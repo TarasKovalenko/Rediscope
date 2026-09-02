@@ -1,28 +1,10 @@
 # rediscope
 
 A terminal UI Redis client. Browse the keyspace as a folder tree, read and edit
-every value type, manage TTLs, and drop into a raw command console — in one
+every value type, manage TTLs, and drop into a raw command console - in one
 static binary, no Electron and no Python runtime.
 
-```
- rediscope  127.0.0.1  redis://127.0.0.1:7799/0  ·  redis 8.10.1 · standalone
-╭ Keys — 9 shown / 9 in db ─────────────────────────╮╭ Key ────────────────────────────────────────────────────────────────────────────────╮
-│▾ app  (4)                                         ││app:user:1001                                                                        │
-│  ▾ config  (1)                                    ││string   ttl: no expiry   48 byte(s)                                                 │
-│    H cache                                        │╰─────────────────────────────────────────────────────────────────────────────────────╯
-│  ▾ queue  (1)                                     │╭ Value ──────────────────────────────────────────────────────────────────────────────╮
-│    L emails                                       ││{                                                                                    │
-│  ▾ user  (2)                                      ││  "id": 1001,                                                                        │
-│    S 1001                                         ││  "name": "ada",                                                                     │
-│    S 1002                                         ││  "roles": [                                                                         │
-│▾ session  (2)                                     ││    "admin",                                                                         │
-│  S abc123  55m53s                                 ││    "dev"                                                                            │
-│  S def456  15m0s                                  ││  ]                                                                                  │
-│X events                                           ││}                                                                                    │
-│Z leaderboard                                      ││                                                                                     │
-│E tags                                             ││                                                                                     │
-│                                                   ││                                                                                     │
-```
+<img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/17b807bb-5ae3-452b-a879-06c9b5b828d9" />
 
 ## Install
 
