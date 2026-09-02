@@ -83,6 +83,12 @@ fn press(app: &mut App, code: KeyCode) {
     app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
 }
 
+fn type_str(app: &mut App, text: &str) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c));
+    }
+}
+
 fn app_ctrl(app: &mut App, c: char) {
     app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
 }
@@ -97,6 +103,17 @@ async fn renders_every_screen_and_modal_at_any_size() {
     press(&mut a, KeyCode::Esc);
 
     press(&mut a, KeyCode::Char('n')); // connection form
+    render_all_sizes(&mut a);
+    // Walk the whole form so every field, heading and scroll position renders.
+    for _ in 0..13 {
+        press(&mut a, KeyCode::Tab);
+        render_at(&mut a, 80, 24);
+        render_at(&mut a, 40, 12);
+    }
+    press(&mut a, KeyCode::Esc);
+
+    press(&mut a, KeyCode::Char('/')); // server-list filter
+    press(&mut a, KeyCode::Char('p'));
     render_all_sizes(&mut a);
     press(&mut a, KeyCode::Esc);
 
@@ -163,21 +180,15 @@ async fn form_validation_blocks_submit_and_keeps_the_modal_open() {
     press(&mut a, KeyCode::Enter); // name is empty
     assert!(a.modal.is_some(), "invalid form stays open");
 
-    for c in "srv".chars() {
-        press(&mut a, KeyCode::Char(c));
-    }
+    type_str(&mut a, "srv"); // focus starts on Name, not the section heading
     press(&mut a, KeyCode::Tab); // host
     press(&mut a, KeyCode::Tab); // port
-    for c in "notaport".chars() {
-        press(&mut a, KeyCode::Char(c));
-    }
+    type_str(&mut a, "notaport");
     press(&mut a, KeyCode::Enter);
     assert!(a.modal.is_some(), "bad port stays open");
 
     app_ctrl(&mut a, 'u'); // clear the port field
-    for c in "6380".chars() {
-        press(&mut a, KeyCode::Char(c));
-    }
+    type_str(&mut a, "6380");
     press(&mut a, KeyCode::Enter);
     assert!(a.modal.is_none(), "valid form closes");
     let saved = a
@@ -187,6 +198,129 @@ async fn form_validation_blocks_submit_and_keeps_the_modal_open() {
         .find(|c| c.name == "srv")
         .unwrap();
     assert_eq!(saved.port, 6380);
+    assert_eq!(
+        saved.host, "127.0.0.1",
+        "an empty host falls back to loopback"
+    );
+}
+
+/// Section headings carry no value, so every field after one would land in the
+/// wrong slot if the form and the save action disagreed about indices.
+#[tokio::test]
+async fn connection_form_writes_every_field_to_the_right_slot() {
+    let mut a = app();
+    press(&mut a, KeyCode::Char('n'));
+
+    let inputs = [
+        "edge",           // Name
+        "cache.example",  // Host
+        "6380",           // Port
+        "3",              // Database
+        "reader",         // Username
+        "s3cret",         // Password
+        "",               // keychain switch, left off
+        "",               // TLS switch, toggled below
+        "~/certs/ca.pem", // CA certificate
+        "",               // client certificate
+        "",               // client key
+        "",               // skip verification
+    ];
+    for (i, value) in inputs.iter().enumerate() {
+        if i == 7 {
+            press(&mut a, KeyCode::Char(' ')); // switch TLS on
+        } else if !value.is_empty() {
+            app_ctrl(&mut a, 'u');
+            type_str(&mut a, value);
+        }
+        if i + 1 < inputs.len() {
+            press(&mut a, KeyCode::Tab);
+        }
+    }
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none(), "form should have been accepted");
+
+    let c = a
+        .store
+        .connections
+        .iter()
+        .find(|c| c.name == "edge")
+        .unwrap();
+    assert_eq!(c.host, "cache.example");
+    assert_eq!(c.port, 6380);
+    assert_eq!(c.db, 3);
+    assert_eq!(c.username, "reader");
+    assert_eq!(c.password, "s3cret");
+    assert!(!c.use_keychain);
+    assert!(c.tls);
+    assert_eq!(c.tls_ca_file, "~/certs/ca.pem");
+    assert!(c.tls_cert_file.is_empty());
+    assert!(!c.tls_insecure);
+}
+
+#[tokio::test]
+async fn certificate_files_require_tls() {
+    let mut a = app();
+    press(&mut a, KeyCode::Char('n'));
+    type_str(&mut a, "certs-only");
+    for _ in 0..8 {
+        press(&mut a, KeyCode::Tab); // walk to the CA certificate field
+    }
+    type_str(&mut a, "/tmp/ca.pem");
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_some(), "certificates without TLS are rejected");
+
+    press(&mut a, KeyCode::BackTab); // back to the TLS switch
+    press(&mut a, KeyCode::Char(' '));
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none());
+    let c = a
+        .store
+        .connections
+        .iter()
+        .find(|c| c.name == "certs-only")
+        .unwrap();
+    assert!(c.tls);
+    assert_eq!(c.tls_ca_file, "/tmp/ca.pem");
+}
+
+#[tokio::test]
+async fn duplicate_reorder_and_filter_the_server_list() {
+    let mut a = app();
+    let names =
+        |a: &App| -> Vec<String> { a.store.connections.iter().map(|c| c.name.clone()).collect() };
+
+    press(&mut a, KeyCode::Char('c')); // duplicate "local"
+    assert_eq!(names(&a), ["local", "local copy", "prod"]);
+    assert_eq!(
+        a.conn_state.selected(),
+        Some(1),
+        "the cursor follows the copy"
+    );
+
+    press(&mut a, KeyCode::Char('J')); // move it down
+    assert_eq!(names(&a), ["local", "prod", "local copy"]);
+    assert_eq!(a.conn_state.selected(), Some(2));
+    press(&mut a, KeyCode::Char('J')); // already last, nothing moves
+    assert_eq!(names(&a), ["local", "prod", "local copy"]);
+    press(&mut a, KeyCode::Char('K'));
+    assert_eq!(names(&a), ["local", "local copy", "prod"]);
+
+    press(&mut a, KeyCode::Char('/'));
+    type_str(&mut a, "prod");
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.visible_connections().len(), 1);
+    render_all_sizes(&mut a);
+
+    // Reordering a filtered list would rewrite an order the user cannot see.
+    press(&mut a, KeyCode::Char('J'));
+    assert_eq!(names(&a), ["local", "local copy", "prod"]);
+    assert!(a.status.contains("filter"));
+
+    press(&mut a, KeyCode::Esc); // clears the filter, does not quit
+    assert!(!a.should_quit);
+    assert_eq!(a.visible_connections().len(), 3);
+    press(&mut a, KeyCode::Esc); // nothing left to clear, so this quits
+    assert!(a.should_quit);
 }
 
 #[tokio::test]

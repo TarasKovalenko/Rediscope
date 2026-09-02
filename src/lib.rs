@@ -6,5 +6,6 @@ pub mod config;
 pub mod input;
 pub mod osc52;
 pub mod redis_client;
+pub mod secrets;
 pub mod tree;
 pub mod ui;

@@ -30,14 +30,48 @@ jobs:
           else
             brew install redis
           fi
+
+          # Plain instance for the main integration suite.
           redis-server --port 7799 --daemonize yes --save '' --appendonly no
           for _ in $(seq 1 20); do redis-cli -p 7799 ping && break; sleep 0.5; done
+
+          # Self-signed CA plus server and client certificates for the TLS suite.
+          CERTS="${{ runner.temp }}/certs"
+          mkdir -p "$CERTS"
+          openssl genrsa -out "$CERTS/ca.key" 2048
+          openssl req -x509 -new -nodes -key "$CERTS/ca.key" -sha256 -days 1 \
+            -subj "/CN=rediscope-test-ca" -out "$CERTS/ca.crt"
+          openssl genrsa -out "$CERTS/server.key" 2048
+          openssl req -new -key "$CERTS/server.key" -subj "/CN=localhost" -out "$CERTS/server.csr"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$CERTS/server.ext"
+          openssl x509 -req -in "$CERTS/server.csr" -CA "$CERTS/ca.crt" -CAkey "$CERTS/ca.key" \
+            -CAcreateserial -out "$CERTS/server.crt" -days 1 -sha256 -extfile "$CERTS/server.ext"
+          openssl genrsa -out "$CERTS/client.key" 2048
+          openssl req -new -key "$CERTS/client.key" -subj "/CN=rediscope-client" -out "$CERTS/client.csr"
+          printf 'extendedKeyUsage=clientAuth\n' > "$CERTS/client.ext"
+          openssl x509 -req -in "$CERTS/client.csr" -CA "$CERTS/ca.crt" -CAkey "$CERTS/ca.key" \
+            -CAcreateserial -out "$CERTS/client.crt" -days 1 -sha256 -extfile "$CERTS/client.ext"
+
+          # 7800 accepts any client; 7801 demands a client certificate.
+          redis-server --port 0 --tls-port 7800 --daemonize yes --save '' --appendonly no \
+            --tls-cert-file "$CERTS/server.crt" --tls-key-file "$CERTS/server.key" \
+            --tls-ca-cert-file "$CERTS/ca.crt" --tls-auth-clients no
+          redis-server --port 0 --tls-port 7801 --daemonize yes --save '' --appendonly no \
+            --tls-cert-file "$CERTS/server.crt" --tls-key-file "$CERTS/server.key" \
+            --tls-ca-cert-file "$CERTS/ca.crt" --tls-auth-clients yes
+          for _ in $(seq 1 20); do
+            redis-cli -p 7800 --tls --cacert "$CERTS/ca.crt" ping && break
+            sleep 0.5
+          done
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
         env:
           REDISCOPE_TEST_PORT: 7799
+          REDISCOPE_TLS_PORT: 7800
+          REDISCOPE_MTLS_PORT: 7801
+          REDISCOPE_CERTS: ${{ runner.temp }}/certs
           # Keep the suite away from the developer's real connections file.
           REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
         run: cargo test --all-targets

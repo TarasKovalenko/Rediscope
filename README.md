@@ -40,7 +40,13 @@ Prebuilt targets: macOS `aarch64` / `x86_64`, Linux `x86_64` and `aarch64`
 rediscope                                  # start at the saved-server list
 rediscope -H 127.0.0.1 -p 6379 -n 0        # connect immediately
 rediscope --url rediss://user@host:6380/2  # or via a URL
+
+# TLS against a private CA, and mutual TLS
+rediscope -H cache.internal --tls-ca ~/certs/ca.pem
+rediscope -H cache.internal --tls-cert ~/certs/client.crt --tls-key ~/certs/client.key
 ```
+
+Naming any certificate implies `--tls`, so you rarely need the flag itself.
 
 Pass the password through `REDISCOPE_PASSWORD` rather than `-a`: a flag is
 visible to anyone who can run `ps`.
@@ -60,9 +66,17 @@ visible to anyone who can run `ps`.
 - **TTL management** — view, set, or drop the expiry on any key.
 - **Raw command console** (`:`) with history, and a confirmation prompt in front
   of `FLUSHALL`, `FLUSHDB`, `SHUTDOWN` and friends.
-- **Saved connections**, stored `0600` in your config dir, with TLS and ACL
-  username support. A password of `${SOME_ENV_VAR}` is resolved from the
-  environment at connect time, so the file need never hold a literal secret.
+- **Connection manager** — add, edit, duplicate (`c`), reorder (`J`/`K`), filter
+  (`/`), and test (`T`) saved servers. A test reports round-trip latency, the
+  server version and its key count without opening the connection.
+- **TLS** — a private CA, mutual TLS with a client certificate and key, or an
+  explicit skip-verify for a self-signed dev server. Profiles show `TLS`,
+  `no-verify` and `keychain` badges in the list.
+- **Password handling** — profiles are stored `0600` in your config dir. A
+  password of `${SOME_ENV_VAR}` is resolved from the environment at connect
+  time, or the profile can keep its secret in the OS keychain (macOS Keychain,
+  Windows Credential Manager, freedesktop Secret Service) so the file holds no
+  secret at all.
 - **Non-blocking** — every Redis call runs off the render loop, so the interface
   stays responsive against slow or distant servers.
 
@@ -76,6 +90,10 @@ Press `?` in the app for this list at any time.
 | `↑` `↓` / `k` `j` | Move |
 | `Enter` | Connect |
 | `n` / `e` / `d` | New / edit / delete connection |
+| `c` | Duplicate the selected connection |
+| `J` / `K` | Move the connection down / up |
+| `T` | Test the connection without opening it |
+| `/` | Filter by name or host · `Esc` clears the filter |
 | `q` | Quit |
 
 ### Key browser
@@ -102,6 +120,27 @@ Press `?` in the app for this list at any time.
 Dialogs: `Esc` cancels, `Enter` confirms, `Ctrl+S` saves in the multi-line
 editor, `Tab` moves between fields, `Space` toggles a switch.
 
+## Connections and secrets
+
+A connection profile holds the server address, database index, optional ACL
+username, TLS settings, and how to find its password. The editor is one form
+with `Server`, `Authentication` and `TLS` sections; `Tab` moves between fields,
+`Space` toggles a switch, and the form scrolls when the terminal is short.
+
+Passwords resolve in one of three ways:
+
+| Setting | Where the secret lives |
+|---|---|
+| A literal password | In `connections.json`, mode `0600` |
+| `${SOME_ENV_VAR}` | In your environment, read at connect time |
+| Keychain switch on | In the OS keychain, never in the file |
+
+With the keychain switch on, leaving the password field blank keeps whatever is
+already stored, and renaming a profile migrates its entry. Switching it off
+removes the entry. If no keychain is available — a headless Linux box with no
+Secret Service — the form says so and refuses the switch rather than losing the
+password silently.
+
 ## Configuration
 
 Saved connections live in `connections.json` under your platform config dir —
@@ -120,6 +159,12 @@ redis-server --port 7799 --daemonize yes      # for the integration suite
 REDISCOPE_TEST_PORT=7799 cargo test           # exercises a real server
 cargo clippy --all-targets -- -D warnings
 ```
+
+The TLS suite needs two more instances and a certificate set; `.github/workflows/ci.yml`
+has the exact `openssl` and `redis-server` invocations. Point it at them with
+`REDISCOPE_TLS_PORT`, `REDISCOPE_MTLS_PORT` and `REDISCOPE_CERTS`. Every suite
+skips itself when its environment variables are absent, so a bare `cargo test`
+always works.
 
 `src/redis_client.rs` is the only module that talks to Redis; `src/app.rs` holds
 all state and key handling; `src/ui.rs` only draws. The render tests in
@@ -142,6 +187,9 @@ git tag v0.1.0 && git push origin v0.1.0
 - Deleting a list item uses the standard `LSET` + `LREM` sentinel swap, since
   Redis has no delete-by-index. The sentinel is unique per call, so it cannot
   collide with real data.
+- Skip-verify accepts any certificate the server presents, which defeats the
+  point of TLS against anything but a local dev server. The form labels it
+  unsafe and the list badges it `no-verify`.
 - Switching database reconnects rather than issuing a bare `SELECT`: the
   connection is multiplexed, and a `SELECT` on it would affect commands that are
   already in flight.

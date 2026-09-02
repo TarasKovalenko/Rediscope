@@ -40,7 +40,11 @@ pub enum Msg {
     /// A write finished; `Ok` carries the status line to show.
     Mutated(Result<String, String>),
     Console(String),
+    /// A connection test finished: profile name, then the result.
+    Probe(String, Box<Result<crate::redis_client::Probe, String>>),
+    Status(String),
     Error(String),
+    Noop,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -87,6 +91,8 @@ pub enum FieldKind {
     Secret,
     Bool,
     Choice(Vec<String>),
+    /// A heading. Not focusable, and contributes no value on submit.
+    Section,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +125,23 @@ impl Field {
             kind: FieldKind::Bool,
             flag: value,
             ..Self::text(label, "")
+        }
+    }
+    pub fn section(label: &str) -> Self {
+        Self {
+            kind: FieldKind::Section,
+            ..Self::text(label, "")
+        }
+    }
+    pub fn is_input(&self) -> bool {
+        !matches!(self.kind, FieldKind::Section)
+    }
+    /// Height in terminal rows when rendered.
+    pub fn height(&self) -> u16 {
+        if self.is_input() {
+            3
+        } else {
+            2
         }
     }
     pub fn choice(label: &str, options: &[&str], selected: usize) -> Self {
@@ -175,6 +198,12 @@ pub struct App {
 
     pub conn_state: ListState,
     pub connecting: bool,
+    /// Live text of the server-list filter box, while it has focus.
+    pub conn_filter: Option<InputBuf>,
+    /// The applied filter. Empty means "show everything".
+    pub conn_query: String,
+    /// Name of the profile currently being tested, if any.
+    pub testing: Option<String>,
 
     pub client: Option<Client>,
     pub server_line: String,
@@ -212,6 +241,9 @@ impl App {
             tx,
             conn_state,
             connecting: false,
+            conn_filter: None,
+            conn_query: String::new(),
+            testing: None,
             client: None,
             server_line: String::new(),
             tree: Tree::default(),
@@ -389,10 +421,23 @@ impl App {
                     c.log.extend(text.lines().map(|l| l.to_string()));
                 }
             }
+            Msg::Probe(name, result) => {
+                self.testing = None;
+                self.status = match *result {
+                    Ok(p) => format!(
+                        "{name}: PONG in {:.1} ms · redis {} {} · {} key(s) in db",
+                        p.latency_ms, p.version, p.mode, p.dbsize
+                    ),
+                    Err(e) => format!("Error: {name}: {e}"),
+                };
+            }
+            Msg::Status(text) => self.status = text,
             Msg::Error(e) => {
                 self.loading = false;
-                self.status = e;
+                self.testing = None;
+                self.status = format!("Error: {e}");
             }
+            Msg::Noop => {}
         }
     }
 
@@ -421,6 +466,24 @@ impl App {
             self.modal_key(key);
             return;
         }
+        if let Some(buf) = &mut self.conn_filter {
+            match key.code {
+                KeyCode::Esc => self.conn_filter = None,
+                KeyCode::Enter => {
+                    self.conn_query = buf.value().trim().to_string();
+                    self.conn_filter = None;
+                    self.clamp_connection_selection();
+                }
+                _ => {
+                    buf.handle(key);
+                    // Filtering as you type keeps the list honest about what
+                    // Enter will leave behind.
+                    self.conn_query = buf.value().trim().to_string();
+                    self.clamp_connection_selection();
+                }
+            }
+            return;
+        }
         if let Some(buf) = &mut self.search {
             match key.code {
                 KeyCode::Esc => {
@@ -447,12 +510,25 @@ impl App {
     }
 
     fn connections_key(&mut self, key: KeyEvent) {
-        let len = self.store.connections.len();
+        let len = self.visible_connections().len();
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                if self.conn_query.is_empty() {
+                    self.should_quit = true;
+                } else {
+                    self.conn_query.clear();
+                    self.clamp_connection_selection();
+                }
+            }
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Char('/') => self.conn_filter = Some(InputBuf::new(&self.conn_query)),
             KeyCode::Down | KeyCode::Char('j') => move_sel(&mut self.conn_state, len, 1),
             KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.conn_state, len, -1),
+            KeyCode::Char('J') => self.reorder_connection(1),
+            KeyCode::Char('K') => self.reorder_connection(-1),
+            KeyCode::Char('c') => self.duplicate_connection(),
+            KeyCode::Char('T') => self.test_connection(),
             KeyCode::Char('n') => self.open_connection_form(None),
             KeyCode::Char('e') => {
                 if let Some(c) = self.selected_connection() {
@@ -478,32 +554,206 @@ impl App {
         }
     }
 
-    fn selected_connection(&self) -> Option<Connection> {
+    /// Indices into `store.connections` that pass the current filter, in order.
+    pub fn visible_connections(&self) -> Vec<usize> {
+        if self.conn_query.is_empty() {
+            return (0..self.store.connections.len()).collect();
+        }
+        let needle = self.conn_query.to_lowercase();
         self.store
             .connections
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.name.to_lowercase().contains(&needle) || c.host.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.visible_connections()
             .get(self.conn_state.selected()?)
-            .cloned()
+            .copied()
+    }
+
+    fn selected_connection(&self) -> Option<Connection> {
+        self.store.connections.get(self.selected_index()?).cloned()
+    }
+
+    fn clamp_connection_selection(&mut self) {
+        let len = self.visible_connections().len();
+        self.conn_state.select(if len == 0 {
+            None
+        } else {
+            Some(self.conn_state.selected().unwrap_or(0).min(len - 1))
+        });
+    }
+
+    /// Put the cursor back on a profile by name after a save or duplicate.
+    fn focus_connection(&mut self, name: &str) {
+        let pos = self
+            .visible_connections()
+            .iter()
+            .position(|i| self.store.connections[*i].name == name);
+        match pos {
+            Some(p) => self.conn_state.select(Some(p)),
+            None => self.clamp_connection_selection(),
+        }
+    }
+
+    fn duplicate_connection(&mut self) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        if let Some(new_index) = self.store.duplicate(index) {
+            let name = self.store.connections[new_index].name.clone();
+            if let Err(e) = self.store.save() {
+                self.status = format!("Could not save connections: {e}");
+                return;
+            }
+            self.focus_connection(&name);
+            self.status = format!("Duplicated as '{name}'");
+        }
+    }
+
+    /// Reordering rewrites the stored order, so it only makes sense against the
+    /// unfiltered list.
+    fn reorder_connection(&mut self, delta: isize) {
+        if !self.conn_query.is_empty() {
+            self.status = "Clear the filter (esc) before reordering".into();
+            return;
+        }
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        let moved = self.store.move_by(index, delta);
+        if moved != index {
+            if let Err(e) = self.store.save() {
+                self.status = format!("Could not save connections: {e}");
+                return;
+            }
+            self.conn_state.select(Some(moved));
+        }
+    }
+
+    fn test_connection(&mut self) {
+        let Some(conn) = self.selected_connection() else {
+            return;
+        };
+        let name = conn.name.clone();
+        self.testing = Some(name.clone());
+        self.status = format!("Testing {}:{} ...", conn.host, conn.port);
+        self.spawn(async move {
+            let result = Client::probe(conn).await.map_err(|e| e.to_string());
+            Msg::Probe(name, Box::new(result))
+        });
+    }
+
+    /// Reconcile the OS keychain with a profile that was just saved.
+    fn sync_keychain(
+        &mut self,
+        previous: Option<Connection>,
+        name: String,
+        typed_password: String,
+        use_keychain: bool,
+    ) {
+        let old_name = previous.as_ref().map(|p| p.name.clone());
+        let was_keychain = previous.as_ref().is_some_and(|p| p.use_keychain);
+        let renamed = old_name.clone().filter(|o| *o != name);
+
+        if !use_keychain {
+            // Opted out: drop any secret we were holding for this profile.
+            if was_keychain {
+                if let Some(old) = old_name {
+                    self.spawn(async move {
+                        keychain_task(move || {
+                            crate::secrets::delete(&old)?;
+                            Ok(None)
+                        })
+                        .await
+                    });
+                }
+            }
+            return;
+        }
+
+        self.spawn(async move {
+            keychain_task(move || {
+                let secret = if !typed_password.is_empty() {
+                    Some(typed_password)
+                } else if was_keychain {
+                    // No new password typed. Migrate the stored one if the
+                    // profile was renamed, otherwise leave it alone.
+                    match &renamed {
+                        Some(_) => Some(crate::secrets::get(old_name.as_deref().unwrap_or(""))?),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let stored = secret.is_some();
+                if let Some(s) = secret {
+                    crate::secrets::set(&name, &s)?;
+                }
+                if was_keychain {
+                    if let Some(old) = renamed {
+                        crate::secrets::delete(&old)?;
+                    }
+                }
+                Ok(Some(if stored {
+                    format!("Password for '{name}' stored in the OS keychain")
+                } else if was_keychain {
+                    format!("'{name}' keeps its existing keychain entry")
+                } else {
+                    format!("'{name}' uses the keychain, but no password was entered")
+                }))
+            })
+            .await
+        });
     }
 
     fn open_connection_form(&mut self, existing: Option<Connection>) {
         let c = existing.clone().unwrap_or_default();
+        let keychain_label = match crate::secrets::unavailable_reason() {
+            None => "Store the password in the OS keychain".to_string(),
+            Some(_) => "Store in the OS keychain (unavailable on this machine)".to_string(),
+        };
+        // A stored secret is never read back just to populate a form; an empty
+        // password field on save means "keep whatever is already there".
+        let password_label = if c.use_keychain {
+            "Password (blank keeps the stored secret)"
+        } else {
+            "Password (optional, ${ENV_VAR} works)"
+        };
         self.modal = Some(Modal::Form {
             title: if existing.is_some() {
                 "Edit connection".into()
             } else {
                 "New connection".into()
             },
-            hint: "Tab/↑↓ move · Space toggles · Enter saves · Esc cancels".into(),
+            hint: "Tab/↑↓ move · Space toggles · Enter saves".into(),
             fields: vec![
+                Field::section("Server"),
                 Field::text("Name", &c.name),
                 Field::text("Host", &c.host),
                 Field::text("Port", &c.port.to_string()),
                 Field::text("Database", &c.db.to_string()),
+                Field::section("Authentication"),
                 Field::text("Username (optional)", &c.username),
-                Field::secret("Password (optional, ${ENV_VAR} works)", &c.password),
-                Field::boolean("TLS", c.tls),
+                Field::secret(
+                    password_label,
+                    if c.use_keychain { "" } else { &c.password },
+                ),
+                Field::boolean(&keychain_label, c.use_keychain),
+                Field::section("TLS"),
+                Field::boolean("Use TLS", c.tls),
+                Field::text("CA certificate file (optional)", &c.tls_ca_file),
+                Field::text("Client certificate file (optional)", &c.tls_cert_file),
+                Field::text("Client key file (optional)", &c.tls_key_file),
+                Field::boolean("Skip certificate verification (unsafe)", c.tls_insecure),
             ],
-            focus: 0,
+            focus: 1,
             error: None,
             action: Action::SaveConnection {
                 replacing: existing.map(|e| e.name),
@@ -1008,53 +1258,50 @@ impl App {
                 action,
                 error,
                 ..
-            } => {
-                let count = fields.len();
-                match key.code {
-                    KeyCode::Esc => self.modal = None,
-                    KeyCode::Tab | KeyCode::Down => *focus = (*focus + 1) % count,
-                    KeyCode::BackTab | KeyCode::Up => *focus = (*focus + count - 1) % count,
-                    KeyCode::Enter => {
-                        let values: Vec<String> = fields
-                            .iter()
-                            .map(|f| match &f.kind {
-                                FieldKind::Bool => f.flag.to_string(),
-                                FieldKind::Choice(opts) => {
-                                    opts.get(f.choice).cloned().unwrap_or_default()
-                                }
-                                _ => f.value(),
-                            })
-                            .collect();
-                        let action = action.clone();
-                        if let Some(err) = validate(&action, &values) {
-                            *error = Some(err);
-                            return;
-                        }
-                        self.modal = None;
-                        self.run_action(action, values);
+            } => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Tab | KeyCode::Down => *focus = next_focus(fields, *focus, 1),
+                KeyCode::BackTab | KeyCode::Up => *focus = next_focus(fields, *focus, -1),
+                KeyCode::Enter => {
+                    let values: Vec<String> = fields
+                        .iter()
+                        .filter(|f| f.is_input())
+                        .map(|f| match &f.kind {
+                            FieldKind::Bool => f.flag.to_string(),
+                            FieldKind::Choice(opts) => {
+                                opts.get(f.choice).cloned().unwrap_or_default()
+                            }
+                            _ => f.value(),
+                        })
+                        .collect();
+                    let action = action.clone();
+                    if let Some(err) = validate(&action, &values) {
+                        *error = Some(err);
+                        return;
                     }
-                    _ => {
-                        let field = &mut fields[*focus];
-                        match (&field.kind, key.code) {
-                            (
-                                FieldKind::Bool,
-                                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right,
-                            ) => field.flag = !field.flag,
-                            (FieldKind::Choice(opts), KeyCode::Right | KeyCode::Char(' ')) => {
-                                field.choice = (field.choice + 1) % opts.len()
-                            }
-                            (FieldKind::Choice(opts), KeyCode::Left) => {
-                                field.choice = (field.choice + opts.len() - 1) % opts.len()
-                            }
-                            (FieldKind::Choice(_) | FieldKind::Bool, _) => {}
-                            _ => {
-                                field.input.handle(key);
-                                *error = None;
-                            }
+                    self.modal = None;
+                    self.run_action(action, values);
+                }
+                _ => {
+                    let field = &mut fields[*focus];
+                    match (&field.kind, key.code) {
+                        (FieldKind::Bool, KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right) => {
+                            field.flag = !field.flag
+                        }
+                        (FieldKind::Choice(opts), KeyCode::Right | KeyCode::Char(' ')) => {
+                            field.choice = (field.choice + 1) % opts.len()
+                        }
+                        (FieldKind::Choice(opts), KeyCode::Left) => {
+                            field.choice = (field.choice + opts.len() - 1) % opts.len()
+                        }
+                        (FieldKind::Choice(_) | FieldKind::Bool | FieldKind::Section, _) => {}
+                        _ => {
+                            field.input.handle(key);
+                            *error = None;
                         }
                     }
                 }
-            }
+            },
             Modal::Console(state) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Up if !state.history.is_empty() => {
@@ -1141,6 +1388,12 @@ impl App {
         let v = |i: usize| values.get(i).cloned().unwrap_or_default();
         match action {
             Action::SaveConnection { replacing } => {
+                let previous = replacing
+                    .as_deref()
+                    .and_then(|n| self.store.connections.iter().find(|c| c.name == n))
+                    .cloned();
+                let typed_password = v(5);
+                let use_keychain = v(6) == "true";
                 let conn = Connection {
                     name: v(0).trim().to_string(),
                     host: {
@@ -1154,23 +1407,47 @@ impl App {
                     port: v(2).trim().parse().unwrap_or(6379),
                     db: v(3).trim().parse().unwrap_or(0),
                     username: v(4).trim().to_string(),
-                    password: v(5),
-                    tls: v(6) == "true",
+                    password: if use_keychain {
+                        String::new()
+                    } else {
+                        typed_password.clone()
+                    },
+                    use_keychain,
+                    tls: v(7) == "true",
+                    tls_ca_file: v(8).trim().to_string(),
+                    tls_cert_file: v(9).trim().to_string(),
+                    tls_key_file: v(10).trim().to_string(),
+                    tls_insecure: v(11) == "true",
                 };
+                let new_name = conn.name.clone();
                 self.store.upsert(conn, replacing.as_deref());
                 if let Err(e) = self.store.save() {
                     self.status = format!("Could not save connections: {e}");
                 } else {
                     self.status = "Connection saved".into();
                 }
-                if self.conn_state.selected().is_none() && !self.store.connections.is_empty() {
-                    self.conn_state.select(Some(0));
-                }
+                self.sync_keychain(previous, new_name.clone(), typed_password, use_keychain);
+                self.focus_connection(&new_name);
             }
             Action::DeleteConnection(name) => {
+                let had_keychain = self
+                    .store
+                    .connections
+                    .iter()
+                    .any(|c| c.name == name && c.use_keychain);
                 self.store.remove(&name);
                 let _ = self.store.save();
-                let len = self.store.connections.len();
+                if had_keychain {
+                    self.spawn(async move {
+                        match tokio::task::spawn_blocking(move || crate::secrets::delete(&name))
+                            .await
+                        {
+                            Ok(Err(e)) => Msg::Error(e.to_string()),
+                            _ => Msg::Noop,
+                        }
+                    });
+                }
+                let len = self.visible_connections().len();
                 self.conn_state.select(if len == 0 {
                     None
                 } else {
@@ -1323,6 +1600,19 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
             if get(3).parse::<i64>().is_err() {
                 return Some("Database must be a number".into());
             }
+            // Opting into the keychain on a machine without one would silently
+            // lose the password.
+            if get(6) == "true" {
+                if let Some(reason) = crate::secrets::unavailable_reason() {
+                    return Some(format!("No OS keychain available here: {reason}"));
+                }
+            }
+            if get(7) != "true" && [8, 9, 10].iter().any(|i| !get(*i).is_empty()) {
+                return Some("Certificate files need TLS switched on".into());
+            }
+            if get(9).is_empty() != get(10).is_empty() {
+                return Some("Mutual TLS needs both a client certificate and a key".into());
+            }
             None
         }
         Action::NewKey | Action::RenameKey(_) => {
@@ -1392,6 +1682,35 @@ impl Selectable for TableState {
     fn set(&mut self, i: Option<usize>) {
         self.select(i)
     }
+}
+
+/// Run a blocking keychain operation off the runtime and turn it into a message.
+async fn keychain_task<F>(job: F) -> Msg
+where
+    F: FnOnce() -> anyhow::Result<Option<String>> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(job).await {
+        Ok(Ok(Some(text))) => Msg::Status(text),
+        Ok(Ok(None)) => Msg::Noop,
+        Ok(Err(e)) => Msg::Error(e.to_string()),
+        Err(e) => Msg::Error(e.to_string()),
+    }
+}
+
+/// Step focus to the next real input, wrapping around and skipping headings.
+fn next_focus(fields: &[Field], from: usize, dir: isize) -> usize {
+    let n = fields.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut i = from;
+    for _ in 0..n {
+        i = ((i as isize + dir).rem_euclid(n as isize)) as usize;
+        if fields[i].is_input() {
+            return i;
+        }
+    }
+    from
 }
 
 fn move_sel<S: Selectable>(state: &mut S, len: usize, delta: isize) {

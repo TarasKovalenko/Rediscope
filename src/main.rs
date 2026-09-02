@@ -52,6 +52,22 @@ struct Cli {
     #[arg(long)]
     tls: bool,
 
+    /// PEM root certificate, when the server is not signed by a public CA.
+    #[arg(long, value_name = "FILE")]
+    tls_ca: Option<String>,
+
+    /// PEM client certificate, for mutual TLS. Requires --tls-key.
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    tls_cert: Option<String>,
+
+    /// PEM client key, for mutual TLS. Requires --tls-cert.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    tls_key: Option<String>,
+
+    /// Accept any server certificate. Only sensible against a dev server.
+    #[arg(long)]
+    tls_insecure: bool,
+
     /// Connect via URL, e.g. redis://user:pass@host:6379/2. Overrides the other flags.
     #[arg(long)]
     url: Option<String>,
@@ -63,8 +79,21 @@ struct Cli {
 
 impl Cli {
     fn quick_connect(&self) -> Result<Option<Connection>> {
+        let tls_ca_file = self.tls_ca.clone().unwrap_or_default();
+        let tls_cert_file = self.tls_cert.clone().unwrap_or_default();
+        let tls_key_file = self.tls_key.clone().unwrap_or_default();
+        // Naming any certificate implies TLS; requiring both flags is noise.
+        let tls =
+            self.tls || self.tls_insecure || !tls_ca_file.is_empty() || !tls_cert_file.is_empty();
+
         if let Some(url) = &self.url {
-            return Ok(Some(Connection::from_url(url)?));
+            let mut conn = Connection::from_url(url)?;
+            conn.tls = conn.tls || tls;
+            conn.tls_ca_file = tls_ca_file;
+            conn.tls_cert_file = tls_cert_file;
+            conn.tls_key_file = tls_key_file;
+            conn.tls_insecure = self.tls_insecure;
+            return Ok(Some(conn));
         }
         let Some(host) = &self.host else {
             return Ok(None);
@@ -76,7 +105,12 @@ impl Cli {
             db: self.db,
             username: self.username.clone(),
             password: self.password.clone(),
-            tls: self.tls,
+            tls,
+            tls_ca_file,
+            tls_cert_file,
+            tls_key_file,
+            tls_insecure: self.tls_insecure,
+            use_keychain: false,
         }))
     }
 }
