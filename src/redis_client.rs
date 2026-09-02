@@ -1,10 +1,11 @@
 //! Async Redis access tailored to the TUI: SCAN-based listing, bounded value
 //! reads, and typed mutators. Nothing here blocks the render loop.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use redis::aio::MultiplexedConnection;
 use redis::{
-    AsyncCommands, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
+    AsyncCommands, ClientTlsConfig, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
+    RedisConnectionInfo, TlsCertificates,
 };
 
 use crate::config::Connection;
@@ -97,13 +98,13 @@ pub struct Client {
     mgr: MultiplexedConnection,
 }
 
-fn connection_info(conn: &Connection) -> Result<ConnectionInfo> {
+fn connection_info(conn: &Connection, password: &str) -> Result<ConnectionInfo> {
     let mut info = (conn.host.as_str(), conn.port).into_connection_info()?;
     if conn.tls {
         info = info.set_addr(ConnectionAddr::TcpTls {
             host: conn.host.clone(),
             port: conn.port,
-            insecure: false,
+            insecure: conn.tls_insecure,
             tls_params: None,
         });
     }
@@ -111,16 +112,116 @@ fn connection_info(conn: &Connection) -> Result<ConnectionInfo> {
     if !conn.username.is_empty() {
         settings = settings.set_username(&conn.username);
     }
-    let password = conn.resolved_password();
     if !password.is_empty() {
-        settings = settings.set_password(&password);
+        settings = settings.set_password(password);
     }
     Ok(info.set_redis_settings(settings))
 }
 
+impl std::fmt::Debug for Client {
+    /// The live connection has no useful representation; the profile does.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("conn", &self.conn)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read the PEM files a profile points at. Returns `None` when the profile
+/// relies on the system trust store and does not use client certificates.
+fn load_tls_certificates(conn: &Connection) -> Result<Option<TlsCertificates>> {
+    if !conn.tls {
+        return Ok(None);
+    }
+    let root_cert = read_pem(&conn.tls_ca_file, "CA certificate")?;
+    let cert = read_pem(&conn.tls_cert_file, "client certificate")?;
+    let key = read_pem(&conn.tls_key_file, "client key")?;
+    let client_tls = match (cert, key) {
+        (Some(client_cert), Some(client_key)) => Some(ClientTlsConfig {
+            client_cert,
+            client_key,
+        }),
+        (None, None) => None,
+        _ => anyhow::bail!("mutual TLS needs both a client certificate and a client key"),
+    };
+    if client_tls.is_none() && root_cert.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(TlsCertificates {
+        client_tls,
+        root_cert,
+    }))
+}
+
+fn read_pem(path: &str, what: &str) -> Result<Option<Vec<u8>>> {
+    if path.trim().is_empty() {
+        return Ok(None);
+    }
+    let resolved = crate::config::expand_home(path);
+    let bytes = std::fs::read(&resolved)
+        .with_context(|| format!("cannot read the {what} at {}", resolved.display()))?;
+    Ok(Some(bytes))
+}
+
+/// rustls refuses to pick a cipher-suite provider on its own when more than one
+/// is compiled in, and panics at handshake time if none was installed. Do it
+/// once, before the first TLS connection.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // An error here means a provider is already installed, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Resolve the password and certificates (both hit the filesystem or the OS
+/// keychain) off the async runtime, then build the redis client.
+async fn build_client(conn: &Connection) -> Result<redis::Client> {
+    if conn.tls {
+        ensure_crypto_provider();
+    }
+    let probe = conn.clone();
+    let (password, certs) =
+        tokio::task::spawn_blocking(move || -> Result<(String, Option<TlsCertificates>)> {
+            Ok((probe.resolve_password()?, load_tls_certificates(&probe)?))
+        })
+        .await??;
+    let info = connection_info(conn, &password)?;
+    Ok(match certs {
+        Some(certs) => redis::Client::build_with_tls(info, certs)?,
+        None => redis::Client::open(info)?,
+    })
+}
+
+/// The result of a connection test, shown in the server list.
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub latency_ms: f64,
+    pub version: String,
+    pub mode: String,
+    pub dbsize: u64,
+}
+
 impl Client {
+    /// Connect, time a round trip, read the server banner, then drop the
+    /// connection. Used by "test connection" so it never disturbs the session.
+    pub async fn probe(conn: Connection) -> Result<Probe> {
+        let client = Self::connect(conn).await?;
+        let mut c = client.mgr.clone();
+        let start = std::time::Instant::now();
+        redis::cmd("PING").query_async::<()>(&mut c).await?;
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let info: String = redis::cmd("INFO").arg("server").query_async(&mut c).await?;
+        Ok(Probe {
+            latency_ms,
+            version: info_field(&info, "redis_version:"),
+            mode: info_field(&info, "redis_mode:"),
+            dbsize: client.dbsize().await.unwrap_or(0),
+        })
+    }
+
     pub async fn connect(conn: Connection) -> Result<Self> {
-        let client = redis::Client::open(connection_info(&conn)?)?;
+        let client = build_client(&conn).await?;
         let mut mgr = client
             .get_multiplexed_async_connection_with_config(
                 &redis::AsyncConnectionConfig::new()
@@ -140,15 +241,10 @@ impl Client {
     pub async fn server_line(&self) -> Result<String> {
         let mut c = self.mgr.clone();
         let info: String = redis::cmd("INFO").arg("server").query_async(&mut c).await?;
-        let field = |k: &str| {
-            info.lines()
-                .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
-                .unwrap_or_else(|| "?".into())
-        };
         Ok(format!(
             "redis {} · {}",
-            field("redis_version:"),
-            field("redis_mode:")
+            info_field(&info, "redis_version:"),
+            info_field(&info, "redis_mode:")
         ))
     }
 
@@ -532,6 +628,13 @@ impl Client {
         let value: redis::Value = cmd.query_async(&mut c).await?;
         Ok(format_value(&value, 0))
     }
+}
+
+/// Pull one `key:value` line out of an `INFO` reply.
+fn info_field(info: &str, key: &str) -> String {
+    info.lines()
+        .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
+        .unwrap_or_else(|| "?".into())
 }
 
 fn sentinel() -> String {

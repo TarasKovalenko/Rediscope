@@ -67,18 +67,44 @@ fn title_bar(f: &mut Frame, area: Rect, app: &App) {
 
 fn connections(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::horizontal([
-        Constraint::Percentage(20),
-        Constraint::Min(40),
-        Constraint::Percentage(20),
+        Constraint::Percentage(15),
+        Constraint::Min(44),
+        Constraint::Percentage(15),
     ])
     .split(area);
-    let items: Vec<ListItem> = app
-        .store
-        .connections
+
+    let filtering = app.conn_filter.is_some();
+    let rows = Layout::vertical([
+        Constraint::Length(if filtering { 3 } else { 0 }),
+        Constraint::Min(1),
+    ])
+    .split(cols[1]);
+
+    if let Some(buf) = &app.conn_filter {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("/", Style::new().fg(ACCENT).bold()),
+                Span::raw(buf.value()),
+            ]))
+            .block(panel(
+                "Filter by name or host (Enter keeps it, Esc closes)",
+                true,
+            )),
+            rows[0],
+        );
+        f.set_cursor_position((rows[0].x + 2 + buf.cursor() as u16, rows[0].y + 1));
+    }
+
+    let visible = app.visible_connections();
+    let items: Vec<ListItem> = visible
         .iter()
-        .map(|c| {
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<18}", c.name), Style::new().bold()),
+        .map(|i| {
+            let c = &app.store.connections[*i];
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:<16}", truncate(&c.name, 16)),
+                    Style::new().bold(),
+                ),
                 Span::styled(
                     format!(
                         "{}://{}:{}/{}",
@@ -89,21 +115,49 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App) {
                     ),
                     Style::new().fg(DIM),
                 ),
-            ]))
+            ];
+            if c.tls {
+                spans.push(Span::styled("  TLS", Style::new().fg(Color::Green)));
+            }
+            if c.tls_insecure {
+                spans.push(Span::styled("  no-verify", Style::new().fg(Color::Yellow)));
+            }
+            if c.use_keychain {
+                spans.push(Span::styled("  keychain", Style::new().fg(Color::Cyan)));
+            }
+            if app.testing.as_deref() == Some(c.name.as_str()) {
+                spans.push(Span::styled("  testing…", Style::new().fg(ACCENT)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
+
+    let total = app.store.connections.len();
+    let title = if app.conn_query.is_empty() {
+        format!("Saved connections ({total})")
+    } else {
+        format!(
+            "Saved connections — {} of {total} match '{}'",
+            visible.len(),
+            app.conn_query
+        )
+    };
     let empty = items.is_empty();
     let list = List::new(items)
-        .block(panel("Saved connections", true))
+        .block(panel(&title, !filtering))
         .highlight_style(Style::new().bg(ACCENT).fg(Color::White).bold())
         .highlight_symbol(" ");
-    f.render_stateful_widget(list, cols[1], &mut app.conn_state);
+    f.render_stateful_widget(list, rows[1], &mut app.conn_state);
+
     if empty {
-        let inner = cols[1].inner(Margin::new(2, 2));
+        let message = if total == 0 {
+            "No saved connections yet — press 'n' to add one."
+        } else {
+            "Nothing matches this filter. Press esc to clear it."
+        };
         f.render_widget(
-            Paragraph::new("No saved connections yet — press 'n' to add one.")
-                .style(Style::new().fg(DIM)),
-            inner,
+            Paragraph::new(message).style(Style::new().fg(DIM)),
+            rows[1].inner(Margin::new(2, 1)),
         );
     }
 }
@@ -325,7 +379,11 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("enter", "connect"),
             ("n", "new"),
             ("e", "edit"),
+            ("c", "copy"),
             ("d", "delete"),
+            ("J/K", "reorder"),
+            ("T", "test"),
+            ("/", "filter"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -429,19 +487,63 @@ fn form(
     focus: usize,
     error: Option<&str>,
 ) {
-    let height = (fields.len() as u16 * 3) + 5;
-    let rect = centered(area, 68, height.min(area.height.saturating_sub(2)));
+    let content_height: u16 = fields.iter().map(|f| f.height()).sum();
+    // +2 borders, +1 hint line.
+    let rect = centered(area, 68, content_height + 3);
     f.render_widget(Clear, rect);
     let block = panel(title, true);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let mut constraints: Vec<Constraint> = fields.iter().map(|_| Constraint::Length(3)).collect();
-    constraints.push(Constraint::Length(1));
-    constraints.push(Constraint::Min(0));
-    let rows = Layout::vertical(constraints).split(inner);
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let viewport = rows[0];
+
+    // A long form (the connection editor is 14 rows tall) will not fit a short
+    // terminal, so scroll the field list to keep the focused input on screen.
+    let offsets: Vec<u16> = fields
+        .iter()
+        .scan(0u16, |acc, fld| {
+            let at = *acc;
+            *acc += fld.height();
+            Some(at)
+        })
+        .collect();
+    let focus_top = offsets.get(focus).copied().unwrap_or(0);
+    let focus_bottom = focus_top + fields.get(focus).map_or(0, |f| f.height());
+    let mut scroll = 0u16;
+    if focus_bottom > viewport.height {
+        scroll = focus_bottom - viewport.height;
+    }
+    if focus_top < scroll {
+        scroll = focus_top;
+    }
 
     for (i, field) in fields.iter().enumerate() {
+        let top = offsets[i];
+        let height = field.height();
+        // Skip anything scrolled out, and anything only partly visible.
+        if top < scroll || top + height > scroll + viewport.height {
+            continue;
+        }
+        let row = Rect {
+            x: viewport.x,
+            y: viewport.y + (top - scroll),
+            width: viewport.width,
+            height,
+        };
+        if let FieldKind::Section = field.kind {
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        field.label.to_uppercase(),
+                        Style::new().fg(ACCENT).bold(),
+                    )),
+                ]),
+                row,
+            );
+            continue;
+        }
         let active = i == focus;
         let border = if active { ACCENT } else { PANEL };
         let content = match &field.kind {
@@ -466,6 +568,7 @@ fn form(
                 .collect::<Vec<_>>()
                 .join(" "),
             FieldKind::Text => field.value(),
+            FieldKind::Section => unreachable!("handled above"),
         };
         f.render_widget(
             Paragraph::new(content).block(
@@ -482,20 +585,32 @@ fn form(
                         },
                     )),
             ),
-            rows[i],
+            row,
         );
         if active && matches!(field.kind, FieldKind::Text | FieldKind::Secret) {
-            f.set_cursor_position((rows[i].x + 1 + field.input.cursor() as u16, rows[i].y + 1));
+            let cursor_x =
+                (row.x + 1 + field.input.cursor() as u16).min(row.x + row.width.saturating_sub(2));
+            f.set_cursor_position((cursor_x, row.y + 1));
         }
     }
+
+    // The hint and error text must never spill past the dialog border.
+    let width = rows[1].width as usize;
     let footer_line = match error {
         Some(e) => Line::from(Span::styled(
-            format!(" {e}"),
+            truncate(&format!(" {e}"), width),
             Style::new().fg(Color::White).bg(ACCENT).bold(),
         )),
-        None => Line::from(Span::styled(format!(" {hint}"), Style::new().fg(DIM))),
+        None => {
+            let text = if content_height > viewport.height {
+                format!(" {hint}  ·  ↑↓ scrolls")
+            } else {
+                format!(" {hint}")
+            };
+            Line::from(Span::styled(truncate(&text, width), Style::new().fg(DIM)))
+        }
     };
-    f.render_widget(Paragraph::new(footer_line), rows[fields.len()]);
+    f.render_widget(Paragraph::new(footer_line), rows[1]);
 }
 
 fn console(f: &mut Frame, area: Rect, state: &ConsoleState) {
@@ -558,6 +673,14 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+fn truncate(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_string()
+    } else {
+        s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+    }
+}
+
 fn type_color(kind: KeyType) -> Color {
     match kind {
         KeyType::String => Color::Cyan,
@@ -617,6 +740,14 @@ fn help_text() -> Vec<Line<'static>> {
         ])
     };
     vec![
+        head("Server list"),
+        row(
+            "enter",
+            "connect        n  new        e  edit        c  duplicate",
+        ),
+        row("d", "delete         J / K  move the profile down / up"),
+        row("T", "test the connection without opening it"),
+        row("/", "filter by name or host · esc clears the filter"),
         head("Navigation"),
         row("j / k  ↑↓", "move        g / G  jump to top / bottom"),
         row("h / l  ←→", "collapse / expand folder"),

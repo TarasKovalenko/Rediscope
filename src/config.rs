@@ -31,6 +31,23 @@ pub struct Connection {
     pub password: String,
     #[serde(default)]
     pub tls: bool,
+
+    /// Keep the password in the OS keychain instead of this file.
+    #[serde(default)]
+    pub use_keychain: bool,
+
+    /// PEM root certificate, when the server is not signed by a public CA.
+    #[serde(default)]
+    pub tls_ca_file: String,
+    /// PEM client certificate and key, for mutual TLS.
+    #[serde(default)]
+    pub tls_cert_file: String,
+    #[serde(default)]
+    pub tls_key_file: String,
+    /// Accept any server certificate. Useful against a self-signed dev server,
+    /// dangerous anywhere else.
+    #[serde(default)]
+    pub tls_insecure: bool,
 }
 
 impl Default for Connection {
@@ -43,14 +60,30 @@ impl Default for Connection {
             username: String::new(),
             password: String::new(),
             tls: false,
+            use_keychain: false,
+            tls_ca_file: String::new(),
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            tls_insecure: false,
         }
     }
 }
 
 impl Connection {
+    /// The password to authenticate with: the keychain entry when this profile
+    /// opts in, otherwise the stored value with `${VAR}` placeholders expanded.
+    ///
+    /// Blocking — a keychain read talks to the OS. Call it off the render loop.
+    pub fn resolve_password(&self) -> anyhow::Result<String> {
+        if self.use_keychain {
+            return crate::secrets::get(&self.name);
+        }
+        Ok(self.expanded_password())
+    }
+
     /// Expand `${VAR}` or `$VAR` password placeholders from the environment.
     /// A password that is not a placeholder is returned unchanged.
-    pub fn resolved_password(&self) -> String {
+    pub fn expanded_password(&self) -> String {
         let p = self.password.trim();
         let var = if let Some(rest) = p.strip_prefix("${") {
             rest.strip_suffix('}')
@@ -92,6 +125,7 @@ impl Connection {
             username: settings.username().unwrap_or_default().to_string(),
             password: settings.password().unwrap_or_default().to_string(),
             tls,
+            ..Default::default()
         })
     }
 }
@@ -136,7 +170,25 @@ impl Store {
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
         restrict(&dir, 0o700);
         let path = config_file();
-        let text = serde_json::to_string_pretty(self)?;
+        // A profile that opted into the keychain must not leave a copy of its
+        // password behind in the file.
+        let sanitized = Self {
+            connections: self
+                .connections
+                .iter()
+                .map(|c| {
+                    if c.use_keychain {
+                        Connection {
+                            password: String::new(),
+                            ..c.clone()
+                        }
+                    } else {
+                        c.clone()
+                    }
+                })
+                .collect(),
+        };
+        let text = serde_json::to_string_pretty(&sanitized)?;
         fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
         // Profiles may hold credentials: keep them owner-only.
         restrict(&path, 0o600);
@@ -156,6 +208,62 @@ impl Store {
     pub fn remove(&mut self, name: &str) {
         self.connections.retain(|c| c.name != name);
     }
+
+    /// Copy a profile under a free name, placed directly after the original.
+    /// Returns the new index, or `None` if `index` is out of range.
+    pub fn duplicate(&mut self, index: usize) -> Option<usize> {
+        let mut copy = self.connections.get(index)?.clone();
+        copy.name = self.unique_name(&copy.name);
+        // The copy has no keychain entry of its own yet.
+        copy.use_keychain = false;
+        self.connections.insert(index + 1, copy);
+        Some(index + 1)
+    }
+
+    fn unique_name(&self, base: &str) -> String {
+        // "prod", "prod copy" and "prod copy 4" all share the stem "prod", so
+        // duplicating a duplicate does not stack suffixes.
+        let stem = base
+            .rsplit_once(" copy")
+            .filter(|(_, rest)| {
+                let rest = rest.trim();
+                rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
+            })
+            .map(|(head, _)| head)
+            .unwrap_or(base);
+        let mut candidate = format!("{stem} copy");
+        let mut n = 2;
+        while self.connections.iter().any(|c| c.name == candidate) {
+            candidate = format!("{stem} copy {n}");
+            n += 1;
+        }
+        candidate
+    }
+
+    /// Swap a profile with its neighbour. Returns the index it ended up at.
+    pub fn move_by(&mut self, index: usize, delta: isize) -> usize {
+        let len = self.connections.len();
+        if len == 0 {
+            return 0;
+        }
+        let target = (index as isize + delta).clamp(0, len as isize - 1) as usize;
+        if target != index {
+            self.connections.swap(index, target);
+        }
+        target
+    }
+}
+
+/// Expand a leading `~` so certificate paths can be written the way users type
+/// them into a shell.
+pub fn expand_home(path: &str) -> std::path::PathBuf {
+    let trimmed = path.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
 }
 
 #[cfg(unix)]
@@ -183,17 +291,88 @@ mod tests {
     }
 
     #[test]
+    fn duplicating_a_profile_picks_a_free_name() {
+        let mut store = Store {
+            connections: vec![
+                Connection {
+                    name: "prod".into(),
+                    ..Default::default()
+                },
+                Connection {
+                    name: "prod copy".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let idx = store.duplicate(0).unwrap();
+        assert_eq!(idx, 1, "the copy sits right after the original");
+        assert_eq!(store.connections[1].name, "prod copy 2");
+        // Duplicating the copy does not stack suffixes.
+        store.duplicate(1).unwrap();
+        assert_eq!(store.connections[2].name, "prod copy 3");
+    }
+
+    #[test]
+    fn reordering_clamps_at_the_ends() {
+        let mut store = Store {
+            connections: ["a", "b", "c"]
+                .iter()
+                .map(|n| Connection {
+                    name: (*n).into(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        assert_eq!(store.move_by(0, -1), 0, "already at the top");
+        assert_eq!(store.move_by(2, 1), 2, "already at the bottom");
+        assert_eq!(store.move_by(1, -1), 0);
+        let names: Vec<&str> = store.connections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn keychain_profiles_do_not_write_a_password_to_disk() {
+        let dir = tempdir();
+        std::env::set_var("REDISCOPE_HOME", &dir);
+        let store = Store {
+            connections: vec![Connection {
+                name: "vault".into(),
+                password: "should-not-persist".into(),
+                use_keychain: true,
+                ..Default::default()
+            }],
+        };
+        store.save().unwrap();
+        let text = fs::read_to_string(config_file()).unwrap();
+        assert!(!text.contains("should-not-persist"));
+        assert!(text.contains("\"use_keychain\": true"));
+        std::env::remove_var("REDISCOPE_HOME");
+    }
+
+    fn tempdir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rediscope-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
     fn password_placeholder_expands_from_env() {
         std::env::set_var("REDISCOPE_TEST_PW", "hunter2");
         let c = Connection {
             password: "${REDISCOPE_TEST_PW}".into(),
             ..Default::default()
         };
-        assert_eq!(c.resolved_password(), "hunter2");
+        assert_eq!(c.expanded_password(), "hunter2");
         let literal = Connection {
             password: "not$aplaceholder".into(),
             ..Default::default()
         };
-        assert_eq!(literal.resolved_password(), "not$aplaceholder");
+        assert_eq!(literal.expanded_password(), "not$aplaceholder");
     }
 }
