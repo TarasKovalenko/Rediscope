@@ -1,0 +1,1433 @@
+//! Application state and the update half of the loop. Rendering lives in `ui`.
+//!
+//! Every Redis call runs on a spawned task and reports back over an mpsc
+//! channel, so the UI thread never awaits the network.
+
+use std::collections::HashSet;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::widgets::{ListState, TableState};
+use tokio::sync::mpsc::UnboundedSender;
+use tui_textarea::TextArea;
+
+use crate::config::{Connection, Store};
+use crate::input::InputBuf;
+use crate::redis_client::{is_destructive, Client, KeyInfo, KeyType, KeyValue, KEY_LIMIT};
+use crate::tree::{Tree, VisibleRow};
+
+pub const NEW_KEY_TYPES: [KeyType; 6] = [
+    KeyType::String,
+    KeyType::Hash,
+    KeyType::List,
+    KeyType::Set,
+    KeyType::ZSet,
+    KeyType::Stream,
+];
+
+pub enum Msg {
+    Connected(Box<Result<Client, String>>),
+    Server(String),
+    Keys {
+        keys: Vec<KeyInfo>,
+        truncated: bool,
+        dbsize: u64,
+        pattern: String,
+    },
+    Value {
+        info: KeyInfo,
+        value: KeyValue,
+    },
+    /// A write finished; `Ok` carries the status line to show.
+    Mutated(Result<String, String>),
+    Console(String),
+    Error(String),
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum Screen {
+    Connections,
+    Browser,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum Focus {
+    Tree,
+    Value,
+}
+
+/// What a modal does when submitted.
+#[derive(Clone, Debug)]
+pub enum Action {
+    SaveConnection { replacing: Option<String> },
+    DeleteConnection(String),
+    NewKey,
+    DeleteKey(String),
+    RenameKey(String),
+    SetTtl(String),
+    EditString(String),
+    HashSet { key: String, field: Option<String> },
+    HashDel { key: String, field: String },
+    ListAdd(String),
+    ListSet { key: String, index: isize },
+    ListDel { key: String, index: isize },
+    SetAdd(String),
+    SetReplace { key: String, old: String },
+    SetDel { key: String, member: String },
+    ZsetSet { key: String, old: Option<String> },
+    ZsetDel { key: String, member: String },
+    StreamAdd(String),
+    StreamDel { key: String, id: String },
+    SelectDb,
+    RunCommand(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum FieldKind {
+    Text,
+    Secret,
+    Bool,
+    Choice(Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Field {
+    pub label: String,
+    pub kind: FieldKind,
+    pub input: InputBuf,
+    pub flag: bool,
+    pub choice: usize,
+}
+
+impl Field {
+    pub fn text(label: &str, initial: &str) -> Self {
+        Self {
+            label: label.into(),
+            kind: FieldKind::Text,
+            input: InputBuf::new(initial),
+            flag: false,
+            choice: 0,
+        }
+    }
+    pub fn secret(label: &str, initial: &str) -> Self {
+        Self {
+            kind: FieldKind::Secret,
+            ..Self::text(label, initial)
+        }
+    }
+    pub fn boolean(label: &str, value: bool) -> Self {
+        Self {
+            kind: FieldKind::Bool,
+            flag: value,
+            ..Self::text(label, "")
+        }
+    }
+    pub fn choice(label: &str, options: &[&str], selected: usize) -> Self {
+        Self {
+            kind: FieldKind::Choice(options.iter().map(|s| s.to_string()).collect()),
+            choice: selected,
+            ..Self::text(label, "")
+        }
+    }
+    pub fn value(&self) -> String {
+        self.input.value()
+    }
+}
+
+pub struct ConsoleState {
+    pub input: InputBuf,
+    pub log: Vec<String>,
+    pub history: Vec<String>,
+    pub hist_idx: Option<usize>,
+}
+
+pub enum Modal {
+    Confirm {
+        message: String,
+        action: Action,
+    },
+    Form {
+        title: String,
+        hint: String,
+        fields: Vec<Field>,
+        focus: usize,
+        error: Option<String>,
+        action: Action,
+    },
+    Editor {
+        title: String,
+        textarea: Box<TextArea<'static>>,
+        action: Action,
+    },
+    Message {
+        title: String,
+        body: String,
+    },
+    Console(ConsoleState),
+    Help,
+}
+
+pub struct App {
+    pub store: Store,
+    pub screen: Screen,
+    pub should_quit: bool,
+    pub status: String,
+    pub tx: UnboundedSender<Msg>,
+
+    pub conn_state: ListState,
+    pub connecting: bool,
+
+    pub client: Option<Client>,
+    pub server_line: String,
+    pub tree: Tree,
+    pub expanded: HashSet<String>,
+    pub rows: Vec<VisibleRow>,
+    pub tree_state: ListState,
+    pub pattern: String,
+    pub truncated: bool,
+    pub dbsize: u64,
+    pub key_count: usize,
+    pub loading: bool,
+
+    pub search: Option<InputBuf>,
+    pub focus: Focus,
+    pub current: Option<KeyInfo>,
+    pub value: Option<KeyValue>,
+    pub value_state: TableState,
+    pub value_scroll: u16,
+
+    pub modal: Option<Modal>,
+}
+
+impl App {
+    pub fn new(store: Store, tx: UnboundedSender<Msg>) -> Self {
+        let mut conn_state = ListState::default();
+        if !store.connections.is_empty() {
+            conn_state.select(Some(0));
+        }
+        Self {
+            store,
+            screen: Screen::Connections,
+            should_quit: false,
+            status: String::new(),
+            tx,
+            conn_state,
+            connecting: false,
+            client: None,
+            server_line: String::new(),
+            tree: Tree::default(),
+            expanded: HashSet::new(),
+            rows: Vec::new(),
+            tree_state: ListState::default(),
+            pattern: "*".into(),
+            truncated: false,
+            dbsize: 0,
+            key_count: 0,
+            loading: false,
+            search: None,
+            focus: Focus::Tree,
+            current: None,
+            value: None,
+            value_state: TableState::default(),
+            value_scroll: 0,
+            modal: None,
+        }
+    }
+
+    // ---- async plumbing -------------------------------------------------
+
+    fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = Msg> + Send + 'static,
+    {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+    }
+
+    pub fn connect(&mut self, conn: Connection) {
+        self.connecting = true;
+        self.status = format!("Connecting to {}:{} ...", conn.host, conn.port);
+        self.spawn(async move {
+            Msg::Connected(Box::new(
+                Client::connect(conn).await.map_err(|e| e.to_string()),
+            ))
+        });
+    }
+
+    pub fn reload_keys(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let pattern = self.pattern.clone();
+        self.loading = true;
+        self.spawn(async move {
+            match client.scan_keys(&pattern, KEY_LIMIT).await {
+                Ok((keys, truncated)) => {
+                    let dbsize = client.dbsize().await.unwrap_or(0);
+                    Msg::Keys {
+                        keys,
+                        truncated,
+                        dbsize,
+                        pattern,
+                    }
+                }
+                Err(e) => Msg::Error(format!("scan failed: {e}")),
+            }
+        });
+    }
+
+    pub fn reload_value(&mut self) {
+        let (Some(client), Some(name)) = (
+            self.client.clone(),
+            self.current.as_ref().map(|k| k.name.clone()),
+        ) else {
+            return;
+        };
+        self.spawn(async move {
+            match client.key_info(&name).await {
+                Ok(info) => match client.read_value(&info.name, info.kind).await {
+                    Ok(value) => Msg::Value { info, value },
+                    Err(e) => Msg::Error(format!("read failed: {e}")),
+                },
+                Err(e) => Msg::Error(format!("read failed: {e}")),
+            }
+        });
+    }
+
+    fn mutate<F, Fut>(&mut self, ok_status: &str, f: F)
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+    {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let ok = ok_status.to_string();
+        self.spawn(async move {
+            match f(client).await {
+                Ok(()) => Msg::Mutated(Ok(ok)),
+                Err(e) => Msg::Mutated(Err(e.to_string())),
+            }
+        });
+    }
+
+    // ---- message handling -------------------------------------------------
+
+    pub fn on_msg(&mut self, msg: Msg) {
+        match msg {
+            Msg::Connected(result) => {
+                self.connecting = false;
+                match *result {
+                    Ok(client) => {
+                        let probe = client.clone();
+                        self.spawn(async move {
+                            Msg::Server(probe.server_line().await.unwrap_or_default())
+                        });
+                        self.client = Some(client);
+                        self.screen = Screen::Browser;
+                        self.pattern = "*".into();
+                        self.status.clear();
+                        self.current = None;
+                        self.value = None;
+                        self.expanded.clear();
+                        self.reload_keys();
+                    }
+                    Err(e) => self.status = format!("Connection failed: {e}"),
+                }
+            }
+            Msg::Server(line) => self.server_line = line,
+            Msg::Keys {
+                keys,
+                truncated,
+                dbsize,
+                pattern,
+            } => {
+                self.loading = false;
+                self.key_count = keys.len();
+                self.truncated = truncated;
+                self.dbsize = dbsize;
+                self.pattern = pattern;
+                self.tree = Tree::build(&keys);
+                // A narrow result set is more useful expanded than collapsed.
+                if keys.len() <= 200 {
+                    self.expanded.extend(self.tree.all_folder_paths());
+                }
+                self.rebuild_rows();
+                if self.rows.is_empty() {
+                    self.tree_state.select(None);
+                } else {
+                    let idx = self
+                        .tree_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.rows.len() - 1);
+                    self.tree_state.select(Some(idx));
+                }
+            }
+            Msg::Value { info, value } => {
+                let same_key = self.current.as_ref().is_some_and(|c| c.name == info.name);
+                self.current = Some(info);
+                self.value = Some(value);
+                if !same_key {
+                    self.value_state.select(Some(0));
+                    self.value_scroll = 0;
+                } else if let Some(KeyValue::Rows { rows, .. }) = &self.value {
+                    let idx = self.value_state.selected().unwrap_or(0);
+                    self.value_state
+                        .select(Some(idx.min(rows.len().saturating_sub(1))));
+                }
+            }
+            Msg::Mutated(Ok(status)) => {
+                self.status = status;
+                self.reload_keys();
+                self.reload_value();
+            }
+            Msg::Mutated(Err(e)) => self.status = format!("Error: {e}"),
+            Msg::Console(text) => {
+                if let Some(Modal::Console(c)) = &mut self.modal {
+                    c.log.extend(text.lines().map(|l| l.to_string()));
+                }
+            }
+            Msg::Error(e) => {
+                self.loading = false;
+                self.status = e;
+            }
+        }
+    }
+
+    pub fn rebuild_rows(&mut self) {
+        self.rows = self.tree.visible(&self.expanded);
+    }
+
+    pub fn selected_row(&self) -> Option<&VisibleRow> {
+        self.rows.get(self.tree_state.selected()?)
+    }
+
+    pub fn selected_value_row(&self) -> Option<&crate::redis_client::Row> {
+        match self.value.as_ref()? {
+            KeyValue::Rows { rows, .. } => rows.get(self.value_state.selected()?),
+            _ => None,
+        }
+    }
+
+    // ---- key events -------------------------------------------------------
+
+    pub fn on_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if self.modal.is_some() {
+            self.modal_key(key);
+            return;
+        }
+        if let Some(buf) = &mut self.search {
+            match key.code {
+                KeyCode::Esc => {
+                    self.search = None;
+                    self.status.clear();
+                }
+                KeyCode::Enter => {
+                    let raw = buf.value().trim().to_string();
+                    self.search = None;
+                    self.pattern = normalize_pattern(&raw);
+                    self.expanded.clear();
+                    self.reload_keys();
+                }
+                _ => {
+                    buf.handle(key);
+                }
+            }
+            return;
+        }
+        match self.screen {
+            Screen::Connections => self.connections_key(key),
+            Screen::Browser => self.browser_key(key),
+        }
+    }
+
+    fn connections_key(&mut self, key: KeyEvent) {
+        let len = self.store.connections.len();
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Down | KeyCode::Char('j') => move_sel(&mut self.conn_state, len, 1),
+            KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.conn_state, len, -1),
+            KeyCode::Char('n') => self.open_connection_form(None),
+            KeyCode::Char('e') => {
+                if let Some(c) = self.selected_connection() {
+                    self.open_connection_form(Some(c));
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(c) = self.selected_connection() {
+                    self.modal = Some(Modal::Confirm {
+                        message: format!("Delete saved connection '{}'?", c.name),
+                        action: Action::DeleteConnection(c.name),
+                    });
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(c) = self.selected_connection() {
+                    self.connect(c);
+                } else {
+                    self.open_connection_form(None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn selected_connection(&self) -> Option<Connection> {
+        self.store
+            .connections
+            .get(self.conn_state.selected()?)
+            .cloned()
+    }
+
+    fn open_connection_form(&mut self, existing: Option<Connection>) {
+        let c = existing.clone().unwrap_or_default();
+        self.modal = Some(Modal::Form {
+            title: if existing.is_some() {
+                "Edit connection".into()
+            } else {
+                "New connection".into()
+            },
+            hint: "Tab/↑↓ move · Space toggles · Enter saves · Esc cancels".into(),
+            fields: vec![
+                Field::text("Name", &c.name),
+                Field::text("Host", &c.host),
+                Field::text("Port", &c.port.to_string()),
+                Field::text("Database", &c.db.to_string()),
+                Field::text("Username (optional)", &c.username),
+                Field::secret("Password (optional, ${ENV_VAR} works)", &c.password),
+                Field::boolean("TLS", c.tls),
+            ],
+            focus: 0,
+            error: None,
+            action: Action::SaveConnection {
+                replacing: existing.map(|e| e.name),
+            },
+        });
+    }
+
+    fn browser_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('d') if ctrl => self.prompt_select_db(),
+            KeyCode::Char('n') if ctrl => self.back_to_connections(),
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                if self.pattern != "*" {
+                    self.pattern = "*".into();
+                    self.reload_keys();
+                }
+            }
+            KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Char('/') => self.search = Some(InputBuf::new("")),
+            KeyCode::Char(':') => self.open_console(),
+            KeyCode::Char('r') => {
+                self.reload_keys();
+                self.reload_value();
+            }
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Focus::Tree => Focus::Value,
+                    Focus::Value => Focus::Tree,
+                }
+            }
+            KeyCode::Char('y') => self.yank_key_name(),
+            KeyCode::Char('n') => self.prompt_new_key(),
+            KeyCode::Char('t') => self.prompt_ttl(),
+            KeyCode::Char('R') => self.prompt_rename(),
+            KeyCode::Char('D') => self.confirm_delete_key(),
+            KeyCode::Char('a') => self.prompt_add_item(),
+            KeyCode::Char('e') | KeyCode::Char('E') => self.prompt_edit(),
+            KeyCode::Char('x') => self.confirm_delete_row(),
+            _ => match self.focus {
+                Focus::Tree => self.tree_key(key),
+                Focus::Value => self.value_key(key),
+            },
+        }
+    }
+
+    fn tree_key(&mut self, key: KeyEvent) {
+        let len = self.rows.len();
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_sel(&mut self.tree_state, len, 1);
+                self.on_tree_move();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_sel(&mut self.tree_state, len, -1);
+                self.on_tree_move();
+            }
+            KeyCode::PageDown => {
+                move_sel(&mut self.tree_state, len, 10);
+                self.on_tree_move();
+            }
+            KeyCode::PageUp => {
+                move_sel(&mut self.tree_state, len, -10);
+                self.on_tree_move();
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                if len > 0 {
+                    self.tree_state.select(Some(0));
+                    self.on_tree_move();
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if len > 0 {
+                    self.tree_state.select(Some(len - 1));
+                    self.on_tree_move();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
+                self.toggle_or_open()
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(path) = self.selected_row().and_then(|r| r.folder_path.clone()) {
+                    self.expanded.remove(&path);
+                    self.rebuild_rows();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Moving the tree cursor onto a key loads it; folders clear the pane.
+    fn on_tree_move(&mut self) {
+        match self.selected_row().and_then(|r| r.key.clone()) {
+            Some(k) => {
+                if self.current.as_ref().map(|c| &c.name) != Some(&k.name) {
+                    self.current = Some(k);
+                    self.value = None;
+                    self.reload_value();
+                }
+            }
+            None => {
+                self.current = None;
+                self.value = None;
+            }
+        }
+    }
+
+    fn toggle_or_open(&mut self) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        if let Some(path) = row.folder_path {
+            if !self.expanded.remove(&path) {
+                self.expanded.insert(path);
+            }
+            self.rebuild_rows();
+        } else {
+            self.focus = Focus::Value;
+        }
+    }
+
+    fn value_key(&mut self, key: KeyEvent) {
+        let len = match &self.value {
+            Some(KeyValue::Rows { rows, .. }) => rows.len(),
+            _ => 0,
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if len > 0 {
+                    move_sel(&mut self.value_state, len, 1)
+                } else {
+                    self.value_scroll = self.value_scroll.saturating_add(1)
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if len > 0 {
+                    move_sel(&mut self.value_state, len, -1)
+                } else {
+                    self.value_scroll = self.value_scroll.saturating_sub(1)
+                }
+            }
+            KeyCode::PageDown => {
+                if len > 0 {
+                    move_sel(&mut self.value_state, len, 10)
+                } else {
+                    self.value_scroll = self.value_scroll.saturating_add(10)
+                }
+            }
+            KeyCode::PageUp => {
+                if len > 0 {
+                    move_sel(&mut self.value_state, len, -10)
+                } else {
+                    self.value_scroll = self.value_scroll.saturating_sub(10)
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.value_scroll = 0;
+                if len > 0 {
+                    self.value_state.select(Some(0))
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if len > 0 {
+                    self.value_state.select(Some(len - 1))
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
+            _ => {}
+        }
+    }
+
+    // ---- browser commands --------------------------------------------------
+
+    fn back_to_connections(&mut self) {
+        self.client = None;
+        self.screen = Screen::Connections;
+        self.current = None;
+        self.value = None;
+        self.rows.clear();
+        self.status.clear();
+    }
+
+    fn yank_key_name(&mut self) {
+        let Some(name) = self.current.as_ref().map(|k| k.name.clone()) else {
+            return;
+        };
+        crate::osc52::copy(&name);
+        self.status = format!("Copied '{name}' to clipboard");
+    }
+
+    fn prompt_new_key(&mut self) {
+        let types: Vec<&str> = NEW_KEY_TYPES.iter().map(|t| t.name()).collect();
+        self.modal = Some(Modal::Form {
+            title: "New key".into(),
+            hint: "Tab/↑↓ move · ←→ pick type · Enter creates · Esc cancels".into(),
+            fields: vec![
+                Field::text("Key name", ""),
+                Field::choice("Type", &types, 0),
+            ],
+            focus: 0,
+            error: None,
+            action: Action::NewKey,
+        });
+    }
+
+    fn confirm_delete_key(&mut self) {
+        let Some(k) = self.current.clone() else {
+            self.status = "No key selected".into();
+            return;
+        };
+        self.modal = Some(Modal::Confirm {
+            message: format!("Delete key '{}'? This cannot be undone.", k.name),
+            action: Action::DeleteKey(k.name),
+        });
+    }
+
+    fn prompt_rename(&mut self) {
+        let Some(k) = self.current.clone() else {
+            return;
+        };
+        self.modal = Some(Modal::Form {
+            title: format!("Rename '{}'", k.name),
+            hint: "Enter renames · Esc cancels".into(),
+            fields: vec![Field::text("New name", &k.name)],
+            focus: 0,
+            error: None,
+            action: Action::RenameKey(k.name),
+        });
+    }
+
+    fn prompt_ttl(&mut self) {
+        let Some(k) = self.current.clone() else {
+            return;
+        };
+        let current = if k.ttl < 0 {
+            String::new()
+        } else {
+            k.ttl.to_string()
+        };
+        self.modal = Some(Modal::Form {
+            title: format!("TTL for '{}'", k.name),
+            hint: "Seconds, or empty to remove the expiry · Enter applies".into(),
+            fields: vec![Field::text("Seconds", &current)],
+            focus: 0,
+            error: None,
+            action: Action::SetTtl(k.name),
+        });
+    }
+
+    fn prompt_select_db(&mut self) {
+        let db = self.client.as_ref().map(|c| c.conn.db).unwrap_or(0);
+        self.modal = Some(Modal::Form {
+            title: "Switch database".into(),
+            hint: "Reconnects on the chosen index · Enter applies".into(),
+            fields: vec![Field::text("DB index", &db.to_string())],
+            focus: 0,
+            error: None,
+            action: Action::SelectDb,
+        });
+    }
+
+    fn prompt_add_item(&mut self) {
+        let Some(k) = self.current.clone() else {
+            return;
+        };
+        let name = k.name.clone();
+        self.modal = Some(match k.kind {
+            KeyType::Hash => Modal::Form {
+                title: format!("Add field to '{name}'"),
+                hint: "Enter saves · Esc cancels".into(),
+                fields: vec![Field::text("Field", ""), Field::text("Value", "")],
+                focus: 0,
+                error: None,
+                action: Action::HashSet {
+                    key: name,
+                    field: None,
+                },
+            },
+            KeyType::List => Modal::Form {
+                title: format!("Append to '{name}' (RPUSH)"),
+                hint: "Enter saves · Esc cancels".into(),
+                fields: vec![Field::text("Value", "")],
+                focus: 0,
+                error: None,
+                action: Action::ListAdd(name),
+            },
+            KeyType::Set => Modal::Form {
+                title: format!("Add member to '{name}' (SADD)"),
+                hint: "Enter saves · Esc cancels".into(),
+                fields: vec![Field::text("Member", "")],
+                focus: 0,
+                error: None,
+                action: Action::SetAdd(name),
+            },
+            KeyType::ZSet => Modal::Form {
+                title: format!("Add member to '{name}' (ZADD)"),
+                hint: "Enter saves · Esc cancels".into(),
+                fields: vec![Field::text("Member", ""), Field::text("Score", "0")],
+                focus: 0,
+                error: None,
+                action: Action::ZsetSet {
+                    key: name,
+                    old: None,
+                },
+            },
+            KeyType::Stream => Modal::Form {
+                title: format!("Add entry to '{name}' (XADD *)"),
+                hint: "Enter saves · Esc cancels".into(),
+                fields: vec![Field::text("Field", ""), Field::text("Value", "")],
+                focus: 0,
+                error: None,
+                action: Action::StreamAdd(name),
+            },
+            KeyType::String | KeyType::Other => Modal::Message {
+                title: "Nothing to add".into(),
+                body: "Strings hold a single value — press 'e' to edit it.".into(),
+            },
+        });
+    }
+
+    fn prompt_edit(&mut self) {
+        let Some(k) = self.current.clone() else {
+            return;
+        };
+        let name = k.name.clone();
+        if k.kind == KeyType::String {
+            let current = match &self.value {
+                Some(KeyValue::Str(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let mut ta = TextArea::from(current.lines().collect::<Vec<_>>());
+            ta.set_cursor_line_style(ratatui::style::Style::default());
+            self.modal = Some(Modal::Editor {
+                title: format!("Edit string '{name}'"),
+                textarea: Box::new(ta),
+                action: Action::EditString(name),
+            });
+            return;
+        }
+        let Some(row) = self.selected_value_row().cloned() else {
+            self.status = "No element selected".into();
+            return;
+        };
+        self.modal = Some(match k.kind {
+            KeyType::Hash => Modal::Form {
+                title: format!("Edit field '{}'", row.id),
+                hint: "The field name is fixed; rename via delete + add".into(),
+                fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
+                focus: 0,
+                error: None,
+                action: Action::HashSet {
+                    key: name,
+                    field: Some(row.id),
+                },
+            },
+            KeyType::List => {
+                let index: isize = row.id.parse().unwrap_or(0);
+                Modal::Form {
+                    title: format!("Edit item [{index}] (LSET)"),
+                    hint: "Enter saves · Esc cancels".into(),
+                    fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
+                    focus: 0,
+                    error: None,
+                    action: Action::ListSet { key: name, index },
+                }
+            }
+            KeyType::Set => Modal::Form {
+                title: "Replace set member".into(),
+                hint: "Removes the old member and adds the new one".into(),
+                fields: vec![Field::text("Member", &row.id)],
+                focus: 0,
+                error: None,
+                action: Action::SetReplace {
+                    key: name,
+                    old: row.id,
+                },
+            },
+            KeyType::ZSet => Modal::Form {
+                title: "Edit sorted-set member".into(),
+                hint: "Enter saves · Esc cancels".into(),
+                fields: vec![
+                    Field::text("Member", &row.id),
+                    Field::text("Score", row.cells.get(1).map_or("0", |v| v)),
+                ],
+                focus: 0,
+                error: None,
+                action: Action::ZsetSet {
+                    key: name,
+                    old: Some(row.id),
+                },
+            },
+            KeyType::Stream | KeyType::String | KeyType::Other => Modal::Message {
+                title: "Not editable".into(),
+                body: "Stream entries are immutable. Add a new entry with 'a', or delete this one with 'x'.".into(),
+            },
+        });
+    }
+
+    fn confirm_delete_row(&mut self) {
+        let Some(k) = self.current.clone() else {
+            return;
+        };
+        let Some(row) = self.selected_value_row().cloned() else {
+            self.status = "No element selected".into();
+            return;
+        };
+        let name = k.name.clone();
+        let (message, action) = match k.kind {
+            KeyType::Hash => (
+                format!("Delete field '{}' from '{name}'?", row.id),
+                Action::HashDel {
+                    key: name,
+                    field: row.id,
+                },
+            ),
+            KeyType::List => {
+                let index: isize = row.id.parse().unwrap_or(0);
+                (
+                    format!("Delete item [{index}] from '{name}'?"),
+                    Action::ListDel { key: name, index },
+                )
+            }
+            KeyType::Set => (
+                format!("Remove member '{}' from '{name}'?", row.id),
+                Action::SetDel {
+                    key: name,
+                    member: row.id,
+                },
+            ),
+            KeyType::ZSet => (
+                format!("Remove member '{}' from '{name}'?", row.id),
+                Action::ZsetDel {
+                    key: name,
+                    member: row.id,
+                },
+            ),
+            KeyType::Stream => (
+                format!("Delete entry '{}' from '{name}'?", row.id),
+                Action::StreamDel {
+                    key: name,
+                    id: row.id,
+                },
+            ),
+            KeyType::String | KeyType::Other => {
+                self.status = "Use 'D' to delete the whole key".into();
+                return;
+            }
+        };
+        self.modal = Some(Modal::Confirm { message, action });
+    }
+
+    fn open_console(&mut self) {
+        self.modal = Some(Modal::Console(ConsoleState {
+            input: InputBuf::new(""),
+            log: vec![
+                "Type a Redis command and press Enter. Esc closes.".into(),
+                "Destructive commands (FLUSHALL, FLUSHDB, ...) ask first.".into(),
+                String::new(),
+            ],
+            history: Vec::new(),
+            hist_idx: None,
+        }));
+    }
+
+    // ---- modal input ------------------------------------------------------
+
+    fn modal_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match self.modal.as_mut().expect("modal_key with no modal") {
+            Modal::Help | Modal::Message { .. } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                    self.modal = None;
+                }
+            }
+            Modal::Confirm { action, .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let action = action.clone();
+                    self.modal = None;
+                    self.run_action(action, Vec::new());
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => self.modal = None,
+                _ => {}
+            },
+            Modal::Editor {
+                textarea, action, ..
+            } => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Char('s') if ctrl => {
+                    let text = textarea.lines().join("\n");
+                    let action = action.clone();
+                    self.modal = None;
+                    self.run_action(action, vec![text]);
+                }
+                _ => {
+                    textarea.input(key);
+                }
+            },
+            Modal::Form {
+                fields,
+                focus,
+                action,
+                error,
+                ..
+            } => {
+                let count = fields.len();
+                match key.code {
+                    KeyCode::Esc => self.modal = None,
+                    KeyCode::Tab | KeyCode::Down => *focus = (*focus + 1) % count,
+                    KeyCode::BackTab | KeyCode::Up => *focus = (*focus + count - 1) % count,
+                    KeyCode::Enter => {
+                        let values: Vec<String> = fields
+                            .iter()
+                            .map(|f| match &f.kind {
+                                FieldKind::Bool => f.flag.to_string(),
+                                FieldKind::Choice(opts) => {
+                                    opts.get(f.choice).cloned().unwrap_or_default()
+                                }
+                                _ => f.value(),
+                            })
+                            .collect();
+                        let action = action.clone();
+                        if let Some(err) = validate(&action, &values) {
+                            *error = Some(err);
+                            return;
+                        }
+                        self.modal = None;
+                        self.run_action(action, values);
+                    }
+                    _ => {
+                        let field = &mut fields[*focus];
+                        match (&field.kind, key.code) {
+                            (
+                                FieldKind::Bool,
+                                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right,
+                            ) => field.flag = !field.flag,
+                            (FieldKind::Choice(opts), KeyCode::Right | KeyCode::Char(' ')) => {
+                                field.choice = (field.choice + 1) % opts.len()
+                            }
+                            (FieldKind::Choice(opts), KeyCode::Left) => {
+                                field.choice = (field.choice + opts.len() - 1) % opts.len()
+                            }
+                            (FieldKind::Choice(_) | FieldKind::Bool, _) => {}
+                            _ => {
+                                field.input.handle(key);
+                                *error = None;
+                            }
+                        }
+                    }
+                }
+            }
+            Modal::Console(state) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Up if !state.history.is_empty() => {
+                    let idx = match state.hist_idx {
+                        Some(0) | None if state.hist_idx.is_none() => state.history.len() - 1,
+                        Some(i) => i.saturating_sub(1),
+                        None => state.history.len() - 1,
+                    };
+                    state.hist_idx = Some(idx);
+                    state.input.set(&state.history[idx]);
+                }
+                KeyCode::Down if !state.history.is_empty() => match state.hist_idx {
+                    Some(i) if i + 1 < state.history.len() => {
+                        state.hist_idx = Some(i + 1);
+                        state.input.set(&state.history[i + 1]);
+                    }
+                    _ => {
+                        state.hist_idx = None;
+                        state.input.clear();
+                    }
+                },
+                KeyCode::Enter => {
+                    let line = state.input.value().trim().to_string();
+                    if line.is_empty() {
+                        return;
+                    }
+                    state.input.clear();
+                    state.history.push(line.clone());
+                    state.hist_idx = None;
+                    state.log.push(format!("> {line}"));
+                    if is_destructive(&line) {
+                        state.log.push(
+                            "  ^ destructive — press y to confirm, any other key to abort".into(),
+                        );
+                        let action = Action::RunCommand(line);
+                        self.modal = Some(Modal::Confirm {
+                            message: "Run this destructive command?".into(),
+                            action,
+                        });
+                    } else {
+                        self.run_console(line);
+                    }
+                }
+                _ => {
+                    state.input.handle(key);
+                }
+            },
+        }
+    }
+
+    fn run_console(&mut self, line: String) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        // `SELECT` through the console would desync our idea of the current db.
+        let select_target = parse_select(&line);
+        self.spawn(async move {
+            match client.execute_raw(&line).await {
+                Ok(out) => Msg::Console(if out.is_empty() { "OK".into() } else { out }),
+                Err(e) => Msg::Console(format!("(error) {e}")),
+            }
+        });
+        if let Some(db) = select_target {
+            self.switch_db(db);
+        }
+    }
+
+    fn switch_db(&mut self, db: i64) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let mut conn = client.conn.clone();
+        conn.db = db;
+        self.connecting = true;
+        self.status = format!("Switching to db{db} ...");
+        self.spawn(async move {
+            Msg::Connected(Box::new(
+                Client::connect(conn).await.map_err(|e| e.to_string()),
+            ))
+        });
+    }
+
+    fn run_action(&mut self, action: Action, values: Vec<String>) {
+        let v = |i: usize| values.get(i).cloned().unwrap_or_default();
+        match action {
+            Action::SaveConnection { replacing } => {
+                let conn = Connection {
+                    name: v(0).trim().to_string(),
+                    host: {
+                        let h = v(1).trim().to_string();
+                        if h.is_empty() {
+                            "127.0.0.1".into()
+                        } else {
+                            h
+                        }
+                    },
+                    port: v(2).trim().parse().unwrap_or(6379),
+                    db: v(3).trim().parse().unwrap_or(0),
+                    username: v(4).trim().to_string(),
+                    password: v(5),
+                    tls: v(6) == "true",
+                };
+                self.store.upsert(conn, replacing.as_deref());
+                if let Err(e) = self.store.save() {
+                    self.status = format!("Could not save connections: {e}");
+                } else {
+                    self.status = "Connection saved".into();
+                }
+                if self.conn_state.selected().is_none() && !self.store.connections.is_empty() {
+                    self.conn_state.select(Some(0));
+                }
+            }
+            Action::DeleteConnection(name) => {
+                self.store.remove(&name);
+                let _ = self.store.save();
+                let len = self.store.connections.len();
+                self.conn_state.select(if len == 0 {
+                    None
+                } else {
+                    Some(self.conn_state.selected().unwrap_or(0).min(len - 1))
+                });
+            }
+            Action::NewKey => {
+                let name = v(0).trim().to_string();
+                let kind = NEW_KEY_TYPES
+                    .iter()
+                    .copied()
+                    .find(|t| t.name() == v(1))
+                    .unwrap_or(KeyType::String);
+                self.mutate("Key created", move |c| async move {
+                    c.create_key(&name, kind).await
+                });
+            }
+            Action::DeleteKey(name) => {
+                self.current = None;
+                self.value = None;
+                self.mutate(
+                    "Key deleted",
+                    move |c| async move { c.delete_key(&name).await },
+                );
+            }
+            Action::RenameKey(old) => {
+                let new = v(0).trim().to_string();
+                self.current = None;
+                self.value = None;
+                self.mutate("Key renamed", move |c| async move {
+                    c.rename_key(&old, &new).await
+                });
+            }
+            Action::SetTtl(name) => {
+                let raw = v(0).trim().to_string();
+                let seconds = if raw.is_empty() {
+                    None
+                } else {
+                    raw.parse::<i64>().ok()
+                };
+                self.mutate("TTL updated", move |c| async move {
+                    c.set_ttl(&name, seconds).await
+                });
+            }
+            Action::EditString(name) => {
+                let value = v(0);
+                self.mutate("Value saved", move |c| async move {
+                    c.set_string(&name, &value).await
+                });
+            }
+            Action::HashSet { key, field } => {
+                let (f, val) = match field {
+                    Some(f) => (f, v(0)),
+                    None => (v(0), v(1)),
+                };
+                self.mutate("Field saved", move |c| async move {
+                    c.hash_set(&key, &f, &val).await
+                });
+            }
+            Action::HashDel { key, field } => self.mutate("Field deleted", move |c| async move {
+                c.hash_del(&key, &field).await
+            }),
+            Action::ListAdd(key) => {
+                let val = v(0);
+                self.mutate("Item appended", move |c| async move {
+                    c.list_push(&key, &val).await
+                });
+            }
+            Action::ListSet { key, index } => {
+                let val = v(0);
+                self.mutate("Item saved", move |c| async move {
+                    c.list_set(&key, index, &val).await
+                });
+            }
+            Action::ListDel { key, index } => self.mutate("Item deleted", move |c| async move {
+                c.list_remove_at(&key, index).await
+            }),
+            Action::SetAdd(key) => {
+                let m = v(0);
+                self.mutate(
+                    "Member added",
+                    move |c| async move { c.set_add(&key, &m).await },
+                );
+            }
+            Action::SetReplace { key, old } => {
+                let new = v(0);
+                self.mutate("Member replaced", move |c| async move {
+                    if new != old {
+                        c.set_remove(&key, &old).await?;
+                    }
+                    c.set_add(&key, &new).await
+                });
+            }
+            Action::SetDel { key, member } => self.mutate("Member removed", move |c| async move {
+                c.set_remove(&key, &member).await
+            }),
+            Action::ZsetSet { key, old } => {
+                let member = v(0);
+                let score: f64 = v(1).trim().parse().unwrap_or(0.0);
+                self.mutate("Member saved", move |c| async move {
+                    if let Some(old) = old {
+                        if old != member {
+                            c.zset_remove(&key, &old).await?;
+                        }
+                    }
+                    c.zset_add(&key, &member, score).await
+                });
+            }
+            Action::ZsetDel { key, member } => self.mutate("Member removed", move |c| async move {
+                c.zset_remove(&key, &member).await
+            }),
+            Action::StreamAdd(key) => {
+                let (f, val) = (v(0), v(1));
+                self.mutate("Entry added", move |c| async move {
+                    c.stream_add(&key, &f, &val).await
+                });
+            }
+            Action::StreamDel { key, id } => self.mutate("Entry deleted", move |c| async move {
+                c.stream_delete(&key, &id).await
+            }),
+            Action::SelectDb => {
+                if let Ok(db) = v(0).trim().parse::<i64>() {
+                    self.switch_db(db);
+                } else {
+                    self.status = "DB index must be a number".into();
+                }
+            }
+            Action::RunCommand(line) => {
+                self.open_console();
+                if let Some(Modal::Console(c)) = &mut self.modal {
+                    c.log.push(format!("> {line}"));
+                }
+                self.run_console(line);
+            }
+        }
+    }
+}
+
+/// Field-level validation that must happen before the modal closes.
+fn validate(action: &Action, values: &[String]) -> Option<String> {
+    let get = |i: usize| values.get(i).map(|s| s.trim()).unwrap_or("");
+    match action {
+        Action::SaveConnection { .. } => {
+            if get(0).is_empty() {
+                return Some("Name is required".into());
+            }
+            if get(2).parse::<u16>().is_err() {
+                return Some("Port must be a number between 0 and 65535".into());
+            }
+            if get(3).parse::<i64>().is_err() {
+                return Some("Database must be a number".into());
+            }
+            None
+        }
+        Action::NewKey | Action::RenameKey(_) => {
+            (get(0).is_empty()).then(|| "Key name is required".into())
+        }
+        Action::SetTtl(_) => {
+            let raw = get(0);
+            (!raw.is_empty() && raw.parse::<i64>().is_err())
+                .then(|| "TTL must be a whole number of seconds".into())
+        }
+        Action::SelectDb => {
+            (get(0).parse::<i64>().is_err()).then(|| "DB index must be a number".into())
+        }
+        Action::ZsetSet { .. } => {
+            if get(0).is_empty() {
+                return Some("Member is required".into());
+            }
+            (get(1).parse::<f64>().is_err()).then(|| "Score must be a number".into())
+        }
+        Action::HashSet { field: None, .. } | Action::StreamAdd(_) => {
+            (get(0).is_empty()).then(|| "Field is required".into())
+        }
+        Action::SetAdd(_) | Action::SetReplace { .. } => {
+            (get(0).is_empty()).then(|| "Member cannot be empty".into())
+        }
+        _ => None,
+    }
+}
+
+/// A bare word with no glob characters is treated as a substring search.
+pub fn normalize_pattern(raw: &str) -> String {
+    if raw.is_empty() {
+        return "*".into();
+    }
+    if raw.contains(['*', '?', '[']) {
+        raw.to_string()
+    } else {
+        format!("*{raw}*")
+    }
+}
+
+fn parse_select(line: &str) -> Option<i64> {
+    let mut parts = line.split_whitespace();
+    let head = parts.next()?;
+    if !head.eq_ignore_ascii_case("select") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+trait Selectable {
+    fn get(&self) -> Option<usize>;
+    fn set(&mut self, i: Option<usize>);
+}
+impl Selectable for ListState {
+    fn get(&self) -> Option<usize> {
+        self.selected()
+    }
+    fn set(&mut self, i: Option<usize>) {
+        self.select(i)
+    }
+}
+impl Selectable for TableState {
+    fn get(&self) -> Option<usize> {
+        self.selected()
+    }
+    fn set(&mut self, i: Option<usize>) {
+        self.select(i)
+    }
+}
+
+fn move_sel<S: Selectable>(state: &mut S, len: usize, delta: isize) {
+    if len == 0 {
+        state.set(None);
+        return;
+    }
+    let cur = state.get().unwrap_or(0) as isize;
+    let next = (cur + delta).clamp(0, len as isize - 1);
+    state.set(Some(next as usize));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_search_terms_become_substring_globs() {
+        assert_eq!(normalize_pattern("session"), "*session*");
+        assert_eq!(normalize_pattern("user:*"), "user:*");
+        assert_eq!(normalize_pattern(""), "*");
+    }
+
+    #[test]
+    fn detects_select_in_console_input() {
+        assert_eq!(parse_select("SELECT 4"), Some(4));
+        assert_eq!(parse_select("select  0"), Some(0));
+        assert_eq!(parse_select("GET select"), None);
+    }
+
+    #[test]
+    fn connection_form_rejects_bad_port() {
+        let action = Action::SaveConnection { replacing: None };
+        let vals = ["srv".into(), "h".into(), "nope".into(), "0".into()];
+        assert!(validate(&action, &vals).unwrap().contains("Port"));
+        let vals = ["".into(), "h".into(), "6379".into(), "0".into()];
+        assert!(validate(&action, &vals).unwrap().contains("Name"));
+    }
+}

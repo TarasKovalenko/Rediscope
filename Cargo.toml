@@ -1,0 +1,42 @@
+[package]
+name = "rediscope"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "A terminal UI Redis client: browse keys as a tree, edit every value type, run raw commands."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/TarasKovalenko/Rediscope"
+homepage = "https://github.com/TarasKovalenko/Rediscope"
+keywords = ["redis", "tui", "terminal", "cli", "database"]
+categories = ["command-line-utilities", "database"]
+exclude = [".github/*"]
+
+[[bin]]
+name = "rediscope"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "6"
+futures = "0.3"
+ratatui = "0.29"
+redis = { version = "1", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "streams", "acl", "script"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tui-textarea = { version = "0.7", default-features = false, features = ["ratatui", "crossterm"] }
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lib]
+name = "rediscope"
+path = "src/lib.rs"
