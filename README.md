@@ -64,6 +64,10 @@ visible to anyone who can run `ps`.
   individual hash fields, list items, set members, sorted-set members and stream
   entries added, edited and deleted in place.
 - **TTL management** — view, set, or drop the expiry on any key.
+- **Server info** (`i`) — `INFO` in tabs: Server (version, uptime, clients and
+  key count up top), Memory (a used / `maxmemory` bar), Stats, Key Statistics
+  (per-db key and TTL counts, a hit-rate bar, expirations and evictions) and the
+  full reply. `/` filters the open section, `y` copies it.
 - **Raw command console** (`:`) with history, and a confirmation prompt in front
   of `FLUSHALL`, `FLUSHDB`, `SHUTDOWN` and friends.
 - **Connection manager** — add, edit, duplicate (`c`), reorder (`J`/`K`), filter
@@ -112,10 +116,15 @@ Press `?` in the app for this list at any time.
 | `e` | Edit — a string opens the editor, a row opens a form |
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
+| `i` | Server info — Server / Memory / Stats / Key Statistics / All, with `/` to filter |
 | `:` | Raw command console |
 | `Ctrl+D` | Switch database |
 | `Ctrl+N` | Back to the server list |
 | `?` / `q` | Help / quit |
+
+In server info: `Tab` / `←` `→` / `1`-`5` change section, `/` filters it, `↑` `↓`
+`PgUp` `PgDn` `g` `G` scroll, `y` copies the open tab, `r` re-reads `INFO`, `Esc`
+clears the filter and then closes.
 
 Dialogs: `Esc` cancels, `Enter` confirms, `Ctrl+S` saves in the multi-line
 editor, `Tab` moves between fields, `Space` toggles a switch.

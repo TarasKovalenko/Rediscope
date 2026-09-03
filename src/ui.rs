@@ -3,10 +3,13 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, Wrap,
 };
 
-use crate::app::{App, ConsoleState, Field, FieldKind, Focus, Modal, Screen};
+use crate::app::{
+    App, ConsoleState, Field, FieldKind, Focus, InfoRow, InfoState, Modal, Screen, INFO_TABS,
+};
 use crate::redis_client::{KeyType, KeyValue};
 
 const ACCENT: Color = Color::Rgb(220, 56, 44);
@@ -397,6 +400,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("D", "del key"),
             ("t", "ttl"),
             (":", "console"),
+            ("i", "info"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -418,7 +422,7 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(m) = &app.modal else { return };
     match m {
         Modal::Help => {
-            let rect = centered(area, 74, 24);
+            let rect = centered(area, 74, 29);
             f.render_widget(Clear, rect);
             f.render_widget(
                 Paragraph::new(help_text())
@@ -475,6 +479,7 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App) {
             f.render_widget(&**textarea, inner);
         }
         Modal::Console(state) => console(f, area, state),
+        Modal::Info(state) => server_info(f, area, state),
     }
 }
 
@@ -611,6 +616,152 @@ fn form(
         }
     };
     f.render_widget(Paragraph::new(footer_line), rows[1]);
+}
+
+/// The `INFO` viewer: a tab strip over a scrolling, filterable field list.
+fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
+    // Fill most of the terminal — INFO is long, and a taller list means less
+    // scrolling on the big sections.
+    let rect = centered(area, area.width.saturating_sub(6).min(110), area.height);
+    f.render_widget(Clear, rect);
+    let block = panel(
+        "Server info — tab / 1-5 section, / filter, ↑↓ scroll, y copy, r refresh, esc closes",
+        true,
+    );
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    let mut tabs = Vec::new();
+    for (i, name) in INFO_TABS.iter().enumerate() {
+        tabs.push(Span::styled(
+            format!(" {} {name} ", i + 1),
+            if i == state.tab {
+                Style::new().bg(ACCENT).fg(Color::White).bold()
+            } else {
+                Style::new().fg(DIM)
+            },
+        ));
+        tabs.push(Span::raw(" "));
+    }
+    f.render_widget(Line::from(tabs), rows[0]);
+
+    let all = state.rows();
+    let body = rows[2];
+    let visible = body.height as usize;
+    let start = (state.scroll as usize).min(all.len().saturating_sub(1));
+    let width = body.width.saturating_sub(1) as usize; // leave the scrollbar column
+    let key_width = 30.min(width.saturating_sub(4));
+
+    // Left of the second line: the filter box or the applied query. Right: the
+    // position within the section.
+    let filter_span = match (&state.filter, state.query.as_str()) {
+        (Some(buf), _) => Span::styled(
+            format!("/{}", buf.value()),
+            Style::new().fg(Color::White).bold(),
+        ),
+        (None, "") => Span::styled("/ filters this section", Style::new().fg(DIM)),
+        (None, q) => Span::styled(
+            format!("filter: {q}   (esc clears)"),
+            Style::new().fg(ACCENT),
+        ),
+    };
+    let counter = if all.len() > visible {
+        format!(
+            "{}–{} of {}",
+            start + 1,
+            (start + visible).min(all.len()),
+            all.len()
+        )
+    } else {
+        format!("{} row(s)", all.len())
+    };
+    f.render_widget(Line::from(filter_span), rows[1]);
+    f.render_widget(
+        Line::from(Span::styled(counter, Style::new().fg(DIM))).right_aligned(),
+        rows[1],
+    );
+    if let Some(buf) = &state.filter {
+        f.set_cursor_position((rows[1].x + 1 + buf.cursor() as u16, rows[1].y));
+    }
+
+    let value_width = width.saturating_sub(key_width + 3);
+    let lines: Vec<Line> = all
+        .iter()
+        .skip(start)
+        .take(visible)
+        .map(|row| match row {
+            InfoRow::Head(name) => Line::from(Span::styled(
+                format!("{name} "),
+                Style::new().fg(ACCENT).bold(),
+            )),
+            InfoRow::Field(k, v) => Line::from(vec![
+                Span::styled(
+                    format!("  {:<key_width$}", truncate(k, key_width.saturating_sub(1))),
+                    Style::new().fg(DIM),
+                ),
+                Span::styled(
+                    truncate(&one_line(v), value_width),
+                    Style::new().fg(Color::White),
+                ),
+            ]),
+            InfoRow::Gauge {
+                label,
+                ratio,
+                text,
+                alarm_high,
+            } => {
+                let bar_width = 24.min(value_width.saturating_sub(text.len() + 2));
+                let filled = (ratio * bar_width as f64).round() as usize;
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "  {:<key_width$}",
+                            truncate(label, key_width.saturating_sub(1))
+                        ),
+                        Style::new().fg(DIM),
+                    ),
+                    Span::styled(
+                        "█".repeat(filled),
+                        Style::new().fg(gauge_color(*ratio, *alarm_high)),
+                    ),
+                    Span::styled("░".repeat(bar_width - filled), Style::new().fg(PANEL)),
+                    Span::styled(format!(" {text}"), Style::new().fg(Color::White).bold()),
+                ])
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), body);
+
+    if all.len() > visible {
+        let mut sb = ScrollbarState::new(all.len().saturating_sub(visible)).position(start);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::new().fg(ACCENT))
+                .track_style(Style::new().fg(PANEL)),
+            body,
+            &mut sb,
+        );
+    }
+}
+
+/// Green while a ratio is healthy, red once it is alarming. Which end is
+/// alarming depends on the metric: a full memory bar is bad, a full hit-rate
+/// bar is good.
+fn gauge_color(ratio: f64, alarm_high: bool) -> Color {
+    let bad = if alarm_high { ratio } else { 1.0 - ratio };
+    match bad {
+        r if r >= 0.9 => ACCENT,
+        r if r >= 0.75 => Color::Yellow,
+        _ => Color::Green,
+    }
 }
 
 fn console(f: &mut Frame, area: Rect, state: &ConsoleState) {
@@ -765,6 +916,10 @@ fn help_text() -> Vec<Line<'static>> {
         row("a", "add an element (hash / list / set / zset / stream)"),
         row("x", "delete the selected element"),
         head("Server"),
+        row(
+            "i",
+            "server info — Server / Memory / Stats / Key Statistics / All",
+        ),
         row(":", "raw command console"),
         row("ctrl+d", "switch database (reconnects)"),
         row("ctrl+n", "back to the server list"),

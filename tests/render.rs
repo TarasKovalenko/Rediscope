@@ -6,6 +6,7 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use rediscope::app::{App, Msg};
 use rediscope::config::{Connection, Store};
+use rediscope::redis_client::ServerInfo;
 use rediscope::redis_client::{KeyInfo, KeyType, KeyValue, Row};
 use rediscope::ui;
 
@@ -125,6 +126,25 @@ async fn renders_every_screen_and_modal_at_any_size() {
         render_all_sizes(&mut a);
         press(&mut a, KeyCode::Esc);
     }
+
+    // Server info: every tab, at every size, plus scrolling past the end.
+    a.on_msg(Msg::Info(Box::new(Ok(ServerInfo::parse(
+        "# Server\nredis_version:7.2.4\nredis_mode:standalone\n\n# Memory\nused_memory_human:1.20M\n\n# Stats\nkeyspace_hits:9\nkeyspace_misses:1\n\n# Keyspace\ndb0:keys=4,expires=1,avg_ttl=0\n",
+    )))));
+    for _ in 0..rediscope::app::INFO_TABS.len() {
+        render_all_sizes(&mut a);
+        press(&mut a, KeyCode::Char('G'));
+        render_all_sizes(&mut a);
+        press(&mut a, KeyCode::Tab);
+    }
+    press(&mut a, KeyCode::Char('/')); // filter inside server info
+    type_str(&mut a, "mem");
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Enter);
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc); // clears the filter, keeps the modal
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
 
     press(&mut a, KeyCode::Char('/')); // search line
     press(&mut a, KeyCode::Char('u'));
