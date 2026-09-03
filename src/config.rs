@@ -147,25 +147,80 @@ pub fn config_file() -> PathBuf {
 pub struct Store {
     #[serde(default)]
     pub connections: Vec<Connection>,
+    /// Set when the file exists but could not be read. Saving is refused while
+    /// it is set, so a bad read can never overwrite good profiles with an
+    /// empty list.
+    #[serde(skip)]
+    pub read_error: Option<String>,
 }
 
 impl Store {
-    /// Load saved profiles. A missing file yields a single `local` profile; a
-    /// corrupt file yields an empty store rather than killing the app.
-    pub fn load() -> Self {
+    /// Load saved profiles, plus a notice to show the user when the file was
+    /// not in the state we expected.
+    ///
+    /// Only a *missing* file starts a fresh store. A file that exists but does
+    /// not parse is moved aside rather than silently replaced, and a file that
+    /// cannot be read at all blocks saving, because either case used to end
+    /// with the next edit overwriting every saved profile.
+    pub fn load() -> (Self, Option<String>) {
         let path = config_file();
-        let Ok(text) = fs::read_to_string(&path) else {
-            return Self {
-                connections: vec![Connection {
-                    name: "local".into(),
-                    ..Default::default()
-                }],
-            };
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (
+                    Self {
+                        connections: vec![Connection {
+                            name: "local".into(),
+                            ..Default::default()
+                        }],
+                        read_error: None,
+                    },
+                    None,
+                )
+            }
+            Err(e) => {
+                let notice = format!("Cannot read {}: {e}", path.display());
+                return (
+                    Self {
+                        connections: Vec::new(),
+                        read_error: Some(notice.clone()),
+                    },
+                    Some(format!("{notice} — saving is disabled so nothing is lost")),
+                );
+            }
         };
-        serde_json::from_str(&text).unwrap_or_default()
+        match serde_json::from_str::<Self>(&text) {
+            Ok(store) => (store, None),
+            Err(e) => match quarantine(&path) {
+                // The unreadable file is kept, so a bad parse costs nothing.
+                Ok(kept) => (
+                    Self::default(),
+                    Some(format!(
+                        "{} did not parse ({e}); kept a copy at {}",
+                        path.display(),
+                        kept.display()
+                    )),
+                ),
+                Err(move_err) => {
+                    let notice = format!("{} did not parse ({e})", path.display());
+                    (
+                        Self {
+                            connections: Vec::new(),
+                            read_error: Some(notice.clone()),
+                        },
+                        Some(format!(
+                            "{notice}; could not set it aside ({move_err}) — saving is disabled"
+                        )),
+                    )
+                }
+            },
+        }
     }
 
     pub fn save(&self) -> Result<()> {
+        if let Some(e) = &self.read_error {
+            anyhow::bail!("refusing to overwrite the profiles that are already on disk: {e}");
+        }
         let dir = config_dir();
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
         restrict(&dir, 0o700);
@@ -187,9 +242,20 @@ impl Store {
                     }
                 })
                 .collect(),
+            read_error: None,
         };
         let text = serde_json::to_string_pretty(&sanitized)?;
-        fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+        // Write beside the real file and rename over it: a crash or a full disk
+        // then leaves the previous profiles intact instead of a half file.
+        // A unique scratch name, so two saves in flight at once (two processes,
+        // or two threads) cannot rename each other's file away.
+        let tmp = path.with_extension(format!("json.tmp-{}", scratch_id()));
+        fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
+        restrict(&tmp, 0o600);
+        if path.exists() {
+            let _ = fs::copy(&path, path.with_extension("json.bak"));
+        }
+        fs::rename(&tmp, &path).with_context(|| format!("cannot write {}", path.display()))?;
         // Profiles may hold credentials: keep them owner-only.
         restrict(&path, 0o600);
         Ok(())
@@ -275,9 +341,40 @@ fn restrict(path: &std::path::Path, mode: u32) {
 #[cfg(not(unix))]
 fn restrict(_path: &std::path::Path, _mode: u32) {}
 
+/// Unique suffix for a scratch file: pid plus a per-process counter.
+fn scratch_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Move a file we could not parse out of the way, keeping its contents under a
+/// timestamped name so a hand edit is never thrown away.
+fn quarantine(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("json.bad-{stamp}"));
+    fs::rename(path, &kept)?;
+    Ok(kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These tests all point REDISCOPE_HOME somewhere private; the variable is
+    /// process-wide, so they must not run at the same time.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn url_parsing_reads_db_and_tls() {
@@ -303,6 +400,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let idx = store.duplicate(0).unwrap();
         assert_eq!(idx, 1, "the copy sits right after the original");
@@ -322,6 +420,7 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         };
         assert_eq!(store.move_by(0, -1), 0, "already at the top");
         assert_eq!(store.move_by(2, 1), 2, "already at the bottom");
@@ -332,6 +431,7 @@ mod tests {
 
     #[test]
     fn keychain_profiles_do_not_write_a_password_to_disk() {
+        let _guard = env_guard();
         let dir = tempdir();
         std::env::set_var("REDISCOPE_HOME", &dir);
         let store = Store {
@@ -341,6 +441,7 @@ mod tests {
                 use_keychain: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         store.save().unwrap();
         let text = fs::read_to_string(config_file()).unwrap();
@@ -374,5 +475,112 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(literal.expanded_password(), "not$aplaceholder");
+    }
+
+    /// The old behaviour of this path: a file that did not parse was replaced
+    /// by an empty store, and the next edit wrote that emptiness back over
+    /// every saved profile.
+    #[test]
+    fn an_unparseable_file_is_kept_and_never_overwritten() {
+        let _guard = env_guard();
+        let dir = tempdir();
+        std::env::set_var("REDISCOPE_HOME", &dir);
+        fs::write(config_file(), "{ this is not json").unwrap();
+
+        let (store, notice) = Store::load();
+        assert!(store.connections.is_empty());
+        let notice = notice.expect("the user is told");
+        assert!(notice.contains("did not parse"), "{notice}");
+
+        let kept: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().contains(".bad-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the original file is still there");
+        assert_eq!(fs::read_to_string(&kept[0]).unwrap(), "{ this is not json");
+        std::env::remove_var("REDISCOPE_HOME");
+    }
+
+    #[test]
+    fn a_store_that_failed_to_load_refuses_to_save() {
+        let store = Store {
+            connections: Vec::new(),
+            read_error: Some("permission denied".into()),
+        };
+        let err = store.save().unwrap_err().to_string();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_file_still_seeds_a_local_profile() {
+        let _guard = env_guard();
+        let dir = tempdir();
+        std::env::set_var("REDISCOPE_HOME", &dir);
+        let (store, notice) = Store::load();
+        assert_eq!(store.connections.len(), 1);
+        assert_eq!(store.connections[0].name, "local");
+        assert!(notice.is_none(), "a first run is not an error");
+        std::env::remove_var("REDISCOPE_HOME");
+    }
+
+    #[test]
+    fn saving_keeps_the_previous_file_as_a_backup() {
+        let _guard = env_guard();
+        let dir = tempdir();
+        std::env::set_var("REDISCOPE_HOME", &dir);
+        let first = Store {
+            connections: vec![Connection {
+                name: "prod".into(),
+                ..Default::default()
+            }],
+            read_error: None,
+        };
+        first.save().unwrap();
+        let second = Store {
+            connections: vec![Connection {
+                name: "staging".into(),
+                ..Default::default()
+            }],
+            read_error: None,
+        };
+        second.save().unwrap();
+
+        let (loaded, _) = Store::load();
+        assert_eq!(loaded.connections[0].name, "staging");
+        let backup = fs::read_to_string(config_file().with_extension("json.bak")).unwrap();
+        assert!(backup.contains("prod"), "the previous file is recoverable");
+        assert!(
+            !config_file().with_extension("json.tmp").exists(),
+            "no temp file is left behind"
+        );
+        std::env::remove_var("REDISCOPE_HOME");
+    }
+
+    /// Round trip of a v0.2.0 file: every field added since must default.
+    #[test]
+    fn an_older_file_still_loads_every_profile() {
+        let _guard = env_guard();
+        let dir = tempdir();
+        std::env::set_var("REDISCOPE_HOME", &dir);
+        fs::write(
+            config_file(),
+            r#"{"connections":[{"name":"local","host":"127.0.0.1","port":6379},
+                               {"name":"prod","host":"cache","port":6380,"tls":true}]}"#,
+        )
+        .unwrap();
+        let (store, notice) = Store::load();
+        assert!(notice.is_none());
+        assert_eq!(
+            store
+                .connections
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["local", "prod"]
+        );
+        assert!(store.connections[1].tls);
+        assert!(!store.connections[1].use_keychain);
+        std::env::remove_var("REDISCOPE_HOME");
     }
 }

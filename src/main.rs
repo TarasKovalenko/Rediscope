@@ -155,12 +155,19 @@ fn restore(terminal: &mut Term) -> Result<()> {
 
 async fn run(terminal: &mut Term, quick: Option<Connection>) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
-    let mut app = App::new(Store::load(), tx);
+    let (store, notice) = Store::load();
+    let mut app = App::new(store, tx);
+    if let Some(notice) = notice {
+        app.status = notice;
+    }
     if let Some(conn) = quick {
         app.connect(conn);
     }
 
     let mut events = EventStream::new();
+    // Drives the TTL countdown; keys drop out of the tree as they expire.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
         tokio::select! {
@@ -171,6 +178,7 @@ async fn run(terminal: &mut Term, quick: Option<Connection>) -> Result<()> {
                 None => break,
             },
             Some(msg) = rx.recv() => app.on_msg(msg),
+            _ = ticker.tick() => app.on_tick(),
         }
         if app.should_quit {
             break;

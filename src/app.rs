@@ -12,6 +12,7 @@ use tui_textarea::TextArea;
 
 use crate::config::{Connection, Store};
 use crate::input::InputBuf;
+use crate::json::{self, JsonMode};
 use crate::redis_client::{
     is_destructive, Client, KeyInfo, KeyType, KeyValue, ServerInfo, KEY_LIMIT,
 };
@@ -461,6 +462,9 @@ pub enum Modal {
         title: String,
         textarea: Box<TextArea<'static>>,
         action: Action,
+        /// Whether the value being edited is JSON, and how it was stored.
+        json: JsonMode,
+        error: Option<String>,
     },
     Message {
         title: String,
@@ -489,6 +493,8 @@ pub struct App {
 
     pub client: Option<Client>,
     pub server_line: String,
+    /// The keys behind the tree, kept so a TTL can expire one locally.
+    pub keys: Vec<KeyInfo>,
     pub tree: Tree,
     pub expanded: HashSet<String>,
     pub rows: Vec<VisibleRow>,
@@ -507,6 +513,9 @@ pub struct App {
     pub value_scroll: u16,
 
     pub modal: Option<Modal>,
+
+    /// When the TTL clock last advanced.
+    last_tick: std::time::Instant,
 }
 
 impl App {
@@ -528,6 +537,7 @@ impl App {
             testing: None,
             client: None,
             server_line: String::new(),
+            keys: Vec::new(),
             tree: Tree::default(),
             expanded: HashSet::new(),
             rows: Vec::new(),
@@ -544,6 +554,7 @@ impl App {
             value_state: TableState::default(),
             value_scroll: 0,
             modal: None,
+            last_tick: std::time::Instant::now(),
         }
     }
 
@@ -626,6 +637,69 @@ impl App {
         });
     }
 
+    // ---- the TTL clock ----------------------------------------------------
+
+    /// Called from the event loop. Advances the cached TTLs by however much
+    /// wall clock has passed since the last call.
+    pub fn on_tick(&mut self) {
+        let secs = self.last_tick.elapsed().as_secs() as i64;
+        if secs < 1 {
+            return;
+        }
+        self.last_tick += std::time::Duration::from_secs(secs as u64);
+        self.age_ttls(secs);
+    }
+
+    /// Count the cached TTLs down and drop whatever just expired. The server
+    /// expires keys on its own schedule; this only keeps the view honest
+    /// between scans, and the next scan is still the truth.
+    pub fn age_ttls(&mut self, secs: i64) {
+        if self.screen != Screen::Browser || secs <= 0 {
+            return;
+        }
+        if let Some(cur) = &mut self.current {
+            if cur.ttl > 0 {
+                cur.ttl = (cur.ttl - secs).max(0);
+            }
+        }
+        let mut expired: Vec<String> = Vec::new();
+        for k in &mut self.keys {
+            if k.ttl > 0 {
+                k.ttl -= secs;
+                if k.ttl <= 0 {
+                    expired.push(k.name.clone());
+                }
+            }
+        }
+        if expired.is_empty() {
+            return;
+        }
+        self.keys.retain(|k| k.ttl > 0 || k.ttl == -1);
+        self.key_count = self.keys.len();
+        self.dbsize = self.dbsize.saturating_sub(expired.len() as u64);
+        self.tree = Tree::build(&self.keys);
+        self.rebuild_rows();
+        if self.rows.is_empty() {
+            self.tree_state.select(None);
+        } else if let Some(idx) = self.tree_state.selected() {
+            self.tree_state.select(Some(idx.min(self.rows.len() - 1)));
+        }
+        // The open key going away is worth saying out loud.
+        if let Some(name) = self.current.as_ref().map(|c| c.name.clone()) {
+            if expired.contains(&name) {
+                self.current = None;
+                self.value = None;
+                self.focus = Focus::Tree;
+                self.status = format!("'{name}' expired");
+                return;
+            }
+        }
+        self.status = match expired.len() {
+            1 => format!("'{}' expired", expired[0]),
+            n => format!("{n} keys expired"),
+        };
+    }
+
     // ---- message handling -------------------------------------------------
 
     pub fn on_msg(&mut self, msg: Msg) {
@@ -663,6 +737,7 @@ impl App {
                 self.dbsize = dbsize;
                 self.pattern = pattern;
                 self.tree = Tree::build(&keys);
+                self.keys = keys.clone();
                 // A narrow result set is more useful expanded than collapsed.
                 if keys.len() <= 200 {
                     self.expanded.extend(self.tree.all_folder_paths());
@@ -1383,12 +1458,26 @@ impl App {
                 Some(KeyValue::Str(s)) => s.clone(),
                 _ => String::new(),
             };
-            let mut ta = TextArea::from(current.lines().collect::<Vec<_>>());
+            // JSON opens indented, however it was stored.
+            let mode = json::mode(&current);
+            let text = if mode.is_json() {
+                json::pretty(&current)
+            } else {
+                current
+            };
+            let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
             ta.set_cursor_line_style(ratatui::style::Style::default());
+            let title = if mode.is_json() {
+                format!("Edit JSON '{name}'")
+            } else {
+                format!("Edit string '{name}'")
+            };
             self.modal = Some(Modal::Editor {
-                title: format!("Edit string '{name}'"),
+                title,
                 textarea: Box::new(ta),
                 action: Action::EditString(name),
+                json: mode,
+                error: None,
             });
             return;
         }
@@ -1548,17 +1637,50 @@ impl App {
                 _ => {}
             },
             Modal::Editor {
-                textarea, action, ..
+                textarea,
+                action,
+                json: mode,
+                error,
+                ..
             } => match key.code {
                 KeyCode::Esc => self.modal = None,
+                // Reformat without saving, so a hand-typed edit can be tidied.
+                KeyCode::Char('f') if ctrl && mode.is_json() => {
+                    let text = textarea.lines().join("\n");
+                    match json::check(&text) {
+                        Ok(()) => {
+                            let mut ta =
+                                TextArea::from(json::pretty(&text).lines().collect::<Vec<_>>());
+                            ta.set_cursor_line_style(ratatui::style::Style::default());
+                            **textarea = ta;
+                            *error = None;
+                        }
+                        Err(e) => *error = Some(e),
+                    }
+                }
                 KeyCode::Char('s') if ctrl => {
                     let text = textarea.lines().join("\n");
+                    // A key that held JSON keeps holding JSON: refuse a broken
+                    // edit rather than overwriting the document with garbage.
+                    if mode.is_json() {
+                        if let Err(e) = json::check(&text) {
+                            *error = Some(e);
+                            return;
+                        }
+                    }
+                    // Written back in the shape the key already had.
+                    let text = if *mode == JsonMode::Compact {
+                        json::minify(&text)
+                    } else {
+                        text
+                    };
                     let action = action.clone();
                     self.modal = None;
                     self.run_action(action, vec![text]);
                 }
                 _ => {
                     textarea.input(key);
+                    *error = None;
                 }
             },
             Modal::Form {
@@ -2192,5 +2314,130 @@ mod tests {
         );
         state.query = "nothing matches".into();
         assert!(state.rows().is_empty());
+    }
+
+    fn tick_app(keys: Vec<KeyInfo>) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        app.screen = Screen::Browser;
+        app.on_msg(Msg::Keys {
+            dbsize: keys.len() as u64,
+            keys,
+            truncated: false,
+            pattern: "*".into(),
+        });
+        app
+    }
+
+    fn info(name: &str, ttl: i64) -> KeyInfo {
+        KeyInfo {
+            name: name.into(),
+            kind: KeyType::String,
+            ttl,
+        }
+    }
+
+    #[test]
+    fn expired_keys_leave_the_tree_and_persistent_ones_stay() {
+        let mut app = tick_app(vec![info("gone", 3), info("stays", -1), info("later", 90)]);
+        app.age_ttls(2);
+        assert_eq!(app.keys.len(), 3, "nothing has expired yet");
+        assert_eq!(app.keys[0].ttl, 1);
+
+        app.age_ttls(1);
+        assert_eq!(
+            app.keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(),
+            ["stays", "later"]
+        );
+        assert_eq!(app.key_count, 2);
+        assert_eq!(app.dbsize, 2);
+        assert_eq!(app.rows.len(), 2);
+        assert_eq!(app.status, "'gone' expired");
+    }
+
+    #[test]
+    fn the_open_key_expiring_clears_the_value_pane() {
+        let mut app = tick_app(vec![info("session:1", 5), info("other", -1)]);
+        app.current = Some(info("session:1", 5));
+        app.value = Some(KeyValue::Str("hello".into()));
+        app.focus = Focus::Value;
+
+        app.age_ttls(2);
+        assert_eq!(
+            app.current.as_ref().unwrap().ttl,
+            3,
+            "the header counts down"
+        );
+
+        app.age_ttls(3);
+        assert!(app.current.is_none());
+        assert!(app.value.is_none());
+        assert!(matches!(app.focus, Focus::Tree));
+        assert_eq!(app.status, "'session:1' expired");
+    }
+
+    #[test]
+    fn the_ttl_clock_only_runs_in_the_browser() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        app.keys = vec![info("k", 1)];
+        app.age_ttls(5);
+        assert_eq!(app.keys.len(), 1, "the server list has no keyspace to age");
+    }
+
+    #[test]
+    fn editing_json_opens_indented_and_saves_in_the_stored_shape() {
+        let mut app = tick_app(vec![info("doc", -1)]);
+        app.current = Some(info("doc", -1));
+        app.value = Some(KeyValue::Str(r#"{"b":2,"a":[1,2]}"#.into()));
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+
+        let Some(Modal::Editor {
+            title,
+            textarea,
+            json: mode,
+            ..
+        }) = &app.modal
+        else {
+            panic!("expected the editor")
+        };
+        assert_eq!(title, "Edit JSON 'doc'");
+        assert_eq!(*mode, JsonMode::Compact);
+        assert!(textarea.lines().len() > 1, "opened pretty-printed");
+    }
+
+    #[test]
+    fn a_broken_json_edit_is_refused_and_keeps_the_editor_open() {
+        let mut app = tick_app(vec![info("doc", -1)]);
+        app.current = Some(info("doc", -1));
+        app.value = Some(KeyValue::Str(r#"{"a":1}"#.into()));
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        // Break the buffer, then try to save.
+        app.on_key(KeyEvent::from(KeyCode::Char('{')));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        let Some(Modal::Editor { error, .. }) = &app.modal else {
+            panic!("the editor should still be open")
+        };
+        assert!(
+            error.as_deref().unwrap_or_default().starts_with("line 1"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_string_edit_is_never_json_checked() {
+        let mut app = tick_app(vec![info("greeting", -1)]);
+        app.current = Some(info("greeting", -1));
+        app.value = Some(KeyValue::Str("hello".into()));
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+
+        let Some(Modal::Editor { title, json, .. }) = &app.modal else {
+            panic!("expected the editor")
+        };
+        assert_eq!(title, "Edit string 'greeting'");
+        assert_eq!(*json, JsonMode::None);
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.modal.is_none(), "a plain string saves straight away");
     }
 }

@@ -10,7 +10,22 @@ use rediscope::redis_client::ServerInfo;
 use rediscope::redis_client::{KeyInfo, KeyType, KeyValue, Row};
 use rediscope::ui;
 
+/// Point the config at a scratch directory. Several of these tests add,
+/// reorder or delete profiles, which writes `connections.json` — without this
+/// they would overwrite the real one belonging to whoever runs the suite.
+fn isolate_config() {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let dir = HOME.get_or_init(|| {
+        let p = std::env::temp_dir().join(format!("rediscope-render-{}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    });
+    std::env::set_var("REDISCOPE_HOME", dir);
+}
+
 fn app() -> App {
+    isolate_config();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let store = Store {
         connections: vec![
@@ -25,6 +40,7 @@ fn app() -> App {
                 ..Default::default()
             },
         ],
+        ..Default::default()
     };
     App::new(store, tx)
 }
@@ -154,10 +170,29 @@ async fn renders_every_screen_and_modal_at_any_size() {
     // A string value renders through a different path than the table.
     a.on_msg(Msg::Value {
         info: key("app:user:1", KeyType::String, -1),
-        value: KeyValue::Str("{\"a\":[1,2,3]}".into()),
+        value: KeyValue::Str("{\"a\":[1,2,3],\"b\":null}".into()),
     });
+    render_all_sizes(&mut a); // coloured JSON
+    press(&mut a, KeyCode::Char('e')); // JSON editor, opened pretty-printed
     render_all_sizes(&mut a);
-    press(&mut a, KeyCode::Char('e')); // multi-line editor
+    type_str(&mut a, "{"); // break it, then fail a save to draw the error line
+    app_ctrl(&mut a, 's');
+    render_all_sizes(&mut a);
+    app_ctrl(&mut a, 'f'); // reformat also reports the error
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
+
+    // A plain string keeps the old editor, with no JSON footer.
+    a.on_msg(Msg::Value {
+        info: key("app:user:1", KeyType::String, -1),
+        value: KeyValue::Str("hello".into()),
+    });
+    press(&mut a, KeyCode::Char('e'));
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
+
+    // Keys expiring out from under the tree must not break the layout.
+    a.age_ttls(4_000);
     render_all_sizes(&mut a);
 }
 

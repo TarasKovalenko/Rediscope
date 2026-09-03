@@ -192,3 +192,30 @@ async fn info_reports_sections_and_key_counts() {
         .expect("db14 in the keyspace section");
     assert!(keys >= 1);
 }
+
+#[tokio::test]
+async fn a_json_string_round_trips_through_the_editor_shape() {
+    let c = client!(15);
+    c.execute_raw("FLUSHDB").await.unwrap();
+    c.set_string("doc", r#"{"b":2,"a":[1,2]}"#).await.unwrap();
+
+    let KeyValue::Str(stored) = c.read_value("doc", KeyType::String).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        rediscope::json::mode(&stored),
+        rediscope::json::JsonMode::Compact
+    );
+
+    // What the editor shows, and what it writes back for a compact document.
+    let shown = rediscope::json::pretty(&stored);
+    assert!(shown.contains("\n  \"b\": 2"));
+    c.set_string("doc", &rediscope::json::minify(&shown))
+        .await
+        .unwrap();
+
+    let KeyValue::Str(after) = c.read_value("doc", KeyType::String).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(after, stored, "the stored shape survives an edit");
+}
