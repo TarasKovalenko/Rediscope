@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,7 +23,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      # ring assembles its x86_64 primitives with nasm on Windows.
+      - name: Install nasm
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       - name: Start Redis
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y redis-server
@@ -67,11 +74,20 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
+        if: runner.os != 'Windows'
         env:
           REDISCOPE_TEST_PORT: 7799
           REDISCOPE_TLS_PORT: 7800
           REDISCOPE_MTLS_PORT: 7801
           REDISCOPE_CERTS: ${{ runner.temp }}/certs
           # Keep the suite away from the developer's real connections file.
+          REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
+        run: cargo test --all-targets
+
+      # No Redis server on the Windows runner: the integration and TLS suites
+      # skip themselves when their port variables are unset.
+      - name: cargo test (no server)
+        if: runner.os == 'Windows'
+        env:
           REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
         run: cargo test --all-targets

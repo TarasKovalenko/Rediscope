@@ -11,13 +11,22 @@ Main view             |  Connections view | Server Info
 
 ## Install
 
+macOS and Linux:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.sh | sh
 ```
 
-The script detects your platform, downloads the matching prebuilt binary from
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.ps1 | iex
+```
+
+Either script detects your platform, downloads the matching prebuilt binary from
 GitHub Releases, verifies its SHA-256 against the published `SHA256SUMS`, and
-installs to `~/.local/bin` (`/usr/local/bin` when run as root).
+installs to `~/.local/bin` (`/usr/local/bin` when run as root), or on Windows to
+`%LOCALAPPDATA%\Programs\rediscope\bin`, adding it to your user `PATH`.
 
 Pin a version or change the location:
 
@@ -26,7 +35,13 @@ REDISCOPE_VERSION=v0.4.0 REDISCOPE_BIN_DIR=/usr/local/bin \
   curl -fsSL https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.sh | sh
 ```
 
-If you'd rather not pipe a script into a shell, download the tarball for your
+```powershell
+$env:REDISCOPE_VERSION = 'v0.4.0'
+$env:REDISCOPE_BIN_DIR = 'C:\tools\bin'
+irm https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.ps1 | iex
+```
+
+If you'd rather not pipe a script into a shell, download the archive for your
 platform from the [releases page](https://github.com/TarasKovalenko/Rediscope/releases)
 and drop the binary on your `PATH`. To build from source instead:
 
@@ -35,7 +50,12 @@ cargo install --git https://github.com/TarasKovalenko/Rediscope
 ```
 
 Prebuilt targets: macOS `aarch64` / `x86_64`, Linux `x86_64` and `aarch64`
-(both glibc and musl).
+(both glibc and musl), Windows `x86_64` and `aarch64` (MSVC). Unix builds ship
+as `.tar.gz`, Windows builds as `.zip`.
+
+On Windows use [Windows Terminal](https://aka.ms/terminal) (or any ConPTY-based
+terminal on Windows 10 1809+). The legacy `conhost` console window does not
+render the interface correctly.
 
 ## Run
 
@@ -86,7 +106,8 @@ visible to anyone who can run `ps`.
 - **TLS** — a private CA, mutual TLS with a client certificate and key, or an
   explicit skip-verify for a self-signed dev server. Profiles show `TLS`,
   `no-verify` and `keychain` badges in the list.
-- **Password handling** — profiles are stored `0600` in your config dir. A
+- **Password handling** — profiles are stored `0600` in your config dir (on
+  Windows, under `%APPDATA%`, which is already per-user). A
   password of `${SOME_ENV_VAR}` is resolved from the environment at connect
   time, or the profile can keep its secret in the OS keychain (macOS Keychain,
   Windows Credential Manager, freedesktop Secret Service) so the file holds no
@@ -151,7 +172,7 @@ Passwords resolve in one of three ways:
 
 | Setting | Where the secret lives |
 |---|---|
-| A literal password | In `connections.json`, mode `0600` |
+| A literal password | In `connections.json`, mode `0600` (Windows: `%APPDATA%` ACL) |
 | `${SOME_ENV_VAR}` | In your environment, read at connect time |
 | Keychain switch on | In the OS keychain, never in the file |
 
@@ -165,7 +186,8 @@ password silently.
 
 Saved connections live in `connections.json` under your platform config dir —
 `~/.config/rediscope` on Linux, `~/Library/Application Support/rediscope` on
-macOS. Override the directory with `REDISCOPE_HOME`, or print the exact path:
+macOS, `%APPDATA%\rediscope` on Windows. Override the directory with
+`REDISCOPE_HOME`, or print the exact path:
 
 ```sh
 rediscope --config-path
@@ -201,7 +223,8 @@ down to 10×5, which is what keeps the layout arithmetic honest.
 ## Releasing
 
 Tag and push — `.github/workflows/release.yml` cross-builds every target,
-publishes the tarballs plus `SHA256SUMS`, and that is what `install.sh` reads.
+publishes the tarballs and Windows zips plus `SHA256SUMS`, and that is what
+`install.sh` and `install.ps1` read.
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0

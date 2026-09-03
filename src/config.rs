@@ -321,10 +321,13 @@ impl Store {
 }
 
 /// Expand a leading `~` so certificate paths can be written the way users type
-/// them into a shell.
+/// them into a shell. `~\\` is accepted too, for a Windows shell.
 pub fn expand_home(path: &str) -> std::path::PathBuf {
     let trimmed = path.trim();
-    if let Some(rest) = trimmed.strip_prefix("~/") {
+    let rest = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"));
+    if let Some(rest) = rest {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
@@ -338,6 +341,9 @@ fn restrict(path: &std::path::Path, mode: u32) {
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
 }
 
+/// Windows has no mode bits. The file lives under the per-user profile
+/// directory (`%APPDATA%`), whose default ACL already keeps other standard
+/// users out, so there is nothing to tighten here.
 #[cfg(not(unix))]
 fn restrict(_path: &std::path::Path, _mode: u32) {}
 
@@ -385,6 +391,15 @@ mod tests {
         assert_eq!(c.username, "alice");
         assert_eq!(c.password, "s3cret");
         assert!(c.tls);
+    }
+
+    #[test]
+    fn tilde_expands_with_either_separator() {
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(expand_home("~/certs/ca.pem"), home.join("certs/ca.pem"));
+        assert_eq!(expand_home("~\\certs\\ca.pem"), home.join("certs\\ca.pem"));
+        // A bare path is left exactly as typed.
+        assert_eq!(expand_home("certs/ca.pem"), PathBuf::from("certs/ca.pem"));
     }
 
     #[test]
