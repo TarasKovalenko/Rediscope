@@ -63,7 +63,14 @@ visible to anyone who can run `ps`.
 - **Edit everything** — strings in a multi-line editor with JSON pretty-printing;
   individual hash fields, list items, set members, sorted-set members and stream
   entries added, edited and deleted in place.
-- **TTL management** — view, set, or drop the expiry on any key.
+- **JSON values** — a string holding JSON is shown indented and syntax-coloured
+  and carries a `json` badge. The editor opens it pretty-printed, `ctrl+f`
+  reformats, and `ctrl+s` refuses to save a document that no longer parses.
+  Key order is preserved, and a value stored on one line is written back
+  minified.
+- **TTL management** — view, set, or drop the expiry on any key. TTLs count down
+  live and a key leaves the tree the second its expiry runs out, so nothing
+  stale sits in the view between scans.
 - **Server info** (`i`) — `INFO` in tabs: Server (version, uptime, clients and
   key count up top), Memory (a used / `maxmemory` bar), Stats, Key Statistics
   (per-db key and TTL counts, a hit-rate bar, expirations and evictions) and the
@@ -114,6 +121,7 @@ Press `?` in the app for this list at any time.
 | `y` | Copy the selected key name to the clipboard (OSC 52) |
 | `r` | Refresh |
 | `e` | Edit — a string opens the editor, a row opens a form |
+| `Ctrl+F` | Reformat JSON in the editor (`Ctrl+S` validates before saving) |
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
 | `i` | Server info — Server / Memory / Stats / Key Statistics / All, with `/` to filter |
@@ -159,6 +167,13 @@ macOS. Override the directory with `REDISCOPE_HOME`, or print the exact path:
 ```sh
 rediscope --config-path
 ```
+
+The file is written atomically — a scratch file renamed over the old one, with
+the previous version kept as `connections.json.bak` — so an interrupted save
+cannot truncate it. A file that exists but does not parse is moved aside as
+`connections.json.bad-<timestamp>` rather than replaced, and a file that cannot
+be read at all disables saving for the session instead of overwriting profiles
+that are still on disk.
 
 ## Development
 

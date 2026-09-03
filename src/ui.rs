@@ -10,6 +10,7 @@ use ratatui::widgets::{
 use crate::app::{
     App, ConsoleState, Field, FieldKind, Focus, InfoRow, InfoState, Modal, Screen, INFO_TABS,
 };
+use crate::json::{self, Token};
 use crate::redis_client::{KeyType, KeyValue};
 
 const ACCENT: Color = Color::Rgb(220, 56, 44);
@@ -281,6 +282,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 Line::from(Span::styled(k.name.clone(), Style::new().bold())),
                 Line::from(vec![
                     Span::styled(k.kind.name(), Style::new().fg(type_color(k.kind)).bold()),
+                    Span::styled(json_badge(&app.value), Style::new().fg(Color::Cyan).bold()),
                     Span::styled(format!("   ttl: {ttl}"), Style::new().fg(DIM)),
                     Span::styled(size, Style::new().fg(DIM)),
                 ]),
@@ -307,7 +309,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
             rows[1],
         ),
         Some(KeyValue::Str(s)) => {
-            let text = pretty_json(s);
+            let text = json_text(s);
             f.render_widget(
                 Paragraph::new(text)
                     .wrap(Wrap { trim: false })
@@ -468,15 +470,36 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App) {
             ..
         } => form(f, area, title, hint, fields, *focus, error.as_deref()),
         Modal::Editor {
-            title, textarea, ..
+            title,
+            textarea,
+            json: mode,
+            error,
+            ..
         } => {
-            let rect = centered(area, 90, 24);
+            let rect = centered(area, 90, 26);
             f.render_widget(Clear, rect);
-            let editor_title = format!("{title} — ctrl+s saves, esc cancels");
+            let editor_title = if mode.is_json() {
+                format!("{title} — ctrl+s saves, ctrl+f formats, esc cancels")
+            } else {
+                format!("{title} — ctrl+s saves, esc cancels")
+            };
             let block = panel(&editor_title, true);
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            f.render_widget(&**textarea, inner);
+            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+            f.render_widget(&**textarea, rows[0]);
+            let footer = match (error, mode.is_json()) {
+                (Some(e), _) => Span::styled(
+                    format!("invalid JSON — {e}"),
+                    Style::new().fg(ACCENT).bold(),
+                ),
+                (None, true) => Span::styled(
+                    "JSON — checked before it is saved".to_string(),
+                    Style::new().fg(DIM),
+                ),
+                (None, false) => Span::raw(""),
+            };
+            f.render_widget(Line::from(footer), rows[1]);
         }
         Modal::Console(state) => console(f, area, state),
         Modal::Info(state) => server_info(f, area, state),
@@ -858,6 +881,46 @@ fn one_line(s: &str) -> String {
 }
 
 /// Indent a value that parses as JSON; return it untouched otherwise.
+/// " · json" when a string value parses as a JSON document.
+fn json_badge(value: &Option<KeyValue>) -> String {
+    match value {
+        Some(KeyValue::Str(s)) if json::mode(s).is_json() => "  ·  json".into(),
+        _ => String::new(),
+    }
+}
+
+/// A string value as renderable text: coloured and indented when it is JSON,
+/// otherwise exactly what the server returned.
+fn json_text(s: &str) -> Text<'static> {
+    if !json::mode(s).is_json() {
+        return Text::raw(s.to_string());
+    }
+    let pretty = json::pretty(s);
+    Text::from(
+        json::highlight(&pretty)
+            .into_iter()
+            .map(|spans| {
+                Line::from(
+                    spans
+                        .into_iter()
+                        .map(|(kind, text)| Span::styled(text, token_style(kind)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn token_style(kind: Token) -> Style {
+    match kind {
+        Token::Key => Style::new().fg(Color::Cyan).bold(),
+        Token::Str => Style::new().fg(Color::Green),
+        Token::Number => Style::new().fg(Color::Yellow),
+        Token::Literal => Style::new().fg(Color::Magenta),
+        Token::Punct => Style::new().fg(DIM),
+    }
+}
+
 pub fn pretty_json(s: &str) -> String {
     let t = s.trim_start();
     if !t.starts_with('{') && !t.starts_with('[') {
@@ -910,9 +973,16 @@ fn help_text() -> Vec<Line<'static>> {
         row("n", "new key       D  delete key      R  rename key"),
         row("t", "set or clear TTL"),
         row("y", "copy the selected key name to the clipboard"),
-        row("r", "refresh"),
+        row(
+            "r",
+            "refresh — TTLs count down live, expired keys leave the tree",
+        ),
         head("Values"),
         row("e", "edit — string opens an editor, rows open a form"),
+        row(
+            "ctrl+f",
+            "reformat JSON in the editor · ctrl+s validates before saving",
+        ),
         row("a", "add an element (hash / list / set / zset / stream)"),
         row("x", "delete the selected element"),
         head("Server"),
