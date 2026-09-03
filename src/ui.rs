@@ -47,7 +47,7 @@ fn title_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
             " rediscope ",
             Style::new()
                 .bg(palette.accent)
-                .fg(palette.foreground)
+                .fg(palette.highlight_foreground)
                 .bold(),
         ),
         Span::raw(" "),
@@ -161,7 +161,7 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         .highlight_style(
             Style::new()
                 .bg(palette.accent)
-                .fg(palette.foreground)
+                .fg(palette.highlight_foreground)
                 .bold(),
         )
         .highlight_symbol(" ");
@@ -266,7 +266,7 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         .highlight_style(if focused {
             Style::new()
                 .bg(palette.accent)
-                .fg(palette.foreground)
+                .fg(palette.highlight_foreground)
                 .bold()
         } else {
             Style::new().bg(palette.panel)
@@ -384,7 +384,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 .row_highlight_style(if focused {
                     Style::new()
                         .bg(palette.accent)
-                        .fg(palette.foreground)
+                        .fg(palette.highlight_foreground)
                         .bold()
                 } else {
                     Style::new().bg(palette.panel)
@@ -399,7 +399,9 @@ fn status_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
         || app.status.starts_with("Could not")
         || app.status.contains("failed")
     {
-        Style::new().fg(palette.foreground).bg(palette.red)
+        Style::new()
+            .fg(palette.highlight_foreground)
+            .bg(palette.red)
     } else {
         Style::new().fg(palette.info)
     };
@@ -690,7 +692,10 @@ fn form(f: &mut Frame, area: Rect, view: FormView<'_>, palette: Palette) {
     let footer_line = match error {
         Some(e) => Line::from(Span::styled(
             truncate(&format!(" {e}"), width),
-            Style::new().fg(palette.foreground).bg(palette.red).bold(),
+            Style::new()
+                .fg(palette.highlight_foreground)
+                .bg(palette.red)
+                .bold(),
         )),
         None => {
             let text = if content_height > viewport.height {
@@ -771,7 +776,7 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
             if i == state.tab {
                 Style::new()
                     .bg(palette.accent)
-                    .fg(palette.foreground)
+                    .fg(palette.highlight_foreground)
                     .bold()
             } else {
                 Style::new().fg(palette.dim)

@@ -59,7 +59,8 @@ impl Theme {
         match self {
             Self::Redis => Palette {
                 background: Color::Reset,
-                foreground: Color::White,
+                foreground: Color::Reset,
+                highlight_foreground: Color::Black,
                 accent: rgb(220, 56, 44),
                 dim: rgb(130, 130, 140),
                 panel: rgb(60, 60, 70),
@@ -74,6 +75,7 @@ impl Theme {
             Self::Dracula => Palette {
                 background: rgb(40, 42, 54),
                 foreground: rgb(248, 248, 242),
+                highlight_foreground: rgb(40, 42, 54),
                 accent: rgb(255, 121, 198),
                 dim: rgb(98, 114, 164),
                 panel: rgb(68, 71, 90),
@@ -87,6 +89,7 @@ impl Theme {
             Self::CatppuccinMocha => Palette {
                 background: rgb(30, 30, 46),
                 foreground: rgb(205, 214, 244),
+                highlight_foreground: rgb(30, 30, 46),
                 accent: rgb(203, 166, 247),
                 dim: rgb(127, 132, 156),
                 panel: rgb(69, 71, 90),
@@ -100,6 +103,7 @@ impl Theme {
             Self::Nord => Palette {
                 background: rgb(46, 52, 64),
                 foreground: rgb(236, 239, 244),
+                highlight_foreground: rgb(46, 52, 64),
                 accent: rgb(136, 192, 208),
                 dim: rgb(129, 161, 193),
                 panel: rgb(76, 86, 106),
@@ -113,6 +117,7 @@ impl Theme {
             Self::GruvboxDark => Palette {
                 background: rgb(40, 40, 40),
                 foreground: rgb(235, 219, 178),
+                highlight_foreground: rgb(40, 40, 40),
                 accent: rgb(251, 73, 52),
                 dim: rgb(146, 131, 116),
                 panel: rgb(80, 73, 69),
@@ -126,6 +131,7 @@ impl Theme {
             Self::TokyoNight => Palette {
                 background: rgb(26, 27, 38),
                 foreground: rgb(192, 202, 245),
+                highlight_foreground: rgb(26, 27, 38),
                 accent: rgb(187, 154, 247),
                 dim: rgb(86, 95, 137),
                 panel: rgb(59, 66, 97),
@@ -144,6 +150,8 @@ impl Theme {
 pub struct Palette {
     pub background: Color,
     pub foreground: Color,
+    /// Text drawn over bright accent or error backgrounds.
+    pub highlight_foreground: Color,
     pub accent: Color,
     pub dim: Color,
     pub panel: Color,
@@ -173,5 +181,25 @@ mod tests {
             serde_json::from_str::<Theme>("\"gruvbox_dark\"").unwrap(),
             Theme::GruvboxDark
         );
+    }
+
+    #[test]
+    fn redis_inherits_both_terminal_colors() {
+        let palette = Theme::Redis.palette();
+        assert_eq!(palette.background, Color::Reset);
+        assert_eq!(palette.foreground, Color::Reset);
+    }
+
+    #[test]
+    fn dark_themes_use_their_background_for_highlight_text() {
+        for theme in Theme::ALL.into_iter().skip(1) {
+            let palette = theme.palette();
+            assert_eq!(
+                palette.highlight_foreground,
+                palette.background,
+                "{} should use dark text on bright highlights",
+                theme.name()
+            );
+        }
     }
 }
