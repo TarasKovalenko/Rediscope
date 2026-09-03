@@ -19,7 +19,7 @@ installs to `~/.local/bin` (`/usr/local/bin` when run as root).
 Pin a version or change the location:
 
 ```sh
-REDISCOPE_VERSION=v0.2.0 REDISCOPE_BIN_DIR=/usr/local/bin \
+REDISCOPE_VERSION=v0.3.0 REDISCOPE_BIN_DIR=/usr/local/bin \
   curl -fsSL https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.sh | sh
 ```
 
