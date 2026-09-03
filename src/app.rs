@@ -16,6 +16,7 @@ use crate::json::{self, JsonMode};
 use crate::redis_client::{
     is_destructive, Client, KeyInfo, KeyType, KeyValue, ServerInfo, KEY_LIMIT,
 };
+use crate::theme::Theme;
 use crate::tree::{Tree, VisibleRow};
 
 pub const NEW_KEY_TYPES: [KeyType; 6] = [
@@ -472,6 +473,10 @@ pub enum Modal {
     },
     Console(ConsoleState),
     Info(Box<InfoState>),
+    ThemePicker {
+        selected: usize,
+        original: Theme,
+    },
     Help,
 }
 
@@ -894,6 +899,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Char('p') => self.open_theme_picker(),
             KeyCode::Char('/') => self.conn_filter = Some(InputBuf::new(&self.conn_query)),
             KeyCode::Down | KeyCode::Char('j') => move_sel(&mut self.conn_state, len, 1),
             KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.conn_state, len, -1),
@@ -1146,6 +1152,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Char('p') => self.open_theme_picker(),
             KeyCode::Char('/') => self.search = Some(InputBuf::new("")),
             KeyCode::Char(':') => self.open_console(),
             KeyCode::Char('r') => {
@@ -1617,10 +1624,61 @@ impl App {
         }));
     }
 
+    fn open_theme_picker(&mut self) {
+        let original = self.store.theme;
+        self.modal = Some(Modal::ThemePicker {
+            selected: original.index(),
+            original,
+        });
+    }
+
     // ---- modal input ------------------------------------------------------
 
     fn modal_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Theme navigation updates the store for an immediate preview. Escape
+        // restores the opening value; Enter keeps it and persists it.
+        if let Some(Modal::ThemePicker { selected, original }) = &mut self.modal {
+            let mut close = false;
+            let mut save = false;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.store.theme = *original;
+                    close = true;
+                }
+                KeyCode::Enter => {
+                    save = true;
+                    close = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
+                    *selected = (*selected + 1) % Theme::ALL.len();
+                    self.store.theme = Theme::ALL[*selected];
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
+                    *selected = (*selected + Theme::ALL.len() - 1) % Theme::ALL.len();
+                    self.store.theme = Theme::ALL[*selected];
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    *selected = 0;
+                    self.store.theme = Theme::ALL[0];
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    *selected = Theme::ALL.len() - 1;
+                    self.store.theme = Theme::ALL[*selected];
+                }
+                _ => {}
+            }
+            if save {
+                self.status = match self.store.save() {
+                    Ok(()) => format!("Theme set to {}", self.store.theme.name()),
+                    Err(e) => format!("Could not save theme: {e}"),
+                };
+            }
+            if close {
+                self.modal = None;
+            }
+            return;
+        }
         match self.modal.as_mut().expect("modal_key with no modal") {
             Modal::Help | Modal::Message { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
@@ -1840,6 +1898,7 @@ impl App {
                     state.input.handle(key);
                 }
             },
+            Modal::ThemePicker { .. } => unreachable!("handled above"),
         }
     }
 

@@ -12,12 +12,14 @@ use crate::app::{
 };
 use crate::json::{self, Token};
 use crate::redis_client::{KeyType, KeyValue};
-
-const ACCENT: Color = Color::Rgb(220, 56, 44);
-const DIM: Color = Color::Rgb(130, 130, 140);
-const PANEL: Color = Color::Rgb(60, 60, 70);
+use crate::theme::{Palette, Theme};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    let palette = app.store.theme.palette();
+    f.render_widget(
+        Block::default().style(Style::new().bg(palette.background).fg(palette.foreground)),
+        f.area(),
+    );
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
@@ -26,24 +28,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .split(f.area());
 
-    title_bar(f, chunks[0], app);
+    title_bar(f, chunks[0], app, palette);
     match app.screen {
-        Screen::Connections => connections(f, chunks[1], app),
-        Screen::Browser => browser(f, chunks[1], app),
+        Screen::Connections => connections(f, chunks[1], app, palette),
+        Screen::Browser => browser(f, chunks[1], app, palette),
     }
-    status_bar(f, chunks[2], app);
-    footer(f, chunks[3], app);
+    status_bar(f, chunks[2], app, palette);
+    footer(f, chunks[3], app, palette);
 
     if app.modal.is_some() {
-        modal(f, f.area(), app);
+        modal(f, f.area(), app, palette);
     }
 }
 
-fn title_bar(f: &mut Frame, area: Rect, app: &App) {
+fn title_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
     let mut spans = vec![
         Span::styled(
             " rediscope ",
-            Style::new().bg(ACCENT).fg(Color::White).bold(),
+            Style::new()
+                .bg(palette.accent)
+                .fg(palette.highlight_foreground)
+                .bold(),
         ),
         Span::raw(" "),
     ];
@@ -52,24 +57,24 @@ fn title_bar(f: &mut Frame, area: Rect, app: &App) {
         let scheme = if c.tls { "rediss" } else { "redis" };
         spans.push(Span::styled(
             format!("{}  {scheme}://{}:{}/{}", c.name, c.host, c.port, c.db),
-            Style::new().fg(Color::White),
+            Style::new().fg(palette.foreground),
         ));
         if !app.server_line.is_empty() {
             spans.push(Span::styled(
                 format!("  ·  {}", app.server_line),
-                Style::new().fg(DIM),
+                Style::new().fg(palette.dim),
             ));
         }
     } else {
         spans.push(Span::styled(
             "a terminal Redis client",
-            Style::new().fg(DIM),
+            Style::new().fg(palette.dim),
         ));
     }
     f.render_widget(Line::from(spans), area);
 }
 
-fn connections(f: &mut Frame, area: Rect, app: &mut App) {
+fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let cols = Layout::horizontal([
         Constraint::Percentage(15),
         Constraint::Min(44),
@@ -87,12 +92,13 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(buf) = &app.conn_filter {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("/", Style::new().fg(ACCENT).bold()),
+                Span::styled("/", Style::new().fg(palette.accent).bold()),
                 Span::raw(buf.value()),
             ]))
             .block(panel(
                 "Filter by name or host (Enter keeps it, Esc closes)",
                 true,
+                palette,
             )),
             rows[0],
         );
@@ -117,20 +123,23 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App) {
                         c.port,
                         c.db
                     ),
-                    Style::new().fg(DIM),
+                    Style::new().fg(palette.dim),
                 ),
             ];
             if c.tls {
-                spans.push(Span::styled("  TLS", Style::new().fg(Color::Green)));
+                spans.push(Span::styled("  TLS", Style::new().fg(palette.success)));
             }
             if c.tls_insecure {
-                spans.push(Span::styled("  no-verify", Style::new().fg(Color::Yellow)));
+                spans.push(Span::styled(
+                    "  no-verify",
+                    Style::new().fg(palette.warning),
+                ));
             }
             if c.use_keychain {
-                spans.push(Span::styled("  keychain", Style::new().fg(Color::Cyan)));
+                spans.push(Span::styled("  keychain", Style::new().fg(palette.info)));
             }
             if app.testing.as_deref() == Some(c.name.as_str()) {
-                spans.push(Span::styled("  testing…", Style::new().fg(ACCENT)));
+                spans.push(Span::styled("  testing…", Style::new().fg(palette.accent)));
             }
             ListItem::new(Line::from(spans))
         })
@@ -148,8 +157,13 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let empty = items.is_empty();
     let list = List::new(items)
-        .block(panel(&title, !filtering))
-        .highlight_style(Style::new().bg(ACCENT).fg(Color::White).bold())
+        .block(panel(&title, !filtering, palette))
+        .highlight_style(
+            Style::new()
+                .bg(palette.accent)
+                .fg(palette.highlight_foreground)
+                .bold(),
+        )
         .highlight_symbol(" ");
     f.render_stateful_widget(list, rows[1], &mut app.conn_state);
 
@@ -160,20 +174,20 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App) {
             "Nothing matches this filter. Press esc to clear it."
         };
         f.render_widget(
-            Paragraph::new(message).style(Style::new().fg(DIM)),
+            Paragraph::new(message).style(Style::new().fg(palette.dim)),
             rows[1].inner(Margin::new(2, 1)),
         );
     }
 }
 
-fn browser(f: &mut Frame, area: Rect, app: &mut App) {
+fn browser(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let cols =
         Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(area);
-    key_panel(f, cols[0], app);
-    value_panel(f, cols[1], app);
+    key_panel(f, cols[0], app, palette);
+    value_panel(f, cols[1], app, palette);
 }
 
-fn key_panel(f: &mut Frame, area: Rect, app: &mut App) {
+fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let rows = if app.search.is_some() {
         Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area)
     } else {
@@ -183,10 +197,14 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App) {
         let text = buf.value();
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("/", Style::new().fg(ACCENT).bold()),
+                Span::styled("/", Style::new().fg(palette.accent).bold()),
                 Span::raw(text.clone()),
             ]))
-            .block(panel("Search pattern (Enter applies, Esc cancels)", true)),
+            .block(panel(
+                "Search pattern (Enter applies, Esc cancels)",
+                true,
+                palette,
+            )),
             rows[0],
         );
         f.set_cursor_position((rows[0].x + 2 + buf.cursor() as u16, rows[0].y + 1));
@@ -201,23 +219,26 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App) {
             let line = match (&r.folder_path, &r.key) {
                 (Some(_), _) => Line::from(vec![
                     Span::raw(indent),
-                    Span::styled(if r.expanded { "▾ " } else { "▸ " }, Style::new().fg(DIM)),
-                    Span::styled(r.label.clone(), Style::new().fg(Color::White).bold()),
-                    Span::styled(format!("  ({})", r.leaves), Style::new().fg(DIM)),
+                    Span::styled(
+                        if r.expanded { "▾ " } else { "▸ " },
+                        Style::new().fg(palette.dim),
+                    ),
+                    Span::styled(r.label.clone(), Style::new().fg(palette.foreground).bold()),
+                    Span::styled(format!("  ({})", r.leaves), Style::new().fg(palette.dim)),
                 ]),
                 (None, Some(k)) => {
                     let mut spans = vec![
                         Span::raw(indent),
                         Span::styled(
                             format!("{} ", k.kind.badge()),
-                            Style::new().fg(type_color(k.kind)).bold(),
+                            Style::new().fg(type_color(k.kind, palette)).bold(),
                         ),
                         Span::raw(r.label.clone()),
                     ];
                     if k.ttl >= 0 {
                         spans.push(Span::styled(
                             format!("  {}", human_ttl(k.ttl)),
-                            Style::new().fg(Color::Yellow),
+                            Style::new().fg(palette.warning),
                         ));
                     }
                     Line::from(spans)
@@ -241,24 +262,27 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let list = List::new(items)
-        .block(panel(&title, focused))
+        .block(panel(&title, focused, palette))
         .highlight_style(if focused {
-            Style::new().bg(ACCENT).fg(Color::White).bold()
+            Style::new()
+                .bg(palette.accent)
+                .fg(palette.highlight_foreground)
+                .bold()
         } else {
-            Style::new().bg(PANEL)
+            Style::new().bg(palette.panel)
         });
     f.render_stateful_widget(list, rows[1], &mut app.tree_state);
 
     if app.rows.is_empty() && !app.loading {
         f.render_widget(
             Paragraph::new("No keys match. Press / to change the pattern.")
-                .style(Style::new().fg(DIM)),
+                .style(Style::new().fg(palette.dim)),
             rows[1].inner(Margin::new(2, 1)),
         );
     }
 }
 
-fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
+fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(area);
 
     let header = match &app.current {
@@ -281,22 +305,25 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
             Paragraph::new(vec![
                 Line::from(Span::styled(k.name.clone(), Style::new().bold())),
                 Line::from(vec![
-                    Span::styled(k.kind.name(), Style::new().fg(type_color(k.kind)).bold()),
-                    Span::styled(json_badge(&app.value), Style::new().fg(Color::Cyan).bold()),
-                    Span::styled(format!("   ttl: {ttl}"), Style::new().fg(DIM)),
-                    Span::styled(size, Style::new().fg(DIM)),
+                    Span::styled(
+                        k.kind.name(),
+                        Style::new().fg(type_color(k.kind, palette)).bold(),
+                    ),
+                    Span::styled(json_badge(&app.value), Style::new().fg(palette.info).bold()),
+                    Span::styled(format!("   ttl: {ttl}"), Style::new().fg(palette.dim)),
+                    Span::styled(size, Style::new().fg(palette.dim)),
                 ]),
             ])
         }
         None => Paragraph::new(Line::from(Span::styled(
             "Select a key on the left.",
-            Style::new().fg(DIM),
+            Style::new().fg(palette.dim),
         ))),
     };
-    f.render_widget(header.block(panel("Key", false)), rows[0]);
+    f.render_widget(header.block(panel("Key", false, palette)), rows[0]);
 
     let focused = app.focus == Focus::Value;
-    let block = panel("Value", focused);
+    let block = panel("Value", focused, palette);
     match &app.value {
         None => f.render_widget(
             Paragraph::new(if app.current.is_some() {
@@ -304,12 +331,12 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 ""
             })
-            .style(Style::new().fg(DIM))
+            .style(Style::new().fg(palette.dim))
             .block(block),
             rows[1],
         ),
         Some(KeyValue::Str(s)) => {
-            let text = json_text(s);
+            let text = json_text(s, palette);
             f.render_widget(
                 Paragraph::new(text)
                     .wrap(Wrap { trim: false })
@@ -321,7 +348,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
         Some(KeyValue::Unsupported(msg)) => f.render_widget(
             Paragraph::new(msg.clone())
                 .wrap(Wrap { trim: true })
-                .style(Style::new().fg(DIM))
+                .style(Style::new().fg(palette.dim))
                 .block(block),
             rows[1],
         ),
@@ -337,7 +364,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
             let header_row = Row::new(
                 headers
                     .iter()
-                    .map(|h| Cell::from(Span::styled(*h, Style::new().fg(ACCENT).bold())))
+                    .map(|h| Cell::from(Span::styled(*h, Style::new().fg(palette.accent).bold())))
                     .collect::<Vec<_>>(),
             );
             let body: Vec<Row> = data
@@ -355,20 +382,28 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 .header(header_row)
                 .block(block)
                 .row_highlight_style(if focused {
-                    Style::new().bg(ACCENT).fg(Color::White).bold()
+                    Style::new()
+                        .bg(palette.accent)
+                        .fg(palette.highlight_foreground)
+                        .bold()
                 } else {
-                    Style::new().bg(PANEL)
+                    Style::new().bg(palette.panel)
                 });
             f.render_stateful_widget(table, rows[1], &mut app.value_state);
         }
     }
 }
 
-fn status_bar(f: &mut Frame, area: Rect, app: &App) {
-    let style = if app.status.starts_with("Error") || app.status.contains("failed") {
-        Style::new().fg(Color::White).bg(ACCENT)
+fn status_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
+    let style = if app.status.starts_with("Error")
+        || app.status.starts_with("Could not")
+        || app.status.contains("failed")
+    {
+        Style::new()
+            .fg(palette.highlight_foreground)
+            .bg(palette.red)
     } else {
-        Style::new().fg(Color::Cyan)
+        Style::new().fg(palette.info)
     };
     f.render_widget(
         Paragraph::new(Span::styled(format!(" {}", app.status), style)),
@@ -376,7 +411,7 @@ fn status_bar(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn footer(f: &mut Frame, area: Rect, app: &App) {
+fn footer(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
     let keys: &[(&str, &str)] = match (app.screen, app.modal.is_some()) {
         (_, true) => &[("esc", "close"), ("enter", "confirm")],
         (Screen::Connections, _) => &[
@@ -389,6 +424,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("J/K", "reorder"),
             ("T", "test"),
             ("/", "filter"),
+            ("p", "theme"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -403,6 +439,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             ("t", "ttl"),
             (":", "console"),
             ("i", "info"),
+            ("p", "theme"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -411,41 +448,44 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
     for (k, label) in keys {
         spans.push(Span::styled(
             format!(" {k} "),
-            Style::new().bg(PANEL).fg(Color::White).bold(),
+            Style::new().bg(palette.panel).fg(palette.foreground).bold(),
         ));
-        spans.push(Span::styled(format!(" {label}  "), Style::new().fg(DIM)));
+        spans.push(Span::styled(
+            format!(" {label}  "),
+            Style::new().fg(palette.dim),
+        ));
     }
     f.render_widget(Line::from(spans), area);
 }
 
 // ---- modals -------------------------------------------------------------
 
-fn modal(f: &mut Frame, area: Rect, app: &mut App) {
+fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let Some(m) = &app.modal else { return };
     match m {
         Modal::Help => {
-            let rect = centered(area, 74, 29);
-            f.render_widget(Clear, rect);
+            let rect = centered(area, 74, 31);
+            clear_area(f, rect, palette);
             f.render_widget(
-                Paragraph::new(help_text())
-                    .block(panel("Keybindings — esc closes", true))
+                Paragraph::new(help_text(palette))
+                    .block(panel("Keybindings — esc closes", true, palette))
                     .wrap(Wrap { trim: false }),
                 rect,
             );
         }
         Modal::Message { title, body } => {
             let rect = centered(area, 64, 9);
-            f.render_widget(Clear, rect);
+            clear_area(f, rect, palette);
             f.render_widget(
                 Paragraph::new(body.clone())
                     .wrap(Wrap { trim: true })
-                    .block(panel(title, true)),
+                    .block(panel(title, true, palette)),
                 rect,
             );
         }
         Modal::Confirm { message, .. } => {
             let rect = centered(area, 66, 8);
-            f.render_widget(Clear, rect);
+            clear_area(f, rect, palette);
             f.render_widget(
                 Paragraph::new(vec![
                     Line::raw(""),
@@ -453,11 +493,13 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App) {
                     Line::raw(""),
                     Line::from(Span::styled(
                         "y = yes    n / esc = no",
-                        Style::new().fg(DIM),
+                        Style::new().fg(palette.dim),
                     )),
                 ])
                 .wrap(Wrap { trim: true })
-                .block(panel("Confirm", true).border_style(Style::new().fg(ACCENT))),
+                .block(
+                    panel("Confirm", true, palette).border_style(Style::new().fg(palette.accent)),
+                ),
                 rect,
             );
         }
@@ -468,7 +510,18 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App) {
             focus,
             error,
             ..
-        } => form(f, area, title, hint, fields, *focus, error.as_deref()),
+        } => form(
+            f,
+            area,
+            FormView {
+                title,
+                hint,
+                fields,
+                focus: *focus,
+                error: error.as_deref(),
+            },
+            palette,
+        ),
         Modal::Editor {
             title,
             textarea,
@@ -477,13 +530,13 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App) {
             ..
         } => {
             let rect = centered(area, 90, 26);
-            f.render_widget(Clear, rect);
+            clear_area(f, rect, palette);
             let editor_title = if mode.is_json() {
                 format!("{title} — ctrl+s saves, ctrl+f formats, esc cancels")
             } else {
                 format!("{title} — ctrl+s saves, esc cancels")
             };
-            let block = panel(&editor_title, true);
+            let block = panel(&editor_title, true, palette);
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
@@ -491,35 +544,43 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App) {
             let footer = match (error, mode.is_json()) {
                 (Some(e), _) => Span::styled(
                     format!("invalid JSON — {e}"),
-                    Style::new().fg(ACCENT).bold(),
+                    Style::new().fg(palette.red).bold(),
                 ),
                 (None, true) => Span::styled(
                     "JSON — checked before it is saved".to_string(),
-                    Style::new().fg(DIM),
+                    Style::new().fg(palette.dim),
                 ),
                 (None, false) => Span::raw(""),
             };
             f.render_widget(Line::from(footer), rows[1]);
         }
-        Modal::Console(state) => console(f, area, state),
-        Modal::Info(state) => server_info(f, area, state),
+        Modal::Console(state) => console(f, area, state, palette),
+        Modal::Info(state) => server_info(f, area, state, palette),
+        Modal::ThemePicker { selected, .. } => theme_picker(f, area, *selected, palette),
     }
 }
 
-fn form(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    hint: &str,
-    fields: &[Field],
+struct FormView<'a> {
+    title: &'a str,
+    hint: &'a str,
+    fields: &'a [Field],
     focus: usize,
-    error: Option<&str>,
-) {
+    error: Option<&'a str>,
+}
+
+fn form(f: &mut Frame, area: Rect, view: FormView<'_>, palette: Palette) {
+    let FormView {
+        title,
+        hint,
+        fields,
+        focus,
+        error,
+    } = view;
     let content_height: u16 = fields.iter().map(|f| f.height()).sum();
     // +2 borders, +1 hint line.
     let rect = centered(area, 68, content_height + 3);
-    f.render_widget(Clear, rect);
-    let block = panel(title, true);
+    clear_area(f, rect, palette);
+    let block = panel(title, true, palette);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -565,7 +626,7 @@ fn form(
                     Line::raw(""),
                     Line::from(Span::styled(
                         field.label.to_uppercase(),
-                        Style::new().fg(ACCENT).bold(),
+                        Style::new().fg(palette.accent).bold(),
                     )),
                 ]),
                 row,
@@ -573,7 +634,11 @@ fn form(
             continue;
         }
         let active = i == focus;
-        let border = if active { ACCENT } else { PANEL };
+        let border = if active {
+            palette.accent
+        } else {
+            palette.panel
+        };
         let content = match &field.kind {
             FieldKind::Secret => "•".repeat(field.value().chars().count()),
             FieldKind::Bool => {
@@ -607,9 +672,9 @@ fn form(
                     .title(Span::styled(
                         format!(" {} ", field.label),
                         if active {
-                            Style::new().fg(ACCENT).bold()
+                            Style::new().fg(palette.accent).bold()
                         } else {
-                            Style::new().fg(DIM)
+                            Style::new().fg(palette.dim)
                         },
                     )),
             ),
@@ -627,7 +692,10 @@ fn form(
     let footer_line = match error {
         Some(e) => Line::from(Span::styled(
             truncate(&format!(" {e}"), width),
-            Style::new().fg(Color::White).bg(ACCENT).bold(),
+            Style::new()
+                .fg(palette.highlight_foreground)
+                .bg(palette.red)
+                .bold(),
         )),
         None => {
             let text = if content_height > viewport.height {
@@ -635,21 +703,62 @@ fn form(
             } else {
                 format!(" {hint}")
             };
-            Line::from(Span::styled(truncate(&text, width), Style::new().fg(DIM)))
+            Line::from(Span::styled(
+                truncate(&text, width),
+                Style::new().fg(palette.dim),
+            ))
         }
     };
     f.render_widget(Paragraph::new(footer_line), rows[1]);
 }
 
+fn theme_picker(f: &mut Frame, area: Rect, selected: usize, palette: Palette) {
+    let rect = centered(area, 58, Theme::ALL.len() as u16 + 4);
+    clear_area(f, rect, palette);
+    let block = panel(
+        "Theme — ↑↓ previews, Enter saves, Esc cancels",
+        true,
+        palette,
+    );
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let items = Theme::ALL.iter().enumerate().map(|(i, theme)| {
+        let sample = theme.palette();
+        let marker = if i == selected { "›" } else { " " };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {marker} {:<19}", theme.name()),
+                if i == selected {
+                    Style::new().fg(palette.foreground).bold()
+                } else {
+                    Style::new().fg(palette.dim)
+                },
+            ),
+            Span::styled("●", Style::new().fg(sample.accent)),
+            Span::styled(" ●", Style::new().fg(sample.info)),
+            Span::styled(" ●", Style::new().fg(sample.success)),
+            Span::styled(" ●", Style::new().fg(sample.warning)),
+            Span::styled(
+                format!("  {}", theme.description()),
+                Style::new().fg(palette.dim),
+            ),
+        ]);
+        ListItem::new(line)
+    });
+    f.render_widget(List::new(items), inner);
+}
+
 /// The `INFO` viewer: a tab strip over a scrolling, filterable field list.
-fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
+fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
     // Fill most of the terminal — INFO is long, and a taller list means less
     // scrolling on the big sections.
     let rect = centered(area, area.width.saturating_sub(6).min(110), area.height);
-    f.render_widget(Clear, rect);
+    clear_area(f, rect, palette);
     let block = panel(
         "Server info — tab / 1-5 section, / filter, ↑↓ scroll, y copy, r refresh, esc closes",
         true,
+        palette,
     );
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -665,9 +774,12 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
         tabs.push(Span::styled(
             format!(" {} {name} ", i + 1),
             if i == state.tab {
-                Style::new().bg(ACCENT).fg(Color::White).bold()
+                Style::new()
+                    .bg(palette.accent)
+                    .fg(palette.highlight_foreground)
+                    .bold()
             } else {
-                Style::new().fg(DIM)
+                Style::new().fg(palette.dim)
             },
         ));
         tabs.push(Span::raw(" "));
@@ -686,12 +798,12 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
     let filter_span = match (&state.filter, state.query.as_str()) {
         (Some(buf), _) => Span::styled(
             format!("/{}", buf.value()),
-            Style::new().fg(Color::White).bold(),
+            Style::new().fg(palette.foreground).bold(),
         ),
-        (None, "") => Span::styled("/ filters this section", Style::new().fg(DIM)),
+        (None, "") => Span::styled("/ filters this section", Style::new().fg(palette.dim)),
         (None, q) => Span::styled(
             format!("filter: {q}   (esc clears)"),
-            Style::new().fg(ACCENT),
+            Style::new().fg(palette.accent),
         ),
     };
     let counter = if all.len() > visible {
@@ -706,7 +818,7 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
     };
     f.render_widget(Line::from(filter_span), rows[1]);
     f.render_widget(
-        Line::from(Span::styled(counter, Style::new().fg(DIM))).right_aligned(),
+        Line::from(Span::styled(counter, Style::new().fg(palette.dim))).right_aligned(),
         rows[1],
     );
     if let Some(buf) = &state.filter {
@@ -721,16 +833,16 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
         .map(|row| match row {
             InfoRow::Head(name) => Line::from(Span::styled(
                 format!("{name} "),
-                Style::new().fg(ACCENT).bold(),
+                Style::new().fg(palette.accent).bold(),
             )),
             InfoRow::Field(k, v) => Line::from(vec![
                 Span::styled(
                     format!("  {:<key_width$}", truncate(k, key_width.saturating_sub(1))),
-                    Style::new().fg(DIM),
+                    Style::new().fg(palette.dim),
                 ),
                 Span::styled(
                     truncate(&one_line(v), value_width),
-                    Style::new().fg(Color::White),
+                    Style::new().fg(palette.foreground),
                 ),
             ]),
             InfoRow::Gauge {
@@ -747,14 +859,20 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
                             "  {:<key_width$}",
                             truncate(label, key_width.saturating_sub(1))
                         ),
-                        Style::new().fg(DIM),
+                        Style::new().fg(palette.dim),
                     ),
                     Span::styled(
                         "█".repeat(filled),
-                        Style::new().fg(gauge_color(*ratio, *alarm_high)),
+                        Style::new().fg(gauge_color(*ratio, *alarm_high, palette)),
                     ),
-                    Span::styled("░".repeat(bar_width - filled), Style::new().fg(PANEL)),
-                    Span::styled(format!(" {text}"), Style::new().fg(Color::White).bold()),
+                    Span::styled(
+                        "░".repeat(bar_width - filled),
+                        Style::new().fg(palette.panel),
+                    ),
+                    Span::styled(
+                        format!(" {text}"),
+                        Style::new().fg(palette.foreground).bold(),
+                    ),
                 ])
             }
         })
@@ -767,8 +885,8 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
-                .thumb_style(Style::new().fg(ACCENT))
-                .track_style(Style::new().fg(PANEL)),
+                .thumb_style(Style::new().fg(palette.accent))
+                .track_style(Style::new().fg(palette.panel)),
             body,
             &mut sb,
         );
@@ -778,19 +896,19 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState) {
 /// Green while a ratio is healthy, red once it is alarming. Which end is
 /// alarming depends on the metric: a full memory bar is bad, a full hit-rate
 /// bar is good.
-fn gauge_color(ratio: f64, alarm_high: bool) -> Color {
+fn gauge_color(ratio: f64, alarm_high: bool, palette: Palette) -> Color {
     let bad = if alarm_high { ratio } else { 1.0 - ratio };
     match bad {
-        r if r >= 0.9 => ACCENT,
-        r if r >= 0.75 => Color::Yellow,
-        _ => Color::Green,
+        r if r >= 0.9 => palette.red,
+        r if r >= 0.75 => palette.warning,
+        _ => palette.success,
     }
 }
 
-fn console(f: &mut Frame, area: Rect, state: &ConsoleState) {
+fn console(f: &mut Frame, area: Rect, state: &ConsoleState, palette: Palette) {
     let rect = centered(area, 92, 26);
-    f.render_widget(Clear, rect);
-    let block = panel("Command console — esc closes, ↑↓ history", true);
+    clear_area(f, rect, palette);
+    let block = panel("Command console — esc closes, ↑↓ history", true, palette);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
@@ -801,9 +919,12 @@ fn console(f: &mut Frame, area: Rect, state: &ConsoleState) {
         .iter()
         .map(|l| {
             if l.starts_with("> ") {
-                Line::from(Span::styled(l.clone(), Style::new().fg(Color::Cyan).bold()))
+                Line::from(Span::styled(
+                    l.clone(),
+                    Style::new().fg(palette.info).bold(),
+                ))
             } else if l.starts_with("(error)") {
-                Line::from(Span::styled(l.clone(), Style::new().fg(ACCENT)))
+                Line::from(Span::styled(l.clone(), Style::new().fg(palette.red)))
             } else {
                 Line::raw(l.clone())
             }
@@ -813,7 +934,7 @@ fn console(f: &mut Frame, area: Rect, state: &ConsoleState) {
 
     let prompt = format!("> {}", state.input.value());
     f.render_widget(
-        Paragraph::new(Span::styled(prompt, Style::new().fg(Color::White))),
+        Paragraph::new(Span::styled(prompt, Style::new().fg(palette.foreground))),
         rows[1],
     );
     f.set_cursor_position((rows[1].x + 2 + state.input.cursor() as u16, rows[1].y));
@@ -821,17 +942,29 @@ fn console(f: &mut Frame, area: Rect, state: &ConsoleState) {
 
 // ---- helpers ------------------------------------------------------------
 
-fn panel(title: &str, focused: bool) -> Block<'_> {
+fn clear_area(f: &mut Frame, area: Rect, palette: Palette) {
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default().style(Style::new().bg(palette.background).fg(palette.foreground)),
+        area,
+    );
+}
+
+fn panel(title: &str, focused: bool, palette: Palette) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if focused { ACCENT } else { PANEL }))
+        .border_style(Style::new().fg(if focused {
+            palette.accent
+        } else {
+            palette.panel
+        }))
         .title(Span::styled(
             format!(" {title} "),
             if focused {
-                Style::new().fg(Color::White).bold()
+                Style::new().fg(palette.foreground).bold()
             } else {
-                Style::new().fg(DIM)
+                Style::new().fg(palette.dim)
             },
         ))
 }
@@ -855,15 +988,15 @@ fn truncate(s: &str, width: usize) -> String {
     }
 }
 
-fn type_color(kind: KeyType) -> Color {
+fn type_color(kind: KeyType, palette: Palette) -> Color {
     match kind {
-        KeyType::String => Color::Cyan,
-        KeyType::Hash => Color::Green,
-        KeyType::List => Color::Yellow,
-        KeyType::Set => Color::Magenta,
-        KeyType::ZSet => Color::Blue,
-        KeyType::Stream => Color::LightRed,
-        KeyType::Other => DIM,
+        KeyType::String => palette.info,
+        KeyType::Hash => palette.success,
+        KeyType::List => palette.warning,
+        KeyType::Set => palette.magenta,
+        KeyType::ZSet => palette.blue,
+        KeyType::Stream => palette.red,
+        KeyType::Other => palette.dim,
     }
 }
 
@@ -891,7 +1024,7 @@ fn json_badge(value: &Option<KeyValue>) -> String {
 
 /// A string value as renderable text: coloured and indented when it is JSON,
 /// otherwise exactly what the server returned.
-fn json_text(s: &str) -> Text<'static> {
+fn json_text(s: &str, palette: Palette) -> Text<'static> {
     if !json::mode(s).is_json() {
         return Text::raw(s.to_string());
     }
@@ -903,7 +1036,7 @@ fn json_text(s: &str) -> Text<'static> {
                 Line::from(
                     spans
                         .into_iter()
-                        .map(|(kind, text)| Span::styled(text, token_style(kind)))
+                        .map(|(kind, text)| Span::styled(text, token_style(kind, palette)))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -911,13 +1044,13 @@ fn json_text(s: &str) -> Text<'static> {
     )
 }
 
-fn token_style(kind: Token) -> Style {
+fn token_style(kind: Token, palette: Palette) -> Style {
     match kind {
-        Token::Key => Style::new().fg(Color::Cyan).bold(),
-        Token::Str => Style::new().fg(Color::Green),
-        Token::Number => Style::new().fg(Color::Yellow),
-        Token::Literal => Style::new().fg(Color::Magenta),
-        Token::Punct => Style::new().fg(DIM),
+        Token::Key => Style::new().fg(palette.info).bold(),
+        Token::Str => Style::new().fg(palette.success),
+        Token::Number => Style::new().fg(palette.warning),
+        Token::Literal => Style::new().fg(palette.magenta),
+        Token::Punct => Style::new().fg(palette.dim),
     }
 }
 
@@ -945,11 +1078,15 @@ pub fn human_ttl(seconds: i64) -> String {
     }
 }
 
-fn help_text() -> Vec<Line<'static>> {
-    let head = |t: &'static str| Line::from(Span::styled(t, Style::new().fg(ACCENT).bold()));
+fn help_text(palette: Palette) -> Vec<Line<'static>> {
+    let head =
+        |t: &'static str| Line::from(Span::styled(t, Style::new().fg(palette.accent).bold()));
     let row = |k: &'static str, d: &'static str| {
         Line::from(vec![
-            Span::styled(format!("  {k:<12}"), Style::new().fg(Color::White).bold()),
+            Span::styled(
+                format!("  {k:<12}"),
+                Style::new().fg(palette.foreground).bold(),
+            ),
             Span::raw(d),
         ])
     };
@@ -962,6 +1099,7 @@ fn help_text() -> Vec<Line<'static>> {
         row("d", "delete         J / K  move the profile down / up"),
         row("T", "test the connection without opening it"),
         row("/", "filter by name or host · esc clears the filter"),
+        row("p", "choose a colour theme (saved for the next run)"),
         head("Navigation"),
         row("j / k  ↑↓", "move        g / G  jump to top / bottom"),
         row("h / l  ←→", "collapse / expand folder"),

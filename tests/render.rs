@@ -8,6 +8,7 @@ use rediscope::app::{App, Msg};
 use rediscope::config::{Connection, Store};
 use rediscope::redis_client::ServerInfo;
 use rediscope::redis_client::{KeyInfo, KeyType, KeyValue, Row};
+use rediscope::theme::Theme;
 use rediscope::ui;
 
 /// Point the config at a scratch directory. Several of these tests add,
@@ -118,6 +119,16 @@ async fn renders_every_screen_and_modal_at_any_size() {
     press(&mut a, KeyCode::Char('?')); // help
     render_all_sizes(&mut a);
     press(&mut a, KeyCode::Esc);
+
+    // Every built-in theme previews without breaking any supported layout.
+    press(&mut a, KeyCode::Char('p'));
+    for theme in Theme::ALL {
+        assert_eq!(a.store.theme, theme);
+        render_all_sizes(&mut a);
+        press(&mut a, KeyCode::Down);
+    }
+    press(&mut a, KeyCode::Esc);
+    assert_eq!(a.store.theme, Theme::Redis, "cancel restores the old theme");
 
     press(&mut a, KeyCode::Char('n')); // connection form
     render_all_sizes(&mut a);

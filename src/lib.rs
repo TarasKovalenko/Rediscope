@@ -8,5 +8,6 @@ pub mod json;
 pub mod osc52;
 pub mod redis_client;
 pub mod secrets;
+pub mod theme;
 pub mod tree;
 pub mod ui;
