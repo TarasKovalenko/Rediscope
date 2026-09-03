@@ -44,6 +44,8 @@ case "$os" in
       os_part="unknown-linux-gnu"
     fi
     ;;
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    die "on Windows use the PowerShell installer: irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex" ;;
   *) die "unsupported operating system: $os (build from source with 'cargo install --git https://github.com/$REPO')" ;;
 esac
 case "$arch" in

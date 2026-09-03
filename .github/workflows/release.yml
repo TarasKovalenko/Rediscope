@@ -38,6 +38,10 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,11 +53,17 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # ring assembles its x86_64 primitives with nasm on Windows.
+      - name: Install nasm
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1
+
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --locked --git https://github.com/cross-rs/cross
 
       - name: Build
+        shell: bash
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --locked --target ${{ matrix.target }}
@@ -63,10 +73,19 @@ jobs:
 
       - name: Package
         id: package
+        shell: bash
         run: |
           VERSION="${{ github.event.inputs.tag || github.ref_name }}"
-          NAME="rediscope-${VERSION}-${{ matrix.target }}.tar.gz"
-          tar -czf "$NAME" -C "target/${{ matrix.target }}/release" rediscope
+          DIR="target/${{ matrix.target }}/release"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            NAME="rediscope-${VERSION}-${{ matrix.target }}.zip"
+            # Compress-Archive keeps the archive readable by Explorer's built-in unzip.
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path '$DIR/rediscope.exe' -DestinationPath '$NAME' -Force"
+          else
+            NAME="rediscope-${VERSION}-${{ matrix.target }}.tar.gz"
+            tar -czf "$NAME" -C "$DIR" rediscope
+          fi
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -87,7 +106,7 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
@@ -95,5 +114,6 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS
           generate_release_notes: true
