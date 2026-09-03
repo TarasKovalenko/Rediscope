@@ -12,7 +12,9 @@ use tui_textarea::TextArea;
 
 use crate::config::{Connection, Store};
 use crate::input::InputBuf;
-use crate::redis_client::{is_destructive, Client, KeyInfo, KeyType, KeyValue, KEY_LIMIT};
+use crate::redis_client::{
+    is_destructive, Client, KeyInfo, KeyType, KeyValue, ServerInfo, KEY_LIMIT,
+};
 use crate::tree::{Tree, VisibleRow};
 
 pub const NEW_KEY_TYPES: [KeyType; 6] = [
@@ -42,6 +44,8 @@ pub enum Msg {
     Console(String),
     /// A connection test finished: profile name, then the result.
     Probe(String, Box<Result<crate::redis_client::Probe, String>>),
+    /// An `INFO` read finished, for the server-info modal.
+    Info(Box<Result<ServerInfo, String>>),
     Status(String),
     Error(String),
     Noop,
@@ -156,6 +160,283 @@ impl Field {
     }
 }
 
+/// Tabs of the server-info modal, in display order.
+pub const INFO_TABS: [&str; 5] = ["Server", "Memory", "Stats", "Key Statistics", "All"];
+
+/// One rendered line of the server-info modal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InfoRow {
+    Head(String),
+    Field(String, String),
+    /// A proportion worth seeing as a bar: memory used, cache hit rate.
+    Gauge {
+        label: String,
+        ratio: f64,
+        text: String,
+        /// True when a full bar is the bad outcome (memory), false when it is
+        /// the good one (hit rate).
+        alarm_high: bool,
+    },
+}
+
+impl InfoRow {
+    /// The text a filter matches against.
+    fn haystack(&self) -> String {
+        match self {
+            Self::Head(h) => h.clone(),
+            Self::Field(k, v) => format!("{k} {v}"),
+            Self::Gauge { label, text, .. } => format!("{label} {text}"),
+        }
+    }
+}
+
+pub struct InfoState {
+    pub info: ServerInfo,
+    pub tab: usize,
+    pub scroll: u16,
+    /// Live text of the field filter, while it has focus.
+    pub filter: Option<InputBuf>,
+    /// The applied filter. Empty means "show everything".
+    pub query: String,
+}
+
+impl InfoState {
+    pub fn new(info: ServerInfo) -> Self {
+        Self {
+            info,
+            tab: 0,
+            scroll: 0,
+            filter: None,
+            query: String::new(),
+        }
+    }
+
+    /// Rows for the selected tab, after the filter. Curated tabs mirror one
+    /// `INFO` section; "Key Statistics" is assembled from Keyspace plus the
+    /// hit/miss counters.
+    pub fn rows(&self) -> Vec<InfoRow> {
+        let rows = match INFO_TABS[self.tab.min(INFO_TABS.len() - 1)] {
+            "Server" => self.server(),
+            "Memory" => self.memory(),
+            "Stats" => section_rows(&self.info, "Stats"),
+            "Key Statistics" => self.key_statistics(),
+            _ => self
+                .info
+                .sections
+                .iter()
+                .flat_map(|s| {
+                    std::iter::once(InfoRow::Head(s.name.clone())).chain(
+                        s.fields
+                            .iter()
+                            .map(|(k, v)| InfoRow::Field(k.clone(), v.clone())),
+                    )
+                })
+                .collect(),
+        };
+        filter_rows(rows, &self.query)
+    }
+
+    /// Headline facts first, then the whole Server section.
+    fn server(&self) -> Vec<InfoRow> {
+        let field = |k: &str| self.info.field(k).unwrap_or("?").to_string();
+        let mut rows = vec![
+            InfoRow::Head("Overview".into()),
+            InfoRow::Field(
+                "version".into(),
+                format!("redis {} · {}", field("redis_version"), field("redis_mode")),
+            ),
+            InfoRow::Field("uptime".into(), human_uptime(&field("uptime_in_seconds"))),
+            InfoRow::Field("os".into(), field("os")),
+        ];
+        if let Some(v) = self.info.field("connected_clients") {
+            rows.push(InfoRow::Field("clients".into(), v.to_string()));
+        }
+        if let Some(v) = self.info.field("used_memory_human") {
+            rows.push(InfoRow::Field("memory".into(), v.to_string()));
+        }
+        let keys: u64 = self.info.keyspace().iter().map(|(_, k, _)| k).sum();
+        rows.push(InfoRow::Field("keys".into(), keys.to_string()));
+        rows.push(InfoRow::Head("Server".into()));
+        rows.extend(section_rows(&self.info, "Server"));
+        rows
+    }
+
+    /// The Memory section, led by a used / maxmemory bar when one is set.
+    fn memory(&self) -> Vec<InfoRow> {
+        let used: f64 = self
+            .info
+            .field("used_memory")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let max: f64 = self
+            .info
+            .field("maxmemory")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let mut rows = Vec::new();
+        if max > 0.0 {
+            rows.push(InfoRow::Head("Usage".into()));
+            rows.push(InfoRow::Gauge {
+                label: "used / max".into(),
+                ratio: (used / max).clamp(0.0, 1.0),
+                text: format!(
+                    "{} of {}",
+                    self.info.field("used_memory_human").unwrap_or("?"),
+                    self.info.field("maxmemory_human").unwrap_or("?")
+                ),
+                alarm_high: true,
+            });
+            if let Some(policy) = self.info.field("maxmemory_policy") {
+                rows.push(InfoRow::Field("eviction policy".into(), policy.into()));
+            }
+            rows.push(InfoRow::Head("Memory".into()));
+        }
+        rows.extend(section_rows(&self.info, "Memory"));
+        rows
+    }
+
+    fn key_statistics(&self) -> Vec<InfoRow> {
+        let mut rows = vec![InfoRow::Head("Keyspace".into())];
+        let keyspace = self.info.keyspace();
+        if keyspace.is_empty() {
+            rows.push(InfoRow::Field("(empty)".into(), "no keys in any db".into()));
+        }
+        let mut total_keys = 0u64;
+        let mut total_expires = 0u64;
+        for (db, keys, expires) in &keyspace {
+            total_keys += keys;
+            total_expires += expires;
+            rows.push(InfoRow::Field(db.clone(), key_count(*keys, *expires)));
+        }
+        if keyspace.len() > 1 {
+            rows.push(InfoRow::Field(
+                "total".into(),
+                key_count(total_keys, total_expires),
+            ));
+        }
+
+        rows.push(InfoRow::Head("Lookups".into()));
+        let field = |k: &str| self.info.field(k).unwrap_or("0").to_string();
+        let hits: f64 = field("keyspace_hits").parse().unwrap_or(0.0);
+        let misses: f64 = field("keyspace_misses").parse().unwrap_or(0.0);
+        if hits + misses > 0.0 {
+            rows.push(InfoRow::Gauge {
+                label: "hit rate".into(),
+                ratio: hits / (hits + misses),
+                text: format!("{:.1}%", hits / (hits + misses) * 100.0),
+                alarm_high: false,
+            });
+        } else {
+            rows.push(InfoRow::Field("hit rate".into(), "n/a".into()));
+        }
+        rows.push(InfoRow::Field(
+            "keyspace_hits".into(),
+            field("keyspace_hits"),
+        ));
+        rows.push(InfoRow::Field(
+            "keyspace_misses".into(),
+            field("keyspace_misses"),
+        ));
+
+        rows.push(InfoRow::Head("Churn".into()));
+        for k in [
+            "expired_keys",
+            "evicted_keys",
+            "total_reads_processed",
+            "total_writes_processed",
+        ] {
+            if let Some(v) = self.info.field(k) {
+                rows.push(InfoRow::Field(k.into(), v.to_string()));
+            }
+        }
+        let limits: Vec<InfoRow> = ["used_memory_human", "maxmemory_human", "maxmemory_policy"]
+            .iter()
+            .filter_map(|k| {
+                self.info
+                    .field(k)
+                    .map(|v| InfoRow::Field((*k).into(), v.to_string()))
+            })
+            .collect();
+        if !limits.is_empty() {
+            rows.push(InfoRow::Head("Limits".into()));
+            rows.extend(limits);
+        }
+        rows
+    }
+
+    /// The current tab as plain text, for the clipboard.
+    pub fn text(&self) -> String {
+        self.rows()
+            .iter()
+            .map(|r| match r {
+                InfoRow::Head(h) => format!("# {h}"),
+                InfoRow::Field(k, v) => format!("{k}: {v}"),
+                InfoRow::Gauge { label, text, .. } => format!("{label}: {text}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Keep the rows a filter matches, and any heading that still has children.
+fn filter_rows(rows: Vec<InfoRow>, query: &str) -> Vec<InfoRow> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return rows;
+    }
+    let mut out: Vec<InfoRow> = Vec::new();
+    for row in rows {
+        match row {
+            InfoRow::Head(_) => {
+                // Drop the previous heading if nothing under it matched.
+                if matches!(out.last(), Some(InfoRow::Head(_))) {
+                    out.pop();
+                }
+                out.push(row);
+            }
+            _ if row.haystack().to_lowercase().contains(&needle) => out.push(row),
+            _ => {}
+        }
+    }
+    if matches!(out.last(), Some(InfoRow::Head(_))) {
+        out.pop();
+    }
+    out
+}
+
+fn section_rows(info: &ServerInfo, name: &str) -> Vec<InfoRow> {
+    let fields = info.section(name);
+    if fields.is_empty() {
+        return vec![InfoRow::Field(
+            "(empty)".into(),
+            format!("this server reports no {name} section"),
+        )];
+    }
+    fields
+        .iter()
+        .map(|(k, v)| InfoRow::Field(k.clone(), v.clone()))
+        .collect()
+}
+
+/// "12 keys · 3 with a TTL", singular where it matters.
+fn key_count(keys: u64, expires: u64) -> String {
+    let plural = if keys == 1 { "key" } else { "keys" };
+    format!("{keys} {plural} · {expires} with a TTL")
+}
+
+/// `uptime_in_seconds` as something a human reads at a glance.
+fn human_uptime(secs: &str) -> String {
+    let Ok(s) = secs.parse::<u64>() else {
+        return secs.to_string();
+    };
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m{}s", s % 60),
+        (0, _) => format!("{h}h{m}m"),
+        _ => format!("{d}d{h}h"),
+    }
+}
+
 pub struct ConsoleState {
     pub input: InputBuf,
     pub log: Vec<String>,
@@ -186,6 +467,7 @@ pub enum Modal {
         body: String,
     },
     Console(ConsoleState),
+    Info(Box<InfoState>),
     Help,
 }
 
@@ -431,6 +713,21 @@ impl App {
                     Err(e) => format!("Error: {name}: {e}"),
                 };
             }
+            Msg::Info(result) => match *result {
+                Ok(info) => {
+                    let (tab, scroll) = match &self.modal {
+                        Some(Modal::Info(state)) => (state.tab, state.scroll),
+                        _ => (0, 0),
+                    };
+                    self.status.clear();
+                    self.modal = Some(Modal::Info(Box::new(InfoState {
+                        tab,
+                        scroll,
+                        ..InfoState::new(info)
+                    })));
+                }
+                Err(e) => self.status = format!("Error: INFO failed: {e}"),
+            },
             Msg::Status(text) => self.status = text,
             Msg::Error(e) => {
                 self.loading = false;
@@ -787,6 +1084,7 @@ impl App {
                 }
             }
             KeyCode::Char('y') => self.yank_key_name(),
+            KeyCode::Char('i') => self.load_info(),
             KeyCode::Char('n') => self.prompt_new_key(),
             KeyCode::Char('t') => self.prompt_ttl(),
             KeyCode::Char('R') => self.prompt_rename(),
@@ -1206,6 +1504,17 @@ impl App {
         self.modal = Some(Modal::Confirm { message, action });
     }
 
+    /// Fetch `INFO` and show it in the server-info modal.
+    fn load_info(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.status = "Loading server info ...".into();
+        self.spawn(
+            async move { Msg::Info(Box::new(client.info().await.map_err(|e| e.to_string()))) },
+        );
+    }
+
     fn open_console(&mut self) {
         self.modal = Some(Modal::Console(ConsoleState {
             input: InputBuf::new(""),
@@ -1302,6 +1611,66 @@ impl App {
                     }
                 }
             },
+            Modal::Info(state) => {
+                // While the filter box has focus every printable key edits it.
+                if let Some(buf) = &mut state.filter {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.filter = None;
+                            state.query.clear();
+                            state.scroll = 0;
+                        }
+                        KeyCode::Enter => state.filter = None,
+                        _ => {
+                            buf.handle(key);
+                            state.query = buf.value();
+                            state.scroll = 0;
+                        }
+                    }
+                    return;
+                }
+                let last = state.rows().len().saturating_sub(1) as u16;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        if state.query.is_empty() {
+                            self.modal = None;
+                        } else {
+                            state.query.clear();
+                            state.scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('/') => state.filter = Some(InputBuf::new(&state.query)),
+                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                        state.tab = (state.tab + 1) % INFO_TABS.len();
+                        state.scroll = 0;
+                    }
+                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                        state.tab = (state.tab + INFO_TABS.len() - 1) % INFO_TABS.len();
+                        state.scroll = 0;
+                    }
+                    KeyCode::Char(c @ '1'..='5') => {
+                        state.tab = c as usize - '1' as usize;
+                        state.scroll = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.scroll = (state.scroll + 1).min(last)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.scroll = state.scroll.saturating_sub(1)
+                    }
+                    KeyCode::PageDown => state.scroll = (state.scroll + 10).min(last),
+                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => state.scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => state.scroll = last,
+                    KeyCode::Char('y') => {
+                        let tab = INFO_TABS[state.tab];
+                        crate::osc52::copy(&state.text());
+                        self.status = format!("Copied the {tab} tab to the clipboard");
+                    }
+                    KeyCode::Char('r') => self.load_info(),
+                    _ => {}
+                }
+            }
             Modal::Console(state) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Up if !state.history.is_empty() => {
@@ -1748,5 +2117,80 @@ mod tests {
         assert!(validate(&action, &vals).unwrap().contains("Port"));
         let vals = ["".into(), "h".into(), "6379".into(), "0".into()];
         assert!(validate(&action, &vals).unwrap().contains("Name"));
+    }
+
+    #[test]
+    fn key_statistics_tab_summarises_the_keyspace() {
+        let info = crate::redis_client::ServerInfo::parse(
+            "# Memory\nused_memory_human:1.20M\n\n# Stats\nkeyspace_hits:75\nkeyspace_misses:25\nexpired_keys:4\n\n# Keyspace\ndb0:keys=10,expires=2,avg_ttl=0\ndb1:keys=5,expires=1,avg_ttl=0\n",
+        );
+        let mut state = InfoState::new(info);
+        state.tab = INFO_TABS
+            .iter()
+            .position(|t| *t == "Key Statistics")
+            .unwrap();
+        let text = state.text();
+        assert!(text.contains("db0: 10 keys · 2 with a TTL"), "{text}");
+        assert!(text.contains("# Limits"), "{text}");
+        assert!(text.contains("total: 15 keys · 3 with a TTL"), "{text}");
+        assert!(text.contains("hit rate: 75.0%"), "{text}");
+        assert!(text.contains("expired_keys: 4"), "{text}");
+    }
+
+    #[test]
+    fn server_tab_leads_with_an_overview_and_missing_sections_say_so() {
+        let mut state = InfoState::new(crate::redis_client::ServerInfo::parse(
+            "# Server\nredis_version:7.2.4\nredis_mode:standalone\nuptime_in_seconds:90061\nos:Linux\n",
+        ));
+        let text = state.text();
+        assert!(text.contains("version: redis 7.2.4 · standalone"), "{text}");
+        assert!(text.contains("uptime: 1d1h"), "{text}");
+        assert!(text.contains("keys: 0"), "{text}");
+        state.tab = 1;
+        assert!(state.text().contains("no Memory section"));
+    }
+
+    #[test]
+    fn memory_tab_gauges_usage_against_maxmemory() {
+        let mut state = InfoState::new(crate::redis_client::ServerInfo::parse(
+            "# Memory\nused_memory:750\nused_memory_human:750B\nmaxmemory:1000\nmaxmemory_human:1000B\nmaxmemory_policy:allkeys-lru\n",
+        ));
+        state.tab = 1;
+        let gauge = state
+            .rows()
+            .into_iter()
+            .find(|r| matches!(r, InfoRow::Gauge { .. }))
+            .expect("a usage gauge");
+        let InfoRow::Gauge {
+            ratio,
+            text,
+            alarm_high,
+            ..
+        } = gauge
+        else {
+            unreachable!()
+        };
+        assert!((ratio - 0.75).abs() < f64::EPSILON);
+        assert_eq!(text, "750B of 1000B");
+        assert!(alarm_high);
+    }
+
+    #[test]
+    fn the_filter_keeps_matching_fields_and_their_headings() {
+        let mut state = InfoState::new(crate::redis_client::ServerInfo::parse(
+            "# Server\nredis_version:7.2.4\n\n# Memory\nused_memory_human:1.20M\nmem_allocator:libc\n",
+        ));
+        state.tab = INFO_TABS.iter().position(|t| *t == "All").unwrap();
+        state.query = "mem_alloc".into();
+        assert_eq!(
+            state.rows(),
+            vec![
+                InfoRow::Head("Memory".into()),
+                InfoRow::Field("mem_allocator".into(), "libc".into()),
+            ],
+            "the empty Server heading is dropped"
+        );
+        state.query = "nothing matches".into();
+        assert!(state.rows().is_empty());
     }
 }

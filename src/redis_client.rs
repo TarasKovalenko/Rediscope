@@ -193,6 +193,90 @@ async fn build_client(conn: &Connection) -> Result<redis::Client> {
     })
 }
 
+/// A parsed `INFO` reply: sections in server order, each holding its
+/// `field: value` lines, plus the raw text for the "all" view.
+#[derive(Clone, Debug, Default)]
+pub struct ServerInfo {
+    pub sections: Vec<InfoSection>,
+    pub raw: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InfoSection {
+    pub name: String,
+    pub fields: Vec<(String, String)>,
+}
+
+impl ServerInfo {
+    pub fn parse(raw: &str) -> Self {
+        let mut sections: Vec<InfoSection> = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('#') {
+                sections.push(InfoSection {
+                    name: name.trim().to_string(),
+                    fields: Vec::new(),
+                });
+                continue;
+            }
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            // A reply without a leading header still gets a home.
+            if sections.is_empty() {
+                sections.push(InfoSection {
+                    name: "Server".into(),
+                    fields: Vec::new(),
+                });
+            }
+            if let Some(last) = sections.last_mut() {
+                last.fields
+                    .push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+        Self {
+            sections,
+            raw: raw.to_string(),
+        }
+    }
+
+    /// Fields of a section, matched case-insensitively. Empty when absent.
+    pub fn section(&self, name: &str) -> &[(String, String)] {
+        self.sections
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .map_or(&[][..], |s| &s.fields)
+    }
+
+    /// First value for a field name, searched across every section.
+    pub fn field(&self, key: &str) -> Option<&str> {
+        self.sections
+            .iter()
+            .flat_map(|s| &s.fields)
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// `dbN` lines from the Keyspace section, as (db, keys, expires).
+    pub fn keyspace(&self) -> Vec<(String, u64, u64)> {
+        self.section("Keyspace")
+            .iter()
+            .map(|(db, stats)| {
+                let get = |name: &str| -> u64 {
+                    stats
+                        .split(',')
+                        .find_map(|p| p.trim().strip_prefix(name)?.parse().ok())
+                        .unwrap_or(0)
+                };
+                (db.clone(), get("keys="), get("expires="))
+            })
+            .collect()
+    }
+}
+
 /// The result of a connection test, shown in the server list.
 #[derive(Clone, Debug)]
 pub struct Probe {
@@ -236,6 +320,17 @@ impl Client {
     pub async fn dbsize(&self) -> Result<u64> {
         let mut c = self.mgr.clone();
         Ok(redis::cmd("DBSIZE").query_async(&mut c).await?)
+    }
+
+    /// Full `INFO` for the server pane. Falls back to the default sections
+    /// when a managed provider rejects `INFO all`.
+    pub async fn info(&self) -> Result<ServerInfo> {
+        let mut c = self.mgr.clone();
+        let raw: String = match redis::cmd("INFO").arg("all").query_async(&mut c).await {
+            Ok(raw) => raw,
+            Err(_) => redis::cmd("INFO").query_async(&mut c).await?,
+        };
+        Ok(ServerInfo::parse(&raw))
     }
 
     pub async fn server_line(&self) -> Result<String> {
@@ -759,6 +854,39 @@ pub fn is_destructive(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE: &str = "# Server\r\nredis_version:7.2.4\r\nredis_mode:standalone\r\n\r\n# Memory\r\nused_memory_human:1.20M\r\n\r\n# Keyspace\r\ndb0:keys=12,expires=3,avg_ttl=0\r\ndb1:keys=5,expires=0,avg_ttl=0\r\n";
+
+    #[test]
+    fn parses_info_into_sections_and_fields() {
+        let info = ServerInfo::parse(SAMPLE);
+        assert_eq!(
+            info.sections
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Server", "Memory", "Keyspace"]
+        );
+        assert_eq!(info.field("redis_version"), Some("7.2.4"));
+        assert_eq!(info.section("memory").len(), 1);
+        assert!(info.section("Replication").is_empty());
+        assert_eq!(info.field("nope"), None);
+    }
+
+    #[test]
+    fn reads_key_counts_out_of_the_keyspace_section() {
+        let info = ServerInfo::parse(SAMPLE);
+        assert_eq!(
+            info.keyspace(),
+            vec![("db0".to_string(), 12, 3), ("db1".to_string(), 5, 0)]
+        );
+    }
+
+    #[test]
+    fn parses_a_headerless_reply() {
+        let info = ServerInfo::parse("redis_version:7.0.0\n");
+        assert_eq!(info.field("redis_version"), Some("7.0.0"));
+    }
 
     #[test]
     fn splits_quoted_arguments() {

@@ -174,3 +174,21 @@ async fn raw_console_formats_replies() {
     assert_eq!(c.execute_raw(r#"GET "spaced key""#).await.unwrap(), "a b");
     assert!(c.execute_raw("NOTACOMMAND").await.is_err());
 }
+
+#[tokio::test]
+async fn info_reports_sections_and_key_counts() {
+    let c = client!(14);
+    c.execute_raw("FLUSHDB").await.unwrap();
+    c.execute_raw("SET info:probe 1").await.unwrap();
+
+    let info = c.info().await.unwrap();
+    assert!(info.field("redis_version").is_some());
+    assert!(!info.section("Memory").is_empty());
+    assert!(!info.section("Stats").is_empty());
+    let (_, keys, _) = info
+        .keyspace()
+        .into_iter()
+        .find(|(db, ..)| db == "db14")
+        .expect("db14 in the keyspace section");
+    assert!(keys >= 1);
+}
