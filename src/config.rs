@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::theme::Theme;
+
 fn default_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -145,6 +147,10 @@ pub fn config_file() -> PathBuf {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Store {
+    /// The UI colour theme. Missing in older files, so those keep the classic
+    /// Redis look automatically.
+    #[serde(default)]
+    pub theme: Theme,
     #[serde(default)]
     pub connections: Vec<Connection>,
     /// Set when the file exists but could not be read. Saving is refused while
@@ -169,6 +175,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (
                     Self {
+                        theme: Theme::default(),
                         connections: vec![Connection {
                             name: "local".into(),
                             ..Default::default()
@@ -182,6 +189,7 @@ impl Store {
                 let notice = format!("Cannot read {}: {e}", path.display());
                 return (
                     Self {
+                        theme: Theme::default(),
                         connections: Vec::new(),
                         read_error: Some(notice.clone()),
                     },
@@ -205,6 +213,7 @@ impl Store {
                     let notice = format!("{} did not parse ({e})", path.display());
                     (
                         Self {
+                            theme: Theme::default(),
                             connections: Vec::new(),
                             read_error: Some(notice.clone()),
                         },
@@ -228,6 +237,7 @@ impl Store {
         // A profile that opted into the keychain must not leave a copy of its
         // password behind in the file.
         let sanitized = Self {
+            theme: self.theme,
             connections: self
                 .connections
                 .iter()
@@ -520,6 +530,7 @@ mod tests {
     #[test]
     fn a_store_that_failed_to_load_refuses_to_save() {
         let store = Store {
+            theme: Theme::default(),
             connections: Vec::new(),
             read_error: Some("permission denied".into()),
         };
@@ -540,11 +551,35 @@ mod tests {
     }
 
     #[test]
+    fn an_older_file_without_a_theme_uses_the_classic_theme() {
+        let store: Store = serde_json::from_str(r#"{"connections": []}"#).unwrap();
+        assert_eq!(store.theme, Theme::Redis);
+    }
+
+    #[test]
+    fn the_selected_theme_survives_a_reload() {
+        let _guard = env_guard();
+        let dir = tempdir();
+        std::env::set_var("REDISCOPE_HOME", &dir);
+        let store = Store {
+            theme: Theme::Dracula,
+            ..Default::default()
+        };
+        store.save().unwrap();
+
+        let (loaded, notice) = Store::load();
+        assert_eq!(loaded.theme, Theme::Dracula);
+        assert!(notice.is_none());
+        std::env::remove_var("REDISCOPE_HOME");
+    }
+
+    #[test]
     fn saving_keeps_the_previous_file_as_a_backup() {
         let _guard = env_guard();
         let dir = tempdir();
         std::env::set_var("REDISCOPE_HOME", &dir);
         let first = Store {
+            theme: Theme::default(),
             connections: vec![Connection {
                 name: "prod".into(),
                 ..Default::default()
@@ -553,6 +588,7 @@ mod tests {
         };
         first.save().unwrap();
         let second = Store {
+            theme: Theme::default(),
             connections: vec![Connection {
                 name: "staging".into(),
                 ..Default::default()

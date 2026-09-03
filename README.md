@@ -103,6 +103,9 @@ visible to anyone who can run `ps`.
 - **Connection manager** — add, edit, duplicate (`c`), reorder (`J`/`K`), filter
   (`/`), and test (`T`) saved servers. A test reports round-trip latency, the
   server version and its key count without opening the connection.
+- **Colour themes** (`p`) — preview and choose Redis, Dracula, Catppuccin Mocha,
+  Nord, Gruvbox Dark, or Tokyo Night. The choice is saved and restored on the
+  next run.
 - **TLS** — a private CA, mutual TLS with a client certificate and key, or an
   explicit skip-verify for a self-signed dev server. Profiles show `TLS`,
   `no-verify` and `keychain` badges in the list.
@@ -129,6 +132,7 @@ Press `?` in the app for this list at any time.
 | `J` / `K` | Move the connection down / up |
 | `T` | Test the connection without opening it |
 | `/` | Filter by name or host · `Esc` clears the filter |
+| `p` | Preview and choose a colour theme |
 | `q` | Quit |
 
 ### Key browser
@@ -149,6 +153,7 @@ Press `?` in the app for this list at any time.
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
 | `i` | Server info — Server / Memory / Stats / Key Statistics / All, with `/` to filter |
+| `p` | Preview and choose a colour theme |
 | `:` | Raw command console |
 | `Ctrl+D` | Switch database |
 | `Ctrl+N` | Back to the server list |
@@ -160,6 +165,9 @@ clears the filter and then closes.
 
 Dialogs: `Esc` cancels, `Enter` confirms, `Ctrl+S` saves in the multi-line
 editor, `Tab` moves between fields, `Space` toggles a switch.
+
+In the theme picker, `↑` / `↓` (or `j` / `k`) previews a theme immediately,
+`Enter` saves it, and `Esc` restores the previous theme.
 
 ## Connections and secrets
 
