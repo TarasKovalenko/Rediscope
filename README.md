@@ -4,7 +4,10 @@ A terminal UI Redis client. Browse the keyspace as a folder tree, read and edit
 every value type, manage TTLs, and drop into a raw command console - in one
 static binary, no Electron and no Python runtime.
 
-<img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/17b807bb-5ae3-452b-a879-06c9b5b828d9" />
+Main view             |  Connections view | Server Info
+:-------------------------:|:-------------------------:|:-------------------------:
+<img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/17b807bb-5ae3-452b-a879-06c9b5b828d9" />  |  <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/a0e80e28-d436-4e67-a464-155dd8563b7d" /> | <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/5d071494-37bc-44e5-b8d1-c32f691b2208" />
+
 
 ## Install
 
