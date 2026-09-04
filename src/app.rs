@@ -11,8 +11,10 @@ use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{Connection, Store};
-use crate::input::InputBuf;
+use crate::history::History;
+use crate::input::{Completion, InputBuf, ReverseSearch, complete};
 use crate::json::{self, JsonMode};
+use crate::memory::{PrefixRow, Rollup};
 use crate::redis_client::{
     Client, KEY_LIMIT, KeyInfo, KeyType, KeyValue, ServerInfo, is_destructive,
 };
@@ -44,6 +46,13 @@ pub enum Msg {
     /// A write finished; `Ok` carries the status line to show.
     Mutated(Result<String, String>),
     Console(String),
+    /// The server's command names, for console completion.
+    Commands(Vec<String>),
+    /// A batch of the namespace memory scan; `done` on the last one.
+    Memory {
+        rollup: Box<Rollup>,
+        done: bool,
+    },
     /// A connection test finished: profile name, then the result.
     Probe(String, Box<Result<crate::redis_client::Probe, String>>),
     /// An `INFO` read finished, for the server-info modal.
@@ -435,11 +444,53 @@ fn human_uptime(secs: &str) -> String {
     }
 }
 
+/// How many keys the report is willing to measure. Beyond this the scan takes
+/// every nth key instead, which is what keeps it usable on a big server.
+const MEMORY_SAMPLE_LIMIT: u64 = 20_000;
+
+/// The namespace memory report and the scan filling it in.
+pub struct MemoryState {
+    pub rollup: Rollup,
+    /// How many segments of the key name each row groups by.
+    pub depth: usize,
+    /// `DBSIZE` when the scan started, for the progress bar and the stride.
+    pub dbsize: u64,
+    pub running: bool,
+    /// Set when the report closes, so the scan task stops at the next batch.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub scroll: usize,
+}
+
+impl MemoryState {
+    pub fn new(dbsize: u64) -> Self {
+        Self {
+            rollup: Rollup::default(),
+            depth: 1,
+            dbsize,
+            running: true,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            scroll: 0,
+        }
+    }
+
+    /// Measure one key in every `stride`, so a big keyspace still finishes.
+    pub fn stride(&self) -> u64 {
+        (self.dbsize / MEMORY_SAMPLE_LIMIT).max(1)
+    }
+
+    pub fn rows(&self) -> Vec<PrefixRow> {
+        self.rollup.rows(self.depth)
+    }
+}
+
 pub struct ConsoleState {
     pub input: InputBuf,
     pub log: Vec<String>,
-    pub history: Vec<String>,
+    pub history: History,
     pub hist_idx: Option<usize>,
+    /// Live `ctrl+r` search, and the line it interrupted.
+    pub search: Option<ReverseSearch>,
+    pub interrupted: String,
 }
 
 pub enum Modal {
@@ -468,6 +519,7 @@ pub enum Modal {
         body: String,
     },
     Console(ConsoleState),
+    Memory(MemoryState),
     Info(Box<InfoState>),
     ThemePicker {
         selected: usize,
@@ -494,6 +546,8 @@ pub struct App {
 
     pub client: Option<Client>,
     pub server_line: String,
+    /// Command names for console completion, read once per connection.
+    pub commands: Vec<String>,
     /// The keys behind the tree, kept so a TTL can expire one locally.
     pub keys: Vec<KeyInfo>,
     pub tree: Tree,
@@ -537,6 +591,7 @@ impl App {
             conn_query: String::new(),
             testing: None,
             client: None,
+            commands: Vec::new(),
             server_line: String::new(),
             keys: Vec::new(),
             tree: Tree::default(),
@@ -713,6 +768,12 @@ impl App {
                         self.spawn(async move {
                             Msg::Server(probe.server_line().await.unwrap_or_default())
                         });
+                        // Console completion wants the command list; a server
+                        // that will not give it just means no completion.
+                        let names = client.clone();
+                        self.spawn(async move {
+                            Msg::Commands(names.command_names().await.unwrap_or_default())
+                        });
                         self.client = Some(client);
                         self.screen = Screen::Browser;
                         self.pattern = "*".into();
@@ -774,6 +835,13 @@ impl App {
                 self.reload_value();
             }
             Msg::Mutated(Err(e)) => self.status = format!("Error: {e}"),
+            Msg::Commands(names) => self.commands = names,
+            Msg::Memory { rollup, done } => {
+                if let Some(Modal::Memory(state)) = &mut self.modal {
+                    state.rollup = *rollup;
+                    state.running = !done;
+                }
+            }
             Msg::Console(text) => {
                 if let Some(Modal::Console(c)) = &mut self.modal {
                     c.log.extend(text.lines().map(|l| l.to_string()));
@@ -1167,6 +1235,7 @@ impl App {
             }
             KeyCode::Char('y') => self.yank_key_name(),
             KeyCode::Char('i') => self.load_info(),
+            KeyCode::Char('M') => self.start_memory_report(),
             KeyCode::Char('n') => self.prompt_new_key(),
             KeyCode::Char('t') => self.prompt_ttl(),
             KeyCode::Char('R') => self.prompt_rename(),
@@ -1618,6 +1687,49 @@ impl App {
         );
     }
 
+    /// Open the namespace memory report and start the scan behind it.
+    fn start_memory_report(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let state = MemoryState::new(self.dbsize);
+        let stride = state.stride();
+        let cancel = state.cancel.clone();
+        self.modal = Some(Modal::Memory(state));
+
+        // The scan reports as it goes, so the table fills in rather than the
+        // report sitting empty until the last batch lands.
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let mut scan = crate::redis_client::MemoryScan::default();
+            let mut rollup = Rollup::default();
+            let mut last = std::time::Instant::now();
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let done = match client.memory_batch(&mut scan, stride, &mut rollup).await {
+                    Ok(done) => done,
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(format!("memory scan failed: {e}")));
+                        return;
+                    }
+                };
+                // Cloning the rollup is only worth it a few times a second.
+                if done || last.elapsed() >= std::time::Duration::from_millis(200) {
+                    last = std::time::Instant::now();
+                    let _ = tx.send(Msg::Memory {
+                        rollup: Box::new(rollup.clone()),
+                        done,
+                    });
+                }
+                if done {
+                    return;
+                }
+            }
+        });
+    }
+
     fn open_console(&mut self) {
         self.modal = Some(Modal::Console(ConsoleState {
             input: InputBuf::new(""),
@@ -1626,8 +1738,10 @@ impl App {
                 "Destructive commands (FLUSHALL, FLUSHDB, ...) ask first.".into(),
                 String::new(),
             ],
-            history: Vec::new(),
+            history: History::load(),
             hist_idx: None,
+            search: None,
+            interrupted: String::new(),
         }));
     }
 
@@ -1643,6 +1757,18 @@ impl App {
 
     fn modal_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Completion needs the key list and the command list alongside the
+        // console, which the borrow below rules out. Handle it up here.
+        if key.code == KeyCode::Tab
+            && matches!(self.modal, Some(Modal::Console(ref c)) if c.search.is_none())
+        {
+            let commands = self.commands.clone();
+            let keys: Vec<String> = self.keys.iter().map(|k| k.name.clone()).collect();
+            if let Some(Modal::Console(state)) = &mut self.modal {
+                complete_console(state, &commands, &keys);
+            }
+            return;
+        }
         // Theme navigation updates the store for an immediate preview. Escape
         // restores the opening value; Enter keeps it and persists it.
         if let Some(Modal::ThemePicker { selected, original }) = &mut self.modal {
@@ -1858,34 +1984,70 @@ impl App {
                     _ => {}
                 }
             }
+            Modal::Console(state) if state.search.is_some() => {
+                let entries = state.history.entries().to_vec();
+                let search = state.search.as_mut().expect("guarded above");
+                match key.code {
+                    // A second ctrl+r steps further back through the matches.
+                    KeyCode::Char('r') if ctrl => search.older(&entries),
+                    KeyCode::Char(c) if !ctrl => search.push_char(c, &entries),
+                    KeyCode::Backspace => search.pop_char(&entries),
+                    KeyCode::Enter => {
+                        let hit = search.hit(&entries).map(str::to_string);
+                        state.search = None;
+                        if let Some(line) = hit {
+                            state.input.set(&line);
+                        }
+                    }
+                    // Esc abandons the search and restores the interrupted line.
+                    KeyCode::Esc => {
+                        state.search = None;
+                        let restored = state.interrupted.clone();
+                        state.input.set(&restored);
+                    }
+                    _ => {}
+                }
+            }
             Modal::Console(state) => match key.code {
                 KeyCode::Esc => self.modal = None,
-                KeyCode::Up if !state.history.is_empty() => {
+                KeyCode::Char('r') if ctrl => {
+                    state.interrupted = state.input.value();
+                    state.search = Some(ReverseSearch::default());
+                }
+                KeyCode::Up if !state.history.entries().is_empty() => {
+                    let entries = state.history.entries();
                     let idx = match state.hist_idx {
-                        Some(0) | None if state.hist_idx.is_none() => state.history.len() - 1,
                         Some(i) => i.saturating_sub(1),
-                        None => state.history.len() - 1,
+                        None => entries.len() - 1,
                     };
                     state.hist_idx = Some(idx);
-                    state.input.set(&state.history[idx]);
+                    let line = entries[idx].clone();
+                    state.input.set(&line);
                 }
-                KeyCode::Down if !state.history.is_empty() => match state.hist_idx {
-                    Some(i) if i + 1 < state.history.len() => {
-                        state.hist_idx = Some(i + 1);
-                        state.input.set(&state.history[i + 1]);
+                KeyCode::Down if !state.history.entries().is_empty() => {
+                    let entries = state.history.entries();
+                    match state.hist_idx {
+                        Some(i) if i + 1 < entries.len() => {
+                            state.hist_idx = Some(i + 1);
+                            let line = entries[i + 1].clone();
+                            state.input.set(&line);
+                        }
+                        _ => {
+                            state.hist_idx = None;
+                            state.input.clear();
+                        }
                     }
-                    _ => {
-                        state.hist_idx = None;
-                        state.input.clear();
-                    }
-                },
+                }
                 KeyCode::Enter => {
                     let line = state.input.value().trim().to_string();
                     if line.is_empty() {
                         return;
                     }
                     state.input.clear();
-                    state.history.push(line.clone());
+                    state.history.push(&line);
+                    // Best effort: a history we cannot write is not worth
+                    // interrupting the session over.
+                    let _ = state.history.save();
                     state.hist_idx = None;
                     state.log.push(format!("> {line}"));
                     if is_destructive(&line) {
@@ -1904,6 +2066,32 @@ impl App {
                 _ => {
                     state.input.handle(key);
                 }
+            },
+            Modal::Memory(state) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    state
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.modal = None;
+                }
+                KeyCode::Char(c @ '1'..='3') => {
+                    state.depth = c.to_digit(10).unwrap_or(1) as usize;
+                    state.scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => state.scroll = state.scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => state.scroll = state.scroll.saturating_sub(1),
+                KeyCode::Home | KeyCode::Char('g') => state.scroll = 0,
+                KeyCode::Char('y') => {
+                    crate::osc52::copy(&memory_report_text(state));
+                    self.status = "Copied the memory report to the clipboard".into();
+                }
+                KeyCode::Char('r') => {
+                    state
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.start_memory_report();
+                }
+                _ => {}
             },
             Modal::ThemePicker { .. } => unreachable!("handled above"),
         }
@@ -2210,6 +2398,55 @@ pub fn normalize_pattern(raw: &str) -> String {
     }
 }
 
+/// The report as plain text, for `y`.
+fn memory_report_text(state: &MemoryState) -> String {
+    let mut out = format!(
+        "namespace memory - sampled {} of {} keys\n",
+        state.rollup.sampled(),
+        state.dbsize.max(state.rollup.scanned())
+    );
+    for row in state.rows() {
+        out.push_str(&format!(
+            "{:<40} {:>12} {:>12} {:>6.1}%\n",
+            row.prefix,
+            row.keys,
+            crate::memory::human_bytes(row.est_bytes),
+            row.share
+        ));
+    }
+    out
+}
+
+/// Complete the word under the console cursor: the first word against Redis
+/// command names, anything after it against the keys already on screen.
+fn complete_console(state: &mut ConsoleState, commands: &[String], keys: &[String]) {
+    let line = state.input.value();
+    let Some(word) = line.split_whitespace().next_back() else {
+        return;
+    };
+    // The word is only being completed while the cursor sits at its end.
+    if !line.ends_with(word) {
+        return;
+    }
+    let first_word = line.trim_start().len() == word.len();
+    let candidates = if first_word { commands } else { keys };
+    match complete(word, candidates) {
+        Completion::None => {}
+        Completion::Extend(full) => {
+            let head = &line[..line.len() - word.len()];
+            // A completed word is finished, so leave a space to type the next.
+            let done = full.chars().count() > word.chars().count()
+                || candidates.iter().any(|c| c.eq_ignore_ascii_case(word));
+            state
+                .input
+                .set(&format!("{head}{full}{}", if done { " " } else { "" }));
+        }
+        Completion::Choices(all) => {
+            state.log.push(format!("  {}", all.join("  ")));
+        }
+    }
+}
+
 fn parse_select(line: &str) -> Option<i64> {
     let mut parts = line.split_whitespace();
     let head = parts.next()?;
@@ -2504,5 +2741,178 @@ mod tests {
         assert_eq!(*json, JsonMode::None);
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.modal.is_none(), "a plain string saves straight away");
+    }
+    fn console_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        app.screen = Screen::Browser;
+        app.commands = ["GET", "GETDEL", "DBSIZE", "SET"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        app.keys = vec![info("user:1", -1), info("user:2", -1)];
+        app.open_console();
+        app
+    }
+
+    fn console(app: &App) -> &ConsoleState {
+        match app.modal.as_ref() {
+            Some(Modal::Console(c)) => c,
+            _ => panic!("the console is not open"),
+        }
+    }
+
+    fn type_line(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn tab_completes_a_command_name() {
+        let mut app = console_app();
+        type_line(&mut app, "dbs");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(console(&app).input.value(), "DBSIZE ");
+    }
+
+    #[test]
+    fn tab_over_an_ambiguous_command_lists_the_choices() {
+        let mut app = console_app();
+        type_line(&mut app, "get");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(console(&app).input.value(), "get", "the line is left alone");
+        let log = console(&app).log.join(" ");
+        assert!(log.contains("GET") && log.contains("GETDEL"), "{log}");
+    }
+
+    #[test]
+    fn tab_completes_an_argument_from_the_loaded_keys() {
+        let mut app = console_app();
+        type_line(&mut app, "GET user:2");
+        // Trim it back to an unambiguous prefix of the second key.
+        for _ in 0..1 {
+            app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        type_line(&mut app, "2");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(console(&app).input.value(), "GET user:2 ");
+    }
+
+    #[test]
+    fn ctrl_r_pulls_an_earlier_command_back_into_the_line() {
+        let mut app = console_app();
+        if let Some(Modal::Console(c)) = app.modal.as_mut() {
+            c.history.push("GET user:1");
+            c.history.push("DBSIZE");
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        type_line(&mut app, "get");
+        assert_eq!(
+            console(&app)
+                .search
+                .as_ref()
+                .unwrap()
+                .hit(console(&app).history.entries()),
+            Some("GET user:1")
+        );
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(console(&app).input.value(), "GET user:1");
+        assert!(
+            console(&app).search.is_none(),
+            "the search closes on accept"
+        );
+    }
+
+    #[test]
+    fn escape_leaves_the_search_without_touching_what_was_typed() {
+        let mut app = console_app();
+        type_line(&mut app, "PIN");
+        if let Some(Modal::Console(c)) = app.modal.as_mut() {
+            c.history.push("GET user:1");
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        type_line(&mut app, "get");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(console(&app).input.value(), "PIN");
+        assert!(
+            app.modal.is_some(),
+            "escape closes the search, not the console"
+        );
+    }
+    fn memory_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        app.screen = Screen::Browser;
+        app.modal = Some(Modal::Memory(MemoryState::new(1_000)));
+        app
+    }
+
+    fn memory(app: &App) -> &MemoryState {
+        match app.modal.as_ref() {
+            Some(Modal::Memory(m)) => m,
+            _ => panic!("the report is not open"),
+        }
+    }
+
+    fn seeded_rollup() -> crate::memory::Rollup {
+        let mut r = crate::memory::Rollup::default();
+        for i in 0..10 {
+            let key = format!("session:web:{i}");
+            r.count(&key);
+            r.measure(&key, 100);
+        }
+        r
+    }
+
+    #[test]
+    fn a_progress_message_fills_the_table_in_as_it_goes() {
+        let mut app = memory_app();
+        assert!(memory(&app).running);
+        app.on_msg(Msg::Memory {
+            rollup: Box::new(seeded_rollup()),
+            done: false,
+        });
+        assert_eq!(memory(&app).rollup.scanned(), 10);
+        assert!(memory(&app).running, "still going");
+
+        app.on_msg(Msg::Memory {
+            rollup: Box::new(seeded_rollup()),
+            done: true,
+        });
+        assert!(!memory(&app).running, "the last message ends the scan");
+    }
+
+    #[test]
+    fn changing_the_depth_regroups_what_was_already_scanned() {
+        let mut app = memory_app();
+        app.on_msg(Msg::Memory {
+            rollup: Box::new(seeded_rollup()),
+            done: true,
+        });
+        assert_eq!(memory(&app).rows()[0].prefix, "session:");
+        app.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(memory(&app).depth, 2);
+        assert_eq!(memory(&app).rows()[0].prefix, "session:web:");
+    }
+
+    #[test]
+    fn escape_stops_the_scan_rather_than_leaving_it_running() {
+        let mut app = memory_app();
+        let cancel = memory(&app).cancel.clone();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "the task is told to stop"
+        );
+    }
+
+    #[test]
+    fn a_scan_of_an_empty_keyspace_measures_every_key() {
+        // One key in a thousand would be a useless sample of a small server.
+        assert_eq!(MemoryState::new(0).stride(), 1);
+        assert_eq!(MemoryState::new(1_000).stride(), 1);
+        assert_eq!(MemoryState::new(2_000_000).stride(), 100);
     }
 }

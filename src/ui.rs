@@ -9,9 +9,11 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, ConsoleState, Field, FieldKind, Focus, INFO_TABS, InfoRow, InfoState, Modal, Screen,
+    App, ConsoleState, Field, FieldKind, Focus, INFO_TABS, InfoRow, InfoState, MemoryState, Modal,
+    Screen,
 };
 use crate::json::{self, Token};
+use crate::memory::human_bytes;
 use crate::redis_client::{KeyType, KeyValue};
 use crate::theme::{Palette, Theme};
 
@@ -593,6 +595,7 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             );
         }
         Modal::Console(state) => console(f, area, state, palette),
+        Modal::Memory(state) => memory_report(f, area, state, palette),
         Modal::Info(state) => server_info(f, area, state, palette),
         Modal::ThemePicker { selected, .. } => theme_picker(f, area, *selected, palette),
     }
@@ -949,7 +952,11 @@ fn gauge_color(ratio: f64, alarm_high: bool, palette: Palette) -> Color {
 fn console(f: &mut Frame, area: Rect, state: &ConsoleState, palette: Palette) {
     let rect = centered(area, 92, 26);
     clear_area(f, rect, palette);
-    let block = panel("Command console — esc closes, ↑↓ history", true, palette);
+    let block = panel(
+        "Command console — esc closes, ↑↓ history, ctrl+r search, tab completes",
+        true,
+        palette,
+    );
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
@@ -973,6 +980,26 @@ fn console(f: &mut Frame, area: Rect, state: &ConsoleState, palette: Palette) {
         .collect();
     f.render_widget(Paragraph::new(lines), rows[0]);
 
+    // While ctrl+r is open the prompt shows the search and its current hit
+    // instead of the line being edited, the way a shell does it.
+    if let Some(search) = &state.search {
+        let hit = search.hit(state.history.entries()).unwrap_or("");
+        let label = format!("(reverse-i-search)`{}\u{27}: ", search.query());
+        let offset = UnicodeWidthStr::width(label.as_str());
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label, Style::new().fg(palette.dim)),
+                Span::styled(hit.to_string(), Style::new().fg(palette.foreground)),
+            ])),
+            rows[1],
+        );
+        f.set_cursor_position((
+            cursor_col(rows[1], rows[1].x, offset + UnicodeWidthStr::width(hit)),
+            rows[1].y,
+        ));
+        return;
+    }
+
     let prompt = format!("> {}", state.input.value());
     f.render_widget(
         Paragraph::new(Span::styled(prompt, Style::new().fg(palette.foreground))),
@@ -993,6 +1020,104 @@ fn cursor_col(area: Rect, x: u16, offset: usize) -> u16 {
     let right = area.x.saturating_add(area.width.saturating_sub(1));
     x.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
         .min(right)
+}
+
+/// The namespace memory report: which key prefix is holding the RAM, and how
+/// much of the keyspace that answer is based on.
+fn memory_report(f: &mut Frame, area: Rect, state: &MemoryState, palette: Palette) {
+    let rect = centered(area, 88, 28);
+    clear_area(f, rect, palette);
+    let block = panel(
+        "Namespace memory — 1/2/3 depth, r rescans, y copies, esc closes",
+        true,
+        palette,
+    );
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    // Say what the estimate rests on. An extrapolated number without its
+    // sample size invites more trust than it has earned.
+    let total = state.dbsize.max(state.rollup.scanned());
+    let headline = if state.running {
+        format!(
+            "scanning … {} of {} keys, {} measured",
+            state.rollup.scanned(),
+            total,
+            state.rollup.sampled()
+        )
+    } else {
+        format!(
+            "{} keys, {} measured, {} estimated in total",
+            state.rollup.scanned(),
+            state.rollup.sampled(),
+            human_bytes(state.rollup.total_bytes())
+        )
+    };
+    f.render_widget(
+        Line::from(Span::styled(headline, Style::new().fg(palette.dim))),
+        rows[0],
+    );
+
+    let header = format!(
+        "{:<38}{:>10}{:>12}{:>9}",
+        format!("prefix (depth {})", state.depth),
+        "keys",
+        "est. size",
+        "share"
+    );
+    f.render_widget(
+        Line::from(Span::styled(header, Style::new().fg(palette.accent).bold())),
+        rows[1],
+    );
+
+    let all = state.rows();
+    if all.is_empty() {
+        let note = if state.running {
+            "measuring …"
+        } else {
+            "no keys in this database"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(note, Style::new().fg(palette.dim))),
+            rows[2],
+        );
+        return;
+    }
+
+    let height = rows[2].height as usize;
+    let start = state.scroll.min(all.len().saturating_sub(1));
+    let lines: Vec<Line> = all
+        .iter()
+        .skip(start)
+        .take(height)
+        .map(|row| {
+            let bar_width = 8usize;
+            let filled = ((row.share / 100.0) * bar_width as f64).round() as usize;
+            Line::from(vec![
+                Span::raw(format!("{:<38}", truncate(&row.prefix, 37))),
+                Span::styled(format!("{:>10}", row.keys), Style::new().fg(palette.dim)),
+                Span::styled(
+                    format!("{:>12}", human_bytes(row.est_bytes)),
+                    Style::new().fg(palette.foreground),
+                ),
+                Span::styled(
+                    format!("{:>6.1}% ", row.share),
+                    Style::new().fg(palette.dim),
+                ),
+                Span::styled(
+                    "\u{2588}".repeat(filled.min(bar_width)),
+                    Style::new().fg(palette.accent),
+                ),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), rows[2]);
 }
 
 fn clear_area(f: &mut Frame, area: Rect, palette: Palette) {
@@ -1210,7 +1335,8 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
             "i",
             "server info — Server / Memory / Stats / Key Statistics / All",
         ),
-        row(":", "raw command console"),
+        row("M", "namespace memory — which prefix holds the RAM"),
+        row(":", "raw command console — tab completes, ctrl+r searches"),
         row("ctrl+d", "switch database (reconnects)"),
         row("ctrl+n", "back to the server list"),
         row("q", "quit"),

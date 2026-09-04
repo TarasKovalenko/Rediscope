@@ -141,6 +141,11 @@ pub fn config_dir() -> PathBuf {
         .join("rediscope")
 }
 
+/// Where the console keeps its command history.
+pub fn history_file() -> PathBuf {
+    config_dir().join("history")
+}
+
 pub fn config_file() -> PathBuf {
     config_dir().join("connections.json")
 }
@@ -354,7 +359,7 @@ fn restrict(path: &std::path::Path, mode: u32) {
 
 /// Create `path` unreadable to anyone but the owner and write `text` into it.
 #[cfg(unix)]
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
@@ -368,7 +373,7 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 
 /// See [`restrict`]: the containing directory carries the protection here.
 #[cfg(not(unix))]
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     fs::write(path, text)
 }
 

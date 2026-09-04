@@ -102,8 +102,17 @@ visible to anyone who can run `ps`.
   key count up top), Memory (a used / `maxmemory` bar), Stats, Key Statistics
   (per-db key and TTL counts, a hit-rate bar, expirations and evictions) and the
   full reply. `/` filters the open section, `y` copies it.
-- **Raw command console** (`:`) with history, and a confirmation prompt in front
-  of `FLUSHALL`, `FLUSHDB`, `SHUTDOWN` and friends.
+- **Namespace memory** (`M`) — which key prefix is holding the RAM. A background
+  `SCAN` counts every key and measures an evenly spaced sample with
+  `MEMORY USAGE`, so a multi-million-key server answers in seconds instead of
+  hours. Prefixes are ranked by estimated size with a share bar, `1` `2` `3`
+  regroup by one, two or three name segments without rescanning, and the header
+  always says how much of the keyspace the estimate is based on.
+- **Raw command console** (`:`) with history that survives a restart, `ctrl+r`
+  reverse search, `Tab` completion of command names and of keys already on
+  screen, and a confirmation prompt in front of `FLUSHALL`, `FLUSHDB`,
+  `SHUTDOWN` and friends. Commands carrying a password (`AUTH`, `HELLO ... AUTH`,
+  `CONFIG SET requirepass`) are never written to the history file.
 - **Connection manager** — add, edit, duplicate (`c`), reorder (`J`/`K`), filter
   (`/`), and test (`T`) saved servers. A test reports round-trip latency, the
   server version and its key count without opening the connection.
@@ -158,6 +167,7 @@ Press `?` in the app for this list at any time.
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
 | `i` | Server info — Server / Memory / Stats / Key Statistics / All, with `/` to filter |
+| `M` | Namespace memory — `1` `2` `3` set the depth, `r` rescans, `y` copies |
 | `p` | Preview and choose a colour theme |
 | `:` | Raw command console |
 | `Ctrl+D` | Switch database |
@@ -167,6 +177,10 @@ Press `?` in the app for this list at any time.
 In server info: `Tab` / `←` `→` / `1`-`5` change section, `/` filters it, `↑` `↓`
 `PgUp` `PgDn` `g` `G` scroll, `y` copies the open tab, `r` re-reads `INFO`, `Esc`
 clears the filter and then closes.
+
+In the console: `↑` `↓` walk the history, `Ctrl+R` searches it backwards (again
+steps further back, `Enter` accepts, `Esc` returns to what you were typing), and
+`Tab` completes the command name or, after it, a key name from the tree.
 
 Dialogs: `Esc` cancels, `Enter` confirms, `Ctrl+S` saves in the multi-line
 editor, `Tab` moves between fields, `Space` toggles a switch.
@@ -197,7 +211,8 @@ password silently.
 
 ## Configuration
 
-Saved connections live in `connections.json` under your platform config dir —
+Saved connections live in `connections.json` under your platform config dir, and
+the console keeps its history beside it in `history` (mode `0600`, 500 commands) —
 `~/.config/rediscope` on Linux, `~/Library/Application Support/rediscope` on
 macOS, `%APPDATA%\rediscope` on Windows. Override the directory with
 `REDISCOPE_HOME`, or print the exact path:

@@ -469,3 +469,49 @@ async fn escape_clears_an_active_search_pattern() {
     press(&mut a, KeyCode::Esc);
     assert_eq!(a.pattern, "*");
 }
+
+#[tokio::test]
+async fn the_console_renders_its_reverse_search_at_every_size() {
+    let mut a = app();
+    populate(&mut a);
+    press(&mut a, KeyCode::Char(':'));
+    type_str(&mut a, "GET user:1");
+    press(&mut a, KeyCode::Enter);
+    app_ctrl(&mut a, 'r');
+    type_str(&mut a, "get");
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 120, 40);
+    assert!(screen.contains("reverse-i-search"), "{screen}");
+}
+
+#[tokio::test]
+async fn the_memory_report_renders_while_it_is_still_scanning() {
+    let mut a = app();
+    populate(&mut a);
+    // The scan itself needs a server; the report only needs its state.
+    a.modal = Some(rediscope::app::Modal::Memory(
+        rediscope::app::MemoryState::new(4_182_996),
+    ));
+    render_all_sizes(&mut a);
+    let mid = render_text(&mut a, 120, 40);
+    assert!(mid.contains("scanning"), "{mid}");
+
+    let mut rollup = rediscope::memory::Rollup::default();
+    for i in 0..40 {
+        let key = format!("session:web:{i}");
+        rollup.count(&key);
+        rollup.measure(&key, 2_048);
+    }
+    a.on_msg(Msg::Memory {
+        rollup: Box::new(rollup),
+        done: true,
+    });
+    render_all_sizes(&mut a);
+    let done = render_text(&mut a, 120, 40);
+    assert!(done.contains("session:"), "{done}");
+    assert!(done.contains("KB") || done.contains("MB"), "{done}");
+
+    press(&mut a, KeyCode::Char('2'));
+    let deep = render_text(&mut a, 120, 40);
+    assert!(deep.contains("session:web:"), "{deep}");
+}

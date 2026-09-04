@@ -4,8 +4,12 @@
 //!   redis-server --port 7799 --daemonize yes
 //!   REDISCOPE_TEST_PORT=7799 cargo test --test integration
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rediscope::app::{App, Modal, Msg};
 use rediscope::config::Connection;
-use rediscope::redis_client::{Client, KeyType, KeyValue};
+use rediscope::config::Store;
+use rediscope::memory::Rollup;
+use rediscope::redis_client::{Client, KeyType, KeyValue, MemoryScan};
 
 /// Each test owns a database index so the suite can run in parallel.
 fn conn(db: i64) -> Option<Connection> {
@@ -218,4 +222,117 @@ async fn a_json_string_round_trips_through_the_editor_shape() {
         panic!()
     };
     assert_eq!(after, stored, "the stored shape survives an edit");
+}
+
+#[tokio::test]
+async fn the_command_list_is_read_for_console_completion() {
+    let c = client!(8);
+    let names = c.command_names().await.unwrap();
+    assert!(
+        names.len() > 100,
+        "a server knows more than {}",
+        names.len()
+    );
+    assert!(names.iter().any(|n| n == "GET"), "uppercased for display");
+    assert!(names.iter().any(|n| n == "DBSIZE"));
+    assert!(
+        names.windows(2).all(|w| w[0] <= w[1]),
+        "sorted for completion"
+    );
+}
+
+#[tokio::test]
+async fn the_memory_scan_finds_the_prefix_holding_the_most() {
+    let c = client!(7);
+    c.execute_raw("FLUSHDB").await.unwrap();
+    for i in 0..50 {
+        c.set_string(&format!("big:{i}"), &"x".repeat(400))
+            .await
+            .unwrap();
+    }
+    for i in 0..10 {
+        c.set_string(&format!("small:{i}"), "x").await.unwrap();
+    }
+
+    let mut scan = MemoryScan::default();
+    let mut rollup = Rollup::default();
+    // stride 1: measure every key, so the totals are exact rather than sampled.
+    while !c.memory_batch(&mut scan, 1, &mut rollup).await.unwrap() {}
+
+    assert_eq!(rollup.scanned(), 60);
+    assert_eq!(rollup.sampled(), 60);
+    let rows = rollup.rows(1);
+    assert_eq!(rows[0].prefix, "big:");
+    assert_eq!(rows[0].keys, 50);
+    assert!(rows[0].share > 90.0, "{:?}", rows[0]);
+    assert!(rows[0].est_bytes > 50 * 400, "{:?}", rows[0]);
+}
+
+#[tokio::test]
+async fn sampling_one_key_in_ten_still_lands_near_the_real_size() {
+    let c = client!(6);
+    c.execute_raw("FLUSHDB").await.unwrap();
+    for i in 0..500 {
+        c.set_string(&format!("app:{i}"), &"x".repeat(300))
+            .await
+            .unwrap();
+    }
+
+    let mut exact = Rollup::default();
+    let mut scan = MemoryScan::default();
+    while !c.memory_batch(&mut scan, 1, &mut exact).await.unwrap() {}
+
+    let mut sampled = Rollup::default();
+    let mut scan = MemoryScan::default();
+    while !c.memory_batch(&mut scan, 10, &mut sampled).await.unwrap() {}
+
+    assert_eq!(sampled.scanned(), 500);
+    assert!(sampled.sampled() <= 60, "{} measured", sampled.sampled());
+    let error = (sampled.total_bytes() as f64 - exact.total_bytes() as f64).abs()
+        / exact.total_bytes() as f64;
+    assert!(error < 0.05, "off by {:.1}%", error * 100.0);
+}
+
+/// The report end to end: the key press starts the scan, the messages it sends
+/// land in the modal, and the table ends up ranked.
+#[tokio::test]
+async fn pressing_m_fills_the_namespace_report_from_a_live_server() {
+    let c = client!(5);
+    c.execute_raw("FLUSHDB").await.unwrap();
+    for i in 0..30 {
+        c.set_string(&format!("big:{i}"), &"x".repeat(500))
+            .await
+            .unwrap();
+    }
+    for i in 0..5 {
+        c.set_string(&format!("tiny:{i}"), "x").await.unwrap();
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.on_msg(Msg::Connected(Box::new(Ok(c))));
+    app.dbsize = 35;
+    app.on_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE));
+
+    let finish = async {
+        while let Some(msg) = rx.recv().await {
+            app.on_msg(msg);
+            if let Some(Modal::Memory(state)) = &app.modal
+                && !state.running
+            {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), finish)
+        .await
+        .expect("the scan finishes");
+
+    let Some(Modal::Memory(state)) = &app.modal else {
+        panic!("the report closed itself")
+    };
+    assert_eq!(state.rollup.scanned(), 35);
+    let rows = state.rows();
+    assert_eq!(rows[0].prefix, "big:");
+    assert_eq!(rows[0].keys, 30);
 }
