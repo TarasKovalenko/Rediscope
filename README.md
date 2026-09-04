@@ -31,12 +31,12 @@ installs to `~/.local/bin` (`/usr/local/bin` when run as root), or on Windows to
 Pin a version or change the location:
 
 ```sh
-REDISCOPE_VERSION=v0.6.0 REDISCOPE_BIN_DIR=/usr/local/bin \
+REDISCOPE_VERSION=v0.7.0 REDISCOPE_BIN_DIR=/usr/local/bin \
   curl -fsSL https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.sh | sh
 ```
 
 ```powershell
-$env:REDISCOPE_VERSION = 'v0.6.0'
+$env:REDISCOPE_VERSION = 'v0.7.0'
 $env:REDISCOPE_BIN_DIR = 'C:\tools\bin'
 irm https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.ps1 | iex
 ```
