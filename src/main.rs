@@ -7,11 +7,11 @@ use clap::Parser;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
+use futures_util::StreamExt;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use rediscope::app::{App, Msg};
 use rediscope::config::{self, Connection, Store};

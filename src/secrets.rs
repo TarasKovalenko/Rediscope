@@ -4,7 +4,7 @@
 //! Linux box, a container) gets a clear error instead of a panic, and profiles
 //! that do not opt in never touch this module.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 const SERVICE: &str = "rediscope";
 

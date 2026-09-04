@@ -1,8 +1,8 @@
 [package]
 name = "rediscope"
 version = "0.6.0"
-edition = "2021"
-rust-version = "1.78"
+edition = "2024"
+rust-version = "1.88"
 description = "A terminal UI Redis client: browse keys as a tree, edit every value type, run raw commands."
 license = "MIT"
 readme = "README.md"
@@ -19,19 +19,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "6"
-futures = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 keyring = "4"
-quick-xml = "0.38.4"
-ratatui = "0.29"
+quick-xml = "0.42"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
+ratatui-textarea = "0.9"
 redis = { version = "1", default-features = false, features = ["tokio-comp", "tls-rustls", "tls-rustls-insecure", "tokio-rustls-comp", "tls-rustls-webpki-roots", "streams", "acl", "script"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: pretty-printing a value must not silently reorder its keys.
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tui-textarea = { version = "0.7", default-features = false, features = ["ratatui", "crossterm"] }
 unicode-width = "0.2"
 
 [profile.release]

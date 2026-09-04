@@ -7,14 +7,14 @@ use std::collections::HashSet;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
+use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
-use tui_textarea::TextArea;
 
 use crate::config::{Connection, Store};
 use crate::input::InputBuf;
 use crate::json::{self, JsonMode};
 use crate::redis_client::{
-    is_destructive, Client, KeyInfo, KeyType, KeyValue, ServerInfo, KEY_LIMIT,
+    Client, KEY_LIMIT, KeyInfo, KeyType, KeyValue, ServerInfo, is_destructive,
 };
 use crate::theme::Theme;
 use crate::tree::{Tree, VisibleRow};
@@ -144,11 +144,7 @@ impl Field {
     }
     /// Height in terminal rows when rendered.
     pub fn height(&self) -> u16 {
-        if self.is_input() {
-            3
-        } else {
-            2
-        }
+        if self.is_input() { 3 } else { 2 }
     }
     pub fn choice(label: &str, options: &[&str], selected: usize) -> Self {
         Self {
@@ -662,10 +658,10 @@ impl App {
         if self.screen != Screen::Browser || secs <= 0 {
             return;
         }
-        if let Some(cur) = &mut self.current {
-            if cur.ttl > 0 {
-                cur.ttl = (cur.ttl - secs).max(0);
-            }
+        if let Some(cur) = &mut self.current
+            && cur.ttl > 0
+        {
+            cur.ttl = (cur.ttl - secs).max(0);
         }
         let mut expired: Vec<String> = Vec::new();
         for k in &mut self.keys {
@@ -690,14 +686,14 @@ impl App {
             self.tree_state.select(Some(idx.min(self.rows.len() - 1)));
         }
         // The open key going away is worth saying out loud.
-        if let Some(name) = self.current.as_ref().map(|c| c.name.clone()) {
-            if expired.contains(&name) {
-                self.current = None;
-                self.value = None;
-                self.focus = Focus::Tree;
-                self.status = format!("'{name}' expired");
-                return;
-            }
+        if let Some(name) = self.current.as_ref().map(|c| c.name.clone())
+            && expired.contains(&name)
+        {
+            self.current = None;
+            self.value = None;
+            self.focus = Focus::Tree;
+            self.status = format!("'{name}' expired");
+            return;
         }
         self.status = match expired.len() {
             1 => format!("'{}' expired", expired[0]),
@@ -1050,16 +1046,14 @@ impl App {
 
         if !use_keychain {
             // Opted out: drop any secret we were holding for this profile.
-            if was_keychain {
-                if let Some(old) = old_name {
-                    self.spawn(async move {
-                        keychain_task(move || {
-                            crate::secrets::delete(&old)?;
-                            Ok(None)
-                        })
-                        .await
-                    });
-                }
+            if was_keychain && let Some(old) = old_name {
+                self.spawn(async move {
+                    keychain_task(move || {
+                        crate::secrets::delete(&old)?;
+                        Ok(None)
+                    })
+                    .await
+                });
             }
             return;
         }
@@ -1082,10 +1076,8 @@ impl App {
                 if let Some(s) = secret {
                     crate::secrets::set(&name, &s)?;
                 }
-                if was_keychain {
-                    if let Some(old) = renamed {
-                        crate::secrets::delete(&old)?;
-                    }
+                if was_keychain && let Some(old) = renamed {
+                    crate::secrets::delete(&old)?;
                 }
                 Ok(Some(if stored {
                     format!("Password for '{name}' stored in the OS keychain")
@@ -1735,11 +1727,11 @@ impl App {
                     let text = textarea.lines().join("\n");
                     // A key that held JSON keeps holding JSON: refuse a broken
                     // edit rather than overwriting the document with garbage.
-                    if mode.is_json() {
-                        if let Err(e) = json::check(&text) {
-                            *error = Some(e);
-                            return;
-                        }
+                    if mode.is_json()
+                        && let Err(e) = json::check(&text)
+                    {
+                        *error = Some(e);
+                        return;
                     }
                     // Written back in the shape the key already had.
                     let text = if *mode == JsonMode::Compact {
@@ -1963,11 +1955,7 @@ impl App {
                     name: v(0).trim().to_string(),
                     host: {
                         let h = v(1).trim().to_string();
-                        if h.is_empty() {
-                            "127.0.0.1".into()
-                        } else {
-                            h
-                        }
+                        if h.is_empty() { "127.0.0.1".into() } else { h }
                     },
                     port: v(2).trim().parse().unwrap_or(6379),
                     db: v(3).trim().parse().unwrap_or(0),
@@ -1986,10 +1974,13 @@ impl App {
                 };
                 let new_name = conn.name.clone();
                 self.store.upsert(conn, replacing.as_deref());
-                if let Err(e) = self.store.save() {
-                    self.status = format!("Could not save connections: {e}");
-                } else {
-                    self.status = "Connection saved".into();
+                match self.store.save() {
+                    Err(e) => {
+                        self.status = format!("Could not save connections: {e}");
+                    }
+                    _ => {
+                        self.status = "Connection saved".into();
+                    }
                 }
                 self.sync_keychain(previous, new_name.clone(), typed_password, use_keychain);
                 self.focus_connection(&new_name);
@@ -2113,10 +2104,10 @@ impl App {
                 let member = v(0);
                 let score: f64 = v(1).trim().parse().unwrap_or(0.0);
                 self.mutate("Member saved", move |c| async move {
-                    if let Some(old) = old {
-                        if old != member {
-                            c.zset_remove(&key, &old).await?;
-                        }
+                    if let Some(old) = old
+                        && old != member
+                    {
+                        c.zset_remove(&key, &old).await?;
                     }
                     c.zset_add(&key, &member, score).await
                 });
@@ -2167,10 +2158,10 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
             }
             // Opting into the keychain on a machine without one would silently
             // lose the password.
-            if get(6) == "true" {
-                if let Some(reason) = crate::secrets::unavailable_reason() {
-                    return Some(format!("No OS keychain available here: {reason}"));
-                }
+            if get(6) == "true"
+                && let Some(reason) = crate::secrets::unavailable_reason()
+            {
+                return Some(format!("No OS keychain available here: {reason}"));
             }
             if get(7) != "true" && [8, 9, 10].iter().any(|i| !get(*i).is_empty()) {
                 return Some("Certificate files need TLS switched on".into());

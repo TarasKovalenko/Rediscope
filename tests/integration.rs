@@ -20,7 +20,7 @@ fn conn(db: i64) -> Option<Connection> {
 }
 
 macro_rules! client {
-    ($db:expr) => {
+    ($db:expr_2021) => {
         match conn($db) {
             Some(c) => Client::connect(c).await.expect("connect"),
             None => return,

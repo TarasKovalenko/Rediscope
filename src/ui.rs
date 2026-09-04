@@ -9,7 +9,7 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, ConsoleState, Field, FieldKind, Focus, InfoRow, InfoState, Modal, Screen, INFO_TABS,
+    App, ConsoleState, Field, FieldKind, Focus, INFO_TABS, InfoRow, InfoState, Modal, Screen,
 };
 use crate::json::{self, Token};
 use crate::redis_client::{KeyType, KeyValue};
@@ -103,7 +103,10 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             )),
             rows[0],
         );
-        f.set_cursor_position((rows[0].x + 2 + buf.cursor() as u16, rows[0].y + 1));
+        f.set_cursor_position((
+            cursor_col(rows[0], rows[0].x + 2, buf.cursor()),
+            rows[0].y + 1,
+        ));
     }
 
     let visible = app.visible_connections();
@@ -208,7 +211,10 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             )),
             rows[0],
         );
-        f.set_cursor_position((rows[0].x + 2 + buf.cursor() as u16, rows[0].y + 1));
+        f.set_cursor_position((
+            cursor_col(rows[0], rows[0].x + 2, buf.cursor()),
+            rows[0].y + 1,
+        ));
     }
 
     let focused = app.focus == Focus::Tree;
@@ -714,9 +720,11 @@ fn form(f: &mut Frame, area: Rect, view: FormView<'_>, palette: Palette) {
             row,
         );
         if active && matches!(field.kind, FieldKind::Text | FieldKind::Secret) {
-            let cursor_x =
-                (row.x + 1 + field.input.cursor() as u16).min(row.x + row.width.saturating_sub(2));
-            f.set_cursor_position((cursor_x, row.y + 1));
+            f.set_cursor_position((
+                cursor_col(row, row.x + 1, field.input.cursor())
+                    .min(row.x + row.width.saturating_sub(2)),
+                row.y + 1,
+            ));
         }
     }
 
@@ -855,7 +863,7 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
         rows[1],
     );
     if let Some(buf) = &state.filter {
-        f.set_cursor_position((rows[1].x + 1 + buf.cursor() as u16, rows[1].y));
+        f.set_cursor_position((cursor_col(rows[1], rows[1].x + 1, buf.cursor()), rows[1].y));
     }
 
     let value_width = width.saturating_sub(key_width + 3);
@@ -970,10 +978,22 @@ fn console(f: &mut Frame, area: Rect, state: &ConsoleState, palette: Palette) {
         Paragraph::new(Span::styled(prompt, Style::new().fg(palette.foreground))),
         rows[1],
     );
-    f.set_cursor_position((rows[1].x + 2 + state.input.cursor() as u16, rows[1].y));
+    f.set_cursor_position((
+        cursor_col(rows[1], rows[1].x + 2, state.input.cursor()),
+        rows[1].y,
+    ));
 }
 
 // ---- helpers ------------------------------------------------------------
+
+/// Screen column for a cursor `offset` characters into a field drawn inside
+/// `area` at `x`. A pasted line can be longer than the screen - or than `u16`
+/// itself - so the column is clamped instead of wrapping around.
+fn cursor_col(area: Rect, x: u16, offset: usize) -> u16 {
+    let right = area.x.saturating_add(area.width.saturating_sub(1));
+    x.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
+        .min(right)
+}
 
 fn clear_area(f: &mut Frame, area: Rect, palette: Palette) {
     f.render_widget(Clear, area);
@@ -1236,5 +1256,14 @@ mod tests {
         let text = truncate("keys:🔑🔑🔑", 9);
         assert!(UnicodeWidthStr::width(text.as_str()) <= 9, "{text}");
         assert!(text.ends_with('…'));
+    }
+    #[test]
+    fn a_cursor_past_the_edge_stays_inside_the_area() {
+        let area = Rect::new(4, 0, 20, 1);
+        assert_eq!(cursor_col(area, 6, 3), 9);
+        // Longer than the field: pinned to its last column, never wrapped.
+        assert_eq!(cursor_col(area, 6, 100), 23);
+        // Longer than `u16` itself: the same, rather than an overflow.
+        assert_eq!(cursor_col(area, 6, 70_000), 23);
     }
 }
