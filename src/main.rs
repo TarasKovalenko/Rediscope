@@ -3,7 +3,7 @@
 use std::io::{self, Stdout};
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -15,7 +15,7 @@ use ratatui::backend::CrosstermBackend;
 
 use rediscope::app::{App, Msg};
 use rediscope::config::{self, Connection, Store};
-use rediscope::ui;
+use rediscope::{headless, ui};
 
 /// A terminal UI Redis client: browse keys as a tree, edit every value type,
 /// run raw commands.
@@ -72,9 +72,79 @@ struct Cli {
     #[arg(long)]
     url: Option<String>,
 
+    /// Refuse every write for this session.
+    #[arg(long)]
+    read_only: bool,
+
+    /// Reach the server through `ssh -L` on this jump host.
+    #[arg(long, value_name = "HOST")]
+    ssh: Option<String>,
+
+    /// SSH user for --ssh.
+    #[arg(long, value_name = "USER")]
+    ssh_user: Option<String>,
+
+    /// SSH port for --ssh.
+    #[arg(long, value_name = "PORT", default_value_t = 22)]
+    ssh_port: u16,
+
+    /// SSH private key for --ssh.
+    #[arg(long, value_name = "FILE")]
+    ssh_key: Option<String>,
+
     /// Print the path of the connections file and exit.
     #[arg(long)]
     config_path: bool,
+
+    /// Connect straight to a saved profile by name.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Subcommands print to stdout and never open the TUI, so rediscope can be
+/// used from a script as well as a terminal.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// List keys matching a pattern.
+    Keys {
+        /// Glob pattern, as SCAN MATCH takes it.
+        #[arg(long, default_value = "*")]
+        pattern: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write keys and their TTLs to a file, as DUMP payloads.
+    Export {
+        #[arg(long, default_value = "*")]
+        pattern: String,
+        /// Output file, or `-` for stdout.
+        #[arg(long, default_value = "-")]
+        out: String,
+    },
+    /// Restore keys from a file written by `export`.
+    Import {
+        #[arg(long)]
+        file: String,
+        /// Overwrite keys that already exist.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Print the server's INFO reply.
+    Info {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Estimate which key prefixes hold the memory.
+    MemReport {
+        /// How many `:`-separated segments to group by.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -93,6 +163,7 @@ impl Cli {
             conn.tls_cert_file = tls_cert_file;
             conn.tls_key_file = tls_key_file;
             conn.tls_insecure = self.tls_insecure;
+            self.apply_extras(&mut conn);
             return Ok(Some(conn));
         }
         let Some(host) = &self.host else {
@@ -111,7 +182,21 @@ impl Cli {
             tls_key_file,
             tls_insecure: self.tls_insecure,
             use_keychain: false,
+            read_only: self.read_only,
+            ssh_host: self.ssh.clone().unwrap_or_default(),
+            ssh_user: self.ssh_user.clone().unwrap_or_default(),
+            ssh_port: self.ssh_port,
+            ssh_key_file: self.ssh_key.clone().unwrap_or_default(),
         }))
+    }
+
+    /// Flags that apply whether the profile came from --url or the host flags.
+    fn apply_extras(&self, conn: &mut Connection) {
+        conn.read_only = self.read_only;
+        conn.ssh_host = self.ssh.clone().unwrap_or_default();
+        conn.ssh_user = self.ssh_user.clone().unwrap_or_default();
+        conn.ssh_port = self.ssh_port;
+        conn.ssh_key_file = self.ssh_key.clone().unwrap_or_default();
     }
 }
 
@@ -123,6 +208,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let quick = cli.quick_connect()?;
+
+    // A subcommand is a one-shot: resolve the server, print, and exit without
+    // ever touching the alternate screen.
+    if let Some(command) = &cli.command {
+        let conn = headless::resolve(cli.profile.as_deref(), quick)?;
+        return match command {
+            Command::Keys { pattern, json } => headless::keys(conn, pattern, *json).await,
+            Command::Export { pattern, out } => headless::export(conn, pattern, out).await,
+            Command::Import { file, replace } => headless::import(conn, file, *replace).await,
+            Command::Info { json } => headless::info(conn, *json).await,
+            Command::MemReport { depth, json } => headless::mem_report(conn, *depth, *json).await,
+        };
+    }
+
+    // `--profile name` opens that saved server directly, the same as picking
+    // it from the list.
+    let quick = match (&cli.profile, quick) {
+        (Some(name), _) => Some(headless::resolve(Some(name), None)?),
+        (None, quick) => quick,
+    };
 
     let mut terminal = setup()?;
     let result = run(&mut terminal, quick).await;

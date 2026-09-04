@@ -9,8 +9,8 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, ConsoleState, Field, FieldKind, Focus, INFO_TABS, InfoRow, InfoState, MemoryState, Modal,
-    Screen,
+    App, ConsoleState, Field, FieldKind, Focus, GroupPane, GroupsState, INFO_TABS, InfoRow,
+    InfoState, MemoryState, Modal, PubSubState, Screen,
 };
 use crate::json::{self, Token};
 use crate::memory::human_bytes;
@@ -66,6 +66,18 @@ fn title_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
             spans.push(Span::styled(
                 format!("  ·  {}", app.server_line),
                 Style::new().fg(palette.dim),
+            ));
+        }
+        // A read-only session says so where it cannot be missed: every write
+        // is refused, and that should never come as a surprise.
+        if c.read_only {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                " READ-ONLY ",
+                Style::new()
+                    .bg(palette.warning)
+                    .fg(palette.highlight_foreground)
+                    .bold(),
             ));
         }
     } else {
@@ -143,6 +155,15 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             }
             if c.use_keychain {
                 spans.push(Span::styled("  keychain", Style::new().fg(palette.info)));
+            }
+            if c.read_only {
+                spans.push(Span::styled(
+                    "  read-only",
+                    Style::new().fg(palette.warning),
+                ));
+            }
+            if c.uses_ssh() {
+                spans.push(Span::styled("  ssh", Style::new().fg(palette.magenta)));
             }
             if app.testing.as_deref() == Some(c.name.as_str()) {
                 spans.push(Span::styled("  testing…", Style::new().fg(palette.accent)));
@@ -236,8 +257,13 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                     Span::styled(format!("  ({})", r.leaves), Style::new().fg(palette.dim)),
                 ]),
                 (None, Some(k)) => {
+                    let marked = app.marked.contains(&k.name);
                     let mut spans = vec![
                         Span::raw(indent),
+                        Span::styled(
+                            if marked { "✓" } else { " " },
+                            Style::new().fg(palette.success).bold(),
+                        ),
                         Span::styled(
                             format!("{} ", k.kind.badge()),
                             Style::new().fg(type_color(k.kind, palette)).bold(),
@@ -268,6 +294,9 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     }
     if app.truncated {
         title.push_str("  ·  TRUNCATED");
+    }
+    if !app.marked.is_empty() {
+        title.push_str(&format!("  ·  {} marked", app.marked.len()));
     }
 
     let list = List::new(items)
@@ -460,16 +489,18 @@ fn footer(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
         ],
         (Screen::Browser, _) => &[
             ("/", "search"),
+            ("F", "find value"),
             ("tab", "pane"),
             ("n", "new key"),
             ("e", "edit"),
             ("a", "add"),
-            ("x", "del item"),
-            ("D", "del key"),
+            ("m", "mark"),
+            ("D", "del"),
+            ("C", "copy"),
             ("t", "ttl"),
             (":", "console"),
             ("i", "info"),
-            ("p", "theme"),
+            ("P", "pub/sub"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -503,13 +534,29 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 rect,
             );
         }
-        Modal::Message { title, body } => {
-            let rect = centered(area, 64, 9);
+        Modal::Message {
+            title,
+            body,
+            scroll,
+        } => {
+            // A one-line notice gets a small box; a command reply gets room to
+            // be read, and scrolls when it still does not fit.
+            let lines = body.lines().count() as u16;
+            let height = (lines + 4).clamp(9, area.height.saturating_sub(2).max(9));
+            let width = if lines > 4 { 96 } else { 64 };
+            let rect = centered(area, width, height);
             clear_area(f, rect, palette);
+            let scrollable = lines + 2 > rect.height;
+            let heading = if scrollable {
+                format!("{title} — ↑↓ scrolls · y copies · esc closes")
+            } else {
+                title.clone()
+            };
             f.render_widget(
                 Paragraph::new(body.clone())
                     .wrap(Wrap { trim: true })
-                    .block(panel(title, true, palette)),
+                    .scroll((*scroll, 0))
+                    .block(panel(&heading, true, palette)),
                 rect,
             );
         }
@@ -595,6 +642,8 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             );
         }
         Modal::Console(state) => console(f, area, state, palette),
+        Modal::PubSub(state) => pubsub_feed(f, area, state, palette),
+        Modal::Groups(state) => consumer_groups(f, area, state, palette),
         Modal::Memory(state) => memory_report(f, area, state, palette),
         Modal::Info(state) => server_info(f, area, state, palette),
         Modal::ThemePicker { selected, .. } => theme_picker(f, area, *selected, palette),
@@ -800,7 +849,7 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
     let rect = centered(area, area.width.saturating_sub(6).min(110), area.height);
     clear_area(f, rect, palette);
     let block = panel(
-        "Server info — tab / 1-5 section, / filter, ↑↓ scroll, y copy, r refresh, esc closes",
+        "Server info — tab/1-0 section · / filter · e edit config · x kill/reset · y copy · r refresh",
         true,
         palette,
     );
@@ -833,7 +882,7 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
     let all = state.rows();
     let body = rows[2];
     let visible = body.height as usize;
-    let start = (state.scroll as usize).min(all.len().saturating_sub(1));
+    let start = state.view_start(visible).min(all.len().saturating_sub(1));
     let width = body.width.saturating_sub(1) as usize; // leave the scrollbar column
     let key_width = 30.min(width.saturating_sub(4));
 
@@ -870,54 +919,68 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
     }
 
     let value_width = width.saturating_sub(key_width + 3);
+    // The Config and Clients tabs act on one row, so that row is highlighted.
+    let cursor = crate::app::tab_is_actionable(state.tab).then_some(state.cursor);
     let lines: Vec<Line> = all
         .iter()
+        .enumerate()
         .skip(start)
         .take(visible)
-        .map(|row| match row {
-            InfoRow::Head(name) => Line::from(Span::styled(
-                format!("{name} "),
-                Style::new().fg(palette.accent).bold(),
-            )),
-            InfoRow::Field(k, v) => Line::from(vec![
-                Span::styled(
-                    format!("  {:<key_width$}", truncate(k, key_width.saturating_sub(1))),
-                    Style::new().fg(palette.dim),
-                ),
-                Span::styled(
-                    truncate(&one_line(v), value_width),
-                    Style::new().fg(palette.foreground),
-                ),
-            ]),
-            InfoRow::Gauge {
-                label,
-                ratio,
-                text,
-                alarm_high,
-            } => {
-                let bar_width = 24.min(value_width.saturating_sub(text.len() + 2));
-                let filled = (ratio * bar_width as f64).round() as usize;
-                Line::from(vec![
+        .map(|(index, row)| {
+            let line = match row {
+                InfoRow::Head(name) => Line::from(Span::styled(
+                    format!("{name} "),
+                    Style::new().fg(palette.accent).bold(),
+                )),
+                InfoRow::Field(k, v) => Line::from(vec![
                     Span::styled(
-                        format!(
-                            "  {:<key_width$}",
-                            truncate(label, key_width.saturating_sub(1))
-                        ),
+                        format!("  {:<key_width$}", truncate(k, key_width.saturating_sub(1))),
                         Style::new().fg(palette.dim),
                     ),
                     Span::styled(
-                        "█".repeat(filled),
-                        Style::new().fg(gauge_color(*ratio, *alarm_high, palette)),
+                        truncate(&one_line(v), value_width),
+                        Style::new().fg(palette.foreground),
                     ),
-                    Span::styled(
-                        "░".repeat(bar_width - filled),
-                        Style::new().fg(palette.panel),
-                    ),
-                    Span::styled(
-                        format!(" {text}"),
-                        Style::new().fg(palette.foreground).bold(),
-                    ),
-                ])
+                ]),
+                InfoRow::Gauge {
+                    label,
+                    ratio,
+                    text,
+                    alarm_high,
+                } => {
+                    let bar_width = 24.min(value_width.saturating_sub(text.len() + 2));
+                    let filled = (ratio * bar_width as f64).round() as usize;
+                    Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "  {:<key_width$}",
+                                truncate(label, key_width.saturating_sub(1))
+                            ),
+                            Style::new().fg(palette.dim),
+                        ),
+                        Span::styled(
+                            "█".repeat(filled),
+                            Style::new().fg(gauge_color(*ratio, *alarm_high, palette)),
+                        ),
+                        Span::styled(
+                            "░".repeat(bar_width - filled),
+                            Style::new().fg(palette.panel),
+                        ),
+                        Span::styled(
+                            format!(" {text}"),
+                            Style::new().fg(palette.foreground).bold(),
+                        ),
+                    ])
+                }
+            };
+            if cursor == Some(index) {
+                line.style(
+                    Style::new()
+                        .bg(palette.accent)
+                        .fg(palette.highlight_foreground),
+                )
+            } else {
+                line
             }
         })
         .collect();
@@ -1028,7 +1091,7 @@ fn memory_report(f: &mut Frame, area: Rect, state: &MemoryState, palette: Palett
     let rect = centered(area, 88, 28);
     clear_area(f, rect, palette);
     let block = panel(
-        "Namespace memory — 1/2/3 depth, r rescans, y copies, esc closes",
+        "Namespace memory — 1/2/3 depth · t biggest keys · r rescans · y copies · esc closes",
         true,
         palette,
     );
@@ -1064,17 +1127,63 @@ fn memory_report(f: &mut Frame, area: Rect, state: &MemoryState, palette: Palett
         rows[0],
     );
 
-    let header = format!(
-        "{:<38}{:>10}{:>12}{:>9}",
-        format!("prefix (depth {})", state.depth),
-        "keys",
-        "est. size",
-        "share"
-    );
+    let header = if state.show_keys {
+        format!("{:<52}{:>12}{:>10}", "key", "size", "freq")
+    } else {
+        format!(
+            "{:<38}{:>10}{:>12}{:>9}",
+            format!("prefix (depth {})", state.depth),
+            "keys",
+            "est. size",
+            "share"
+        )
+    };
     f.render_widget(
         Line::from(Span::styled(header, Style::new().fg(palette.accent).bold())),
         rows[1],
     );
+
+    // The biggest individual keys the sample measured, rather than prefixes.
+    if state.show_keys {
+        let keys = state.rollup.top_keys();
+        if keys.is_empty() {
+            let note = if state.running {
+                "measuring …"
+            } else {
+                "no keys were measured"
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(note, Style::new().fg(palette.dim))),
+                rows[2],
+            );
+            return;
+        }
+        let height = rows[2].height as usize;
+        let start = state.scroll.min(keys.len().saturating_sub(1));
+        let lines: Vec<Line> = keys
+            .iter()
+            .skip(start)
+            .take(height)
+            .map(|key| {
+                Line::from(vec![
+                    Span::raw(format!("{:<52}", truncate(&key.key, 51))),
+                    Span::styled(
+                        format!("{:>12}", human_bytes(key.bytes)),
+                        Style::new().fg(palette.foreground),
+                    ),
+                    Span::styled(
+                        match key.freq {
+                            Some(f) => format!("{f:>10}"),
+                            None => format!("{:>10}", "—"),
+                        },
+                        Style::new().fg(palette.dim),
+                    ),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), rows[2]);
+        return;
+    }
 
     let all = state.rows();
     if all.is_empty() {
@@ -1118,6 +1227,200 @@ fn memory_report(f: &mut Frame, area: Rect, state: &MemoryState, palette: Palett
         })
         .collect();
     f.render_widget(Paragraph::new(lines), rows[2]);
+}
+
+/// The live message feed. Newest at the bottom, like a log.
+fn pubsub_feed(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette) {
+    let rect = centered(area, area.width.saturating_sub(6).min(110), area.height);
+    clear_area(f, rect, palette);
+    let title = format!(
+        "{} — s resubscribe · w publish · f follow · c clear · y copy · esc closes",
+        state.title()
+    );
+    let block = panel(&title, true, palette);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+
+    let headline = if state.messages.is_empty() {
+        if state.keyspace {
+            "waiting … keyspace events need notify-keyspace-events set on the server".to_string()
+        } else {
+            "waiting for messages …".to_string()
+        }
+    } else {
+        format!(
+            "{} message(s){}",
+            state.messages.len(),
+            if state.follow { " · following" } else { "" }
+        )
+    };
+    f.render_widget(
+        Line::from(Span::styled(headline, Style::new().fg(palette.dim))),
+        rows[0],
+    );
+
+    let body = rows[1];
+    let height = body.height as usize;
+    // Follow mode keeps the newest message in view; otherwise the cursor
+    // decides which window to show.
+    let last = state.messages.len().saturating_sub(1);
+    let anchor = state.scroll.min(last);
+    let start = anchor.saturating_sub(height.saturating_sub(1));
+    // A 10-column terminal leaves nothing for a channel column; clamp rather
+    // than letting the arithmetic wrap.
+    let channel_width = 28.min(body.width.saturating_sub(4) as usize).max(1);
+    let payload_width = (body.width as usize).saturating_sub(channel_width + 3);
+    let lines: Vec<Line> = state
+        .messages
+        .iter()
+        .skip(start)
+        .take(height)
+        .map(|(channel, payload)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{:<channel_width$} ",
+                        truncate(channel, channel_width.saturating_sub(1))
+                    ),
+                    Style::new().fg(palette.accent),
+                ),
+                Span::styled(
+                    truncate(&one_line(payload), payload_width),
+                    Style::new().fg(palette.foreground),
+                ),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), body);
+}
+
+/// Consumer groups on the left, the selected group's consumers and unacked
+/// entries on the right.
+fn consumer_groups(f: &mut Frame, area: Rect, state: &GroupsState, palette: Palette) {
+    let rect = centered(area, area.width.saturating_sub(6).min(120), area.height);
+    clear_area(f, rect, palette);
+    let title = format!(
+        "Consumer groups of '{}' — n new · d destroy · a ack · c claim · tab pane · esc closes",
+        truncate(&state.key, 40)
+    );
+    let block = panel(&title, true, palette);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(inner);
+
+    let group_items: Vec<ListItem> = state
+        .groups
+        .iter()
+        .map(|g| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<20}", truncate(&g.name, 19)),
+                    Style::new().fg(palette.foreground).bold(),
+                ),
+                Span::styled(
+                    format!(
+                        "{:>4} pend  {:>3} cons  lag {}",
+                        g.pending, g.consumers, g.lag
+                    ),
+                    Style::new().fg(palette.dim),
+                ),
+            ]))
+        })
+        .collect();
+    let mut group_state = ratatui::widgets::ListState::default();
+    if !state.groups.is_empty() {
+        group_state.select(Some(state.selected.min(state.groups.len() - 1)));
+    }
+    let groups_focused = state.pane == GroupPane::Groups;
+    f.render_stateful_widget(
+        List::new(group_items)
+            .block(panel("Groups", groups_focused, palette))
+            .highlight_style(if groups_focused {
+                Style::new()
+                    .bg(palette.accent)
+                    .fg(palette.highlight_foreground)
+                    .bold()
+            } else {
+                Style::new().bg(palette.panel)
+            }),
+        columns[0],
+        &mut group_state,
+    );
+
+    let right = Layout::vertical([Constraint::Length(7), Constraint::Min(1)]).split(columns[1]);
+    let consumers: Vec<Line> = if state.detail.consumers.is_empty() {
+        vec![Line::from(Span::styled(
+            "no consumers",
+            Style::new().fg(palette.dim),
+        ))]
+    } else {
+        state
+            .detail
+            .consumers
+            .iter()
+            .map(|c| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<24}", truncate(&c.name, 23)),
+                        Style::new().fg(palette.foreground),
+                    ),
+                    Span::styled(
+                        format!("{:>4} pending · idle {}s", c.pending, c.idle_ms / 1000),
+                        Style::new().fg(palette.dim),
+                    ),
+                ])
+            })
+            .collect()
+    };
+    f.render_widget(
+        Paragraph::new(consumers).block(panel("Consumers", false, palette)),
+        right[0],
+    );
+
+    let pending_focused = state.pane == GroupPane::Pending;
+    let pending_items: Vec<ListItem> = state
+        .detail
+        .pending
+        .iter()
+        .map(|e| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<20}", truncate(&e.id, 19)),
+                    Style::new().fg(palette.foreground),
+                ),
+                Span::styled(
+                    format!(
+                        "{:<18} idle {}s · delivered {}",
+                        truncate(&e.consumer, 17),
+                        e.idle_ms / 1000,
+                        e.deliveries
+                    ),
+                    Style::new().fg(palette.dim),
+                ),
+            ]))
+        })
+        .collect();
+    let pending_title = format!("Pending ({})", state.detail.pending.len());
+    let mut pending_state = ratatui::widgets::ListState::default();
+    if !state.detail.pending.is_empty() {
+        pending_state.select(Some(state.pending_sel.min(state.detail.pending.len() - 1)));
+    }
+    f.render_stateful_widget(
+        List::new(pending_items)
+            .block(panel(&pending_title, pending_focused, palette))
+            .highlight_style(if pending_focused {
+                Style::new()
+                    .bg(palette.accent)
+                    .fg(palette.highlight_foreground)
+                    .bold()
+            } else {
+                Style::new().bg(palette.panel)
+            }),
+        right[1],
+        &mut pending_state,
+    );
 }
 
 fn clear_area(f: &mut Frame, area: Rect, palette: Palette) {
@@ -1202,6 +1505,8 @@ fn type_color(kind: KeyType, palette: Palette) -> Color {
         KeyType::Set => palette.magenta,
         KeyType::ZSet => palette.blue,
         KeyType::Stream => palette.red,
+        KeyType::Json => palette.accent,
+        KeyType::TimeSeries => palette.warning,
         KeyType::Other => palette.dim,
     }
 }
@@ -1317,6 +1622,14 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         row("n", "new key       D  delete key      R  rename key"),
         row("t", "set or clear TTL"),
         row("y", "copy the selected key name to the clipboard"),
+        row("m", "mark the key, or every key under the folder"),
+        row("u", "clear every mark · D and t then act on the marked set"),
+        row("F", "find keys whose value contains some text"),
+        row("C", "copy a key elsewhere (name, database or server)"),
+        row(
+            "w / I",
+            "export the marked keys to a file · import one back",
+        ),
         row(
             "r",
             "refresh — TTLs count down live, expired keys leave the tree",
@@ -1333,9 +1646,15 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         head("Server"),
         row(
             "i",
-            "server info — Server / Memory / Stats / Key Statistics / All",
+            "server info — INFO, slow log, clients, config, latency, cluster",
         ),
-        row("M", "namespace memory — which prefix holds the RAM"),
+        row(
+            "M",
+            "namespace memory — which prefix holds the RAM · t big keys",
+        ),
+        row("P", "pub/sub feed        N  keyspace event feed"),
+        row("S", "consumer groups of the selected stream"),
+        row("L", "run a Lua script — marked keys become KEYS[1..]"),
         row(":", "raw command console — tab completes, ctrl+r searches"),
         row("ctrl+d", "switch database (reconnects)"),
         row("ctrl+n", "back to the server list"),

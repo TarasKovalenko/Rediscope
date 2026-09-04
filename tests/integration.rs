@@ -227,7 +227,8 @@ async fn a_json_string_round_trips_through_the_editor_shape() {
 #[tokio::test]
 async fn the_command_list_is_read_for_console_completion() {
     let c = client!(8);
-    let names = c.command_names().await.unwrap();
+    let table = c.command_names().await.unwrap();
+    let names = table.names;
     assert!(
         names.len() > 100,
         "a server knows more than {}",
@@ -235,6 +236,11 @@ async fn the_command_list_is_read_for_console_completion() {
     );
     assert!(names.iter().any(|n| n == "GET"), "uppercased for display");
     assert!(names.iter().any(|n| n == "DBSIZE"));
+    assert!(
+        table.writes.contains("SET"),
+        "the server flags SET as a write"
+    );
+    assert!(!table.writes.contains("GET"), "GET is a read");
     assert!(
         names.windows(2).all(|w| w[0] <= w[1]),
         "sorted for completion"
@@ -335,4 +341,285 @@ async fn pressing_m_fills_the_namespace_report_from_a_live_server() {
     let rows = state.rows();
     assert_eq!(rows[0].prefix, "big:");
     assert_eq!(rows[0].keys, 30);
+}
+
+// ---- bulk operations, copy and search ------------------------------------
+//
+// The databases up to 15 are taken by the tests above, so these share the low
+// ones and clean up after themselves by prefix rather than with FLUSHDB.
+
+/// Remove every key under a prefix, so a shared database stays usable.
+async fn clear_prefix(c: &Client, prefix: &str) {
+    let (keys, _) = c.scan_keys(&format!("{prefix}*"), 5000).await.unwrap();
+    let names: Vec<String> = keys.into_iter().map(|k| k.name).collect();
+    if !names.is_empty() {
+        c.delete_keys(&names).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn bulk_delete_and_expire_cover_every_named_key() {
+    let c = client!(0);
+    clear_prefix(&c, "bulk:").await;
+    let names: Vec<String> = (0..5).map(|i| format!("bulk:{i}")).collect();
+    for name in &names {
+        c.set_string(name, "v").await.unwrap();
+    }
+
+    assert_eq!(c.expire_keys(&names, Some(600)).await.unwrap(), 5);
+    assert_eq!(c.key_info("bulk:0").await.unwrap().ttl, 600);
+    assert_eq!(c.expire_keys(&names, None).await.unwrap(), 5);
+    assert_eq!(c.key_info("bulk:0").await.unwrap().ttl, -1);
+
+    assert_eq!(c.delete_keys(&names).await.unwrap(), 5);
+    assert_eq!(c.key_info("bulk:0").await.unwrap().kind, KeyType::Other);
+}
+
+#[tokio::test]
+async fn copying_a_key_carries_its_type_and_ttl() {
+    let c = client!(1);
+    clear_prefix(&c, "cp:").await;
+    c.create_key("cp:src", KeyType::Hash).await.unwrap();
+    c.hash_set("cp:src", "a", "1").await.unwrap();
+    c.set_ttl("cp:src", Some(120)).await.unwrap();
+
+    c.copy_key("cp:src", "cp:dst", &c, false).await.unwrap();
+    let copied = c.key_info("cp:dst").await.unwrap();
+    assert_eq!(copied.kind, KeyType::Hash);
+    assert!(copied.ttl > 0, "the expiry travels with the key");
+    match c.read_value("cp:dst", KeyType::Hash).await.unwrap() {
+        KeyValue::Rows { rows, .. } => assert!(rows.iter().any(|r| r.cells == ["a", "1"])),
+        other => panic!("unexpected value: {other:?}"),
+    }
+
+    // Without REPLACE the target must not be clobbered silently.
+    assert!(c.copy_key("cp:src", "cp:dst", &c, false).await.is_err());
+    assert!(c.copy_key("cp:src", "cp:dst", &c, true).await.is_ok());
+    clear_prefix(&c, "cp:").await;
+}
+
+#[tokio::test]
+async fn searching_values_looks_inside_every_type() {
+    let c = client!(2);
+    clear_prefix(&c, "grep:").await;
+    c.set_string("grep:plain", "hello WORLD").await.unwrap();
+    c.create_key("grep:h", KeyType::Hash).await.unwrap();
+    c.hash_set("grep:h", "greeting", "world domination")
+        .await
+        .unwrap();
+    c.set_string("grep:other", "nothing here").await.unwrap();
+
+    let (hits, _) = c.grep_values("grep:*", "world", 5000).await.unwrap();
+    let mut names: Vec<String> = hits.into_iter().map(|k| k.name).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["grep:h", "grep:plain"],
+        "case-insensitive, across types"
+    );
+    clear_prefix(&c, "grep:").await;
+}
+
+#[tokio::test]
+async fn an_export_round_trips_through_a_file() {
+    let c = client!(3);
+    clear_prefix(&c, "keep:").await;
+    c.set_string("keep:1", "one").await.unwrap();
+    c.create_key("keep:2", KeyType::ZSet).await.unwrap();
+    c.zset_add("keep:2", "member", 1.5).await.unwrap();
+
+    let names = vec!["keep:1".to_string(), "keep:2".to_string()];
+    let entries = c.export_keys(&names).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    let text = serde_json::to_string(&entries).unwrap();
+
+    c.delete_keys(&names).await.unwrap();
+    assert_eq!(c.key_info("keep:1").await.unwrap().kind, KeyType::Other);
+
+    let parsed: Vec<rediscope::redis_client::ExportEntry> = serde_json::from_str(&text).unwrap();
+    assert_eq!(c.import_entries(&parsed, false).await.unwrap(), 2);
+    assert_eq!(c.key_info("keep:2").await.unwrap().kind, KeyType::ZSet);
+    match c.read_value("keep:1", KeyType::String).await.unwrap() {
+        KeyValue::Str(s) => assert_eq!(s, "one"),
+        other => panic!("unexpected value: {other:?}"),
+    }
+
+    // A second import of the same keys needs REPLACE.
+    assert!(c.import_entries(&parsed, false).await.is_err());
+    assert!(c.import_entries(&parsed, true).await.is_ok());
+    clear_prefix(&c, "keep:").await;
+}
+
+#[tokio::test]
+async fn consumer_groups_are_listed_acked_and_destroyed() {
+    let c = client!(4);
+    clear_prefix(&c, "xg:").await;
+    c.create_key("xg:stream", KeyType::Stream).await.unwrap();
+    c.stream_group_create("xg:stream", "workers", "0")
+        .await
+        .unwrap();
+    // Read the entry into the group so it becomes pending.
+    c.execute_raw("XREADGROUP GROUP workers alice COUNT 10 STREAMS xg:stream >")
+        .await
+        .unwrap();
+
+    let groups = c.stream_groups("xg:stream").await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "workers");
+    assert_eq!(groups[0].pending, 1);
+
+    let detail = c.stream_group_detail("xg:stream", "workers").await.unwrap();
+    assert_eq!(detail.consumers.len(), 1);
+    assert_eq!(detail.consumers[0].name, "alice");
+    let pending = detail.pending.first().expect("one pending entry").clone();
+    assert_eq!(pending.consumer, "alice");
+
+    c.stream_claim("xg:stream", "workers", "bob", &pending.id)
+        .await
+        .unwrap();
+    let detail = c.stream_group_detail("xg:stream", "workers").await.unwrap();
+    assert_eq!(detail.pending[0].consumer, "bob", "claimed by bob");
+
+    c.stream_ack("xg:stream", "workers", &pending.id)
+        .await
+        .unwrap();
+    assert_eq!(c.stream_groups("xg:stream").await.unwrap()[0].pending, 0);
+
+    c.stream_group_destroy("xg:stream", "workers")
+        .await
+        .unwrap();
+    assert!(c.stream_groups("xg:stream").await.unwrap().is_empty());
+    clear_prefix(&c, "xg:").await;
+}
+
+#[tokio::test]
+async fn diagnostics_read_the_slow_log_clients_and_config() {
+    let c = client!(6);
+    let diag = c.diagnostics().await.unwrap();
+    assert!(
+        diag.config.iter().any(|(k, _)| k == "maxmemory"),
+        "CONFIG GET * reaches the running config"
+    );
+    assert!(
+        diag.clients.iter().any(|c| !c.addr.is_empty()),
+        "our own connection is in CLIENT LIST"
+    );
+    assert!(
+        diag.latency.iter().any(|(k, _)| k.starts_with("ping")),
+        "a ping sample is always available"
+    );
+    // A server built without cluster support refuses CLUSTER INFO outright,
+    // which has to read as "no cluster" rather than as a failed fetch.
+    assert!(
+        diag.cluster.is_empty() || diag.cluster.iter().any(|(k, _)| k == "cluster_enabled"),
+        "cluster state is either absent or parsed: {:?}",
+        diag.cluster
+    );
+}
+
+#[tokio::test]
+async fn a_lua_script_sees_the_keys_it_was_given() {
+    // db7 belongs to the memory scan, which flushes and counts what it finds.
+    let c = client!(0);
+    c.set_string("script:key", "value").await.unwrap();
+    let out = c
+        .eval(
+            "return redis.call('GET', KEYS[1])",
+            &["script:key".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.trim(), "value");
+    c.delete_key("script:key").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_read_only_profile_refuses_every_write() {
+    let Some(base) = conn(1) else { return };
+    let writable = Client::connect(base.clone()).await.expect("connect");
+    writable.set_string("ro:guarded", "before").await.unwrap();
+
+    let guarded = Client::connect(Connection {
+        read_only: true,
+        ..base
+    })
+    .await
+    .expect("connect");
+    assert!(guarded.read_only());
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.on_msg(Msg::Connected(Box::new(Ok(guarded))));
+    app.current = Some(writable.key_info("ro:guarded").await.unwrap());
+    // Every write key is refused before a modal ever opens.
+    for key in ['n', 'D', 'R', 't', 'a', 'e', 'x'] {
+        app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        assert!(app.modal.is_none(), "'{key}' opened a write modal");
+        assert!(app.status.contains("read-only"), "'{key}': {}", app.status);
+    }
+
+    match writable
+        .read_value("ro:guarded", KeyType::String)
+        .await
+        .unwrap()
+    {
+        KeyValue::Str(s) => assert_eq!(s, "before", "nothing was written"),
+        other => panic!("unexpected value: {other:?}"),
+    }
+    writable.delete_key("ro:guarded").await.unwrap();
+}
+
+#[tokio::test]
+async fn the_write_table_separates_reads_from_writes() {
+    let c = client!(9);
+    let table = c.command_names().await.unwrap();
+    assert!(table.is_write("SET k v"));
+    assert!(table.is_write("del k"));
+    assert!(table.is_write("FLUSHALL"), "destructive counts as a write");
+    assert!(!table.is_write("GET k"));
+    assert!(!table.is_write("INFO"));
+    assert!(
+        table.is_write("NOTACOMMAND"),
+        "an unknown command is treated as a write"
+    );
+}
+
+#[tokio::test]
+async fn the_pubsub_feed_receives_what_is_published() {
+    let c = client!(5);
+    let publisher = client!(5);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.on_msg(Msg::Connected(Box::new(Ok(c))));
+    // Drain the messages the connection itself queues (server line, commands).
+    app.on_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // subscribe to *
+    assert!(matches!(app.modal, Some(Modal::PubSub(_))));
+
+    let received = async {
+        loop {
+            // Publishing repeatedly: the subscription is set up on its own
+            // task, so the first message may go out before it is listening.
+            publisher
+                .execute_raw("PUBLISH chat hello")
+                .await
+                .expect("publish");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+            while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                app.on_msg(msg);
+                if let Some(Modal::PubSub(state)) = &app.modal
+                    && !state.messages.is_empty()
+                {
+                    return state.messages[0].clone();
+                }
+            }
+        }
+    };
+    let (channel, payload) = tokio::time::timeout(std::time::Duration::from_secs(10), received)
+        .await
+        .expect("a message arrives");
+    assert_eq!(channel, "chat");
+    assert_eq!(payload, "hello");
 }

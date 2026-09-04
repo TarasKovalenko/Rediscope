@@ -174,8 +174,11 @@ async fn renders_every_screen_and_modal_at_any_size() {
     }
 
     // Server info: every tab, at every size, plus scrolling past the end.
-    a.on_msg(Msg::Info(Box::new(Ok(ServerInfo::parse(
-        "# Server\nredis_version:7.2.4\nredis_mode:standalone\n\n# Memory\nused_memory_human:1.20M\n\n# Stats\nkeyspace_hits:9\nkeyspace_misses:1\n\n# Keyspace\ndb0:keys=4,expires=1,avg_ttl=0\n",
+    a.on_msg(Msg::Info(Box::new(Ok((
+        ServerInfo::parse(
+            "# Server\nredis_version:7.2.4\nredis_mode:standalone\n\n# Memory\nused_memory_human:1.20M\n\n# Stats\nkeyspace_hits:9\nkeyspace_misses:1\n\n# Keyspace\ndb0:keys=4,expires=1,avg_ttl=0\n",
+        ),
+        rediscope::redis_client::Diagnostics::default(),
     )))));
     for _ in 0..rediscope::app::INFO_TABS.len() {
         render_all_sizes(&mut a);
@@ -354,6 +357,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         "cache.example",  // Host
         "6380",           // Port
         "3",              // Database
+        "",               // read-only switch, left off
         "reader",         // Username
         "s3cret",         // Password
         "",               // keychain switch, left off
@@ -362,9 +366,13 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         "",               // client certificate
         "",               // client key
         "",               // skip verification
+        "",               // SSH host, left blank
+        "",               // SSH user
+        "",               // SSH port, keeps its default
+        "",               // SSH key
     ];
     for (i, value) in inputs.iter().enumerate() {
-        if i == 7 {
+        if i == 8 {
             press(&mut a, KeyCode::Char(' ')); // switch TLS on
         } else if !value.is_empty() {
             app_ctrl(&mut a, 'u');
@@ -393,6 +401,9 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
     assert_eq!(c.tls_ca_file, "~/certs/ca.pem");
     assert!(c.tls_cert_file.is_empty());
     assert!(!c.tls_insecure);
+    assert!(!c.read_only);
+    assert!(c.ssh_host.is_empty());
+    assert_eq!(c.ssh_port, 22);
 }
 
 #[tokio::test]
@@ -400,7 +411,7 @@ async fn certificate_files_require_tls() {
     let mut a = app();
     press(&mut a, KeyCode::Char('n'));
     type_str(&mut a, "certs-only");
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut a, KeyCode::Tab); // walk to the CA certificate field
     }
     type_str(&mut a, "/tmp/ca.pem");
@@ -514,4 +525,157 @@ async fn the_memory_report_renders_while_it_is_still_scanning() {
     press(&mut a, KeyCode::Char('2'));
     let deep = render_text(&mut a, 120, 40);
     assert!(deep.contains("session:web:"), "{deep}");
+}
+
+#[tokio::test]
+async fn the_new_panes_render_at_any_size() {
+    let mut a = app();
+    populate(&mut a);
+
+    // The pub/sub feed, filled past the height of the smallest terminal.
+    a.modal = Some(rediscope::app::Modal::PubSub(
+        rediscope::app::PubSubState::new(vec!["news.*".into()], false),
+    ));
+    for i in 0..30 {
+        a.on_msg(Msg::PubSub {
+            channel: format!("news.{i}"),
+            payload: format!("message {i} with a body long enough to need truncating"),
+        });
+    }
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Char('f')); // stop following
+    press(&mut a, KeyCode::Char('G'));
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Char('c')); // clear
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
+    assert!(a.modal.is_none());
+
+    // Consumer groups, both empty and populated.
+    let mut groups = rediscope::app::GroupsState::new("events".into());
+    a.modal = Some(rediscope::app::Modal::Groups(
+        rediscope::app::GroupsState::new("events".into()),
+    ));
+    render_all_sizes(&mut a);
+    groups.set_groups(vec![rediscope::redis_client::StreamGroup {
+        name: "workers".into(),
+        consumers: 2,
+        pending: 3,
+        last_delivered: "1-1".into(),
+        lag: "0".into(),
+    }]);
+    groups.detail = rediscope::redis_client::StreamGroupDetail {
+        consumers: vec![rediscope::redis_client::StreamConsumer {
+            name: "alice".into(),
+            pending: 3,
+            idle_ms: 4200,
+        }],
+        pending: vec![rediscope::redis_client::PendingEntry {
+            id: "1-1".into(),
+            consumer: "alice".into(),
+            idle_ms: 4200,
+            deliveries: 2,
+        }],
+    };
+    a.modal = Some(rediscope::app::Modal::Groups(groups));
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Tab); // into the pending pane
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
+
+    // A long reply scrolls inside the message box.
+    a.modal = Some(rediscope::app::Modal::Message {
+        title: "Result".into(),
+        body: (0..60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        scroll: 0,
+    });
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Char('G'));
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
+    assert!(a.modal.is_none());
+}
+
+#[tokio::test]
+async fn marking_keys_retargets_the_bulk_actions() {
+    let mut a = app();
+    populate(&mut a);
+    a.focus = rediscope::app::Focus::Tree;
+
+    // Marking the folder marks every key beneath it.
+    press(&mut a, KeyCode::Char('g'));
+    press(&mut a, KeyCode::Char('m'));
+    assert_eq!(a.marked.len(), 3, "app:queue, app:user:1 and app:user:2");
+    render_all_sizes(&mut a);
+
+    press(&mut a, KeyCode::Char('D'));
+    match &a.modal {
+        Some(rediscope::app::Modal::Confirm { message, .. }) => {
+            assert!(message.contains("3 marked key(s)"), "{message}");
+        }
+        _ => panic!("delete should confirm the marked set"),
+    }
+    press(&mut a, KeyCode::Esc);
+
+    press(&mut a, KeyCode::Char('t'));
+    match &a.modal {
+        Some(rediscope::app::Modal::Form { title, .. }) => {
+            assert!(title.contains("3 marked key(s)"), "{title}");
+        }
+        _ => panic!("ttl should target the marked set"),
+    }
+    press(&mut a, KeyCode::Esc);
+
+    // Unmarking returns the actions to the selected key.
+    press(&mut a, KeyCode::Char('u'));
+    assert!(a.marked.is_empty());
+    press(&mut a, KeyCode::Char('m'));
+    assert_eq!(a.marked.len(), 3, "the folder toggles as a whole");
+    press(&mut a, KeyCode::Char('m'));
+    assert!(a.marked.is_empty(), "and toggles back off");
+}
+
+#[tokio::test]
+async fn the_info_modal_reaches_the_diagnostics_tabs() {
+    let mut a = app();
+    populate(&mut a);
+    let diag = rediscope::redis_client::Diagnostics {
+        config: vec![
+            ("maxmemory".into(), "0".into()),
+            ("appendonly".into(), "no".into()),
+        ],
+        clients: vec![rediscope::redis_client::ClientEntry {
+            id: "17".into(),
+            addr: "127.0.0.1:6379".into(),
+            db: "0".into(),
+            command: "client|list".into(),
+            ..Default::default()
+        }],
+        latency: vec![("ping (5 samples)".into(), "min 0.10 ms".into())],
+        ..Default::default()
+    };
+    a.on_msg(Msg::Info(Box::new(Ok((
+        ServerInfo::parse("# Server\nredis_version:7.2.4\n"),
+        diag,
+    )))));
+
+    for _ in 0..rediscope::app::INFO_TABS.len() {
+        render_all_sizes(&mut a);
+        press(&mut a, KeyCode::Tab);
+    }
+
+    // The Config tab offers the selected parameter for editing.
+    press(&mut a, KeyCode::Char('7'));
+    press(&mut a, KeyCode::Char('j'));
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Char('e'));
+    match &a.modal {
+        Some(rediscope::app::Modal::Form { title, .. }) => {
+            assert!(title.starts_with("CONFIG SET"), "{title}");
+        }
+        _ => panic!("e on the config tab edits the parameter"),
+    }
 }

@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod config;
+pub mod headless;
 pub mod history;
 pub mod input;
 pub mod json;
