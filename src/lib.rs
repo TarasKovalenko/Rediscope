@@ -11,3 +11,4 @@ pub mod secrets;
 pub mod theme;
 pub mod tree;
 pub mod ui;
+pub mod xml;

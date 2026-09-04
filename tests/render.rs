@@ -91,6 +91,22 @@ fn render_at(app: &mut App, w: u16, h: u16) {
     terminal.draw(|f| ui::draw(f, app)).unwrap();
 }
 
+fn render_text(app: &mut App, w: u16, h: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| ui::draw(f, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..h)
+        .map(|y| {
+            let mut line = String::new();
+            for x in 0..w {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn render_all_sizes(app: &mut App) {
     for (w, h) in [(120, 40), (80, 24), (40, 12), (20, 8), (10, 5)] {
         render_at(app, w, h);
@@ -205,6 +221,59 @@ async fn renders_every_screen_and_modal_at_any_size() {
     // Keys expiring out from under the tree must not break the layout.
     a.age_ttls(4_000);
     render_all_sizes(&mut a);
+}
+
+#[tokio::test]
+async fn previews_structured_list_values_and_handles_long_editor_titles() {
+    let mut a = app();
+    a.screen = rediscope::app::Screen::Browser;
+    a.focus = rediscope::app::Focus::Value;
+    a.on_msg(Msg::Value {
+        info: key("medinsight:data-protection:keys", KeyType::List, -1),
+        value: KeyValue::Rows {
+            headers: vec!["index", "value"],
+            rows: vec![Row {
+                id: "0".into(),
+                cells: vec![
+                    "0".into(),
+                    "<key id=\"abc\"><creationDate>2026-09-04</creationDate><descriptor><masterKey requiresEncryption=\"true\"><value>protected</value></masterKey></descriptor></key>".into(),
+                ],
+            }],
+            total: 1,
+        },
+    });
+
+    let screen = render_text(&mut a, 100, 30);
+    assert!(screen.contains("Selected XML"), "{screen}");
+    assert!(
+        screen.contains("<creationDate>2026-09-04</creationDate>"),
+        "{screen}"
+    );
+    press(&mut a, KeyCode::PageDown);
+    assert_eq!(a.value_scroll, 10, "page keys scroll the preview");
+    press(&mut a, KeyCode::Char('j'));
+    assert_eq!(a.value_scroll, 0, "changing rows resets preview scroll");
+
+    let long_name =
+        "medinsight:data-protection:keys:with:a:key:name:that:is:far:longer:than:the:dialog";
+    a.on_msg(Msg::Value {
+        info: key(long_name, KeyType::String, -1),
+        value: KeyValue::Str("{\"enabled\":true}".into()),
+    });
+    press(&mut a, KeyCode::Char('e'));
+    render_all_sizes(&mut a);
+    let editor = render_text(&mut a, 80, 24);
+    let title_line = editor
+        .lines()
+        .find(|line| line.contains("Edit JSON"))
+        .expect("the edit title is visible");
+    assert!(!title_line.contains("ctrl+s"), "{title_line}");
+    let controls_line = editor
+        .lines()
+        .find(|line| line.contains("ctrl+s saves"))
+        .expect("editor controls are visible in the footer");
+    assert!(controls_line.contains("ctrl+f formats"), "{controls_line}");
+    assert!(controls_line.contains("esc cancels"), "{controls_line}");
 }
 
 #[tokio::test]

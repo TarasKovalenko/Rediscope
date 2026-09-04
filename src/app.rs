@@ -833,6 +833,14 @@ impl App {
         }
     }
 
+    fn selected_value_is_structured(&self) -> bool {
+        self.selected_value_row().is_some_and(|row| {
+            row.cells
+                .iter()
+                .any(|cell| json::mode(cell).is_json() || crate::xml::is_xml(cell))
+        })
+    }
+
     // ---- key events -------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -1264,27 +1272,33 @@ impl App {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 if len > 0 {
-                    move_sel(&mut self.value_state, len, 1)
+                    move_sel(&mut self.value_state, len, 1);
+                    self.value_scroll = 0;
                 } else {
                     self.value_scroll = self.value_scroll.saturating_add(1)
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if len > 0 {
-                    move_sel(&mut self.value_state, len, -1)
+                    move_sel(&mut self.value_state, len, -1);
+                    self.value_scroll = 0;
                 } else {
                     self.value_scroll = self.value_scroll.saturating_sub(1)
                 }
             }
             KeyCode::PageDown => {
-                if len > 0 {
+                if self.selected_value_is_structured() {
+                    self.value_scroll = self.value_scroll.saturating_add(10)
+                } else if len > 0 {
                     move_sel(&mut self.value_state, len, 10)
                 } else {
                     self.value_scroll = self.value_scroll.saturating_add(10)
                 }
             }
             KeyCode::PageUp => {
-                if len > 0 {
+                if self.selected_value_is_structured() {
+                    self.value_scroll = self.value_scroll.saturating_sub(10)
+                } else if len > 0 {
                     move_sel(&mut self.value_state, len, -10)
                 } else {
                     self.value_scroll = self.value_scroll.saturating_sub(10)
@@ -1298,7 +1312,8 @@ impl App {
             }
             KeyCode::Char('G') | KeyCode::End => {
                 if len > 0 {
-                    self.value_state.select(Some(len - 1))
+                    self.value_state.select(Some(len - 1));
+                    self.value_scroll = 0;
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
