@@ -1,7 +1,7 @@
 //! Async Redis access tailored to the TUI: SCAN-based listing, bounded value
 //! reads, and typed mutators. Nothing here blocks the render loop.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use redis::aio::MultiplexedConnection;
 use redis::{
     AsyncCommands, ClientTlsConfig, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,

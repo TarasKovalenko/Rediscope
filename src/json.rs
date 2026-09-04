@@ -189,12 +189,16 @@ mod tests {
                 Token::Punct
             ]
         );
-        assert!(lines[2]
-            .iter()
-            .any(|(t, s)| *t == Token::Number && s == "1.5e3"));
-        assert!(lines[3]
-            .iter()
-            .any(|(t, s)| *t == Token::Literal && s == "true"));
+        assert!(
+            lines[2]
+                .iter()
+                .any(|(t, s)| *t == Token::Number && s == "1.5e3")
+        );
+        assert!(
+            lines[3]
+                .iter()
+                .any(|(t, s)| *t == Token::Literal && s == "true")
+        );
     }
 
     #[test]

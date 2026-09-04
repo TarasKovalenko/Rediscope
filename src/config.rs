@@ -183,7 +183,7 @@ impl Store {
                         read_error: None,
                     },
                     None,
-                )
+                );
             }
             Err(e) => {
                 let notice = format!("Cannot read {}: {e}", path.display());
@@ -260,8 +260,9 @@ impl Store {
         // A unique scratch name, so two saves in flight at once (two processes,
         // or two threads) cannot rename each other's file away.
         let tmp = path.with_extension(format!("json.tmp-{}", scratch_id()));
-        fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
-        restrict(&tmp, 0o600);
+        // Owner-only from the moment it exists: writing first and tightening
+        // afterwards would publish the credentials for the gap in between.
+        write_private(&tmp, &text).with_context(|| format!("cannot write {}", tmp.display()))?;
         if path.exists() {
             let _ = fs::copy(&path, path.with_extension("json.bak"));
         }
@@ -337,10 +338,10 @@ pub fn expand_home(path: &str) -> std::path::PathBuf {
     let rest = trimmed
         .strip_prefix("~/")
         .or_else(|| trimmed.strip_prefix("~\\"));
-    if let Some(rest) = rest {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = rest
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(trimmed)
 }
@@ -349,6 +350,26 @@ pub fn expand_home(path: &str) -> std::path::PathBuf {
 fn restrict(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+}
+
+/// Create `path` unreadable to anyone but the owner and write `text` into it.
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(text.as_bytes())
+}
+
+/// See [`restrict`]: the containing directory carries the protection here.
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    fs::write(path, text)
 }
 
 /// Windows has no mode bits. The file lives under the per-user profile
@@ -390,6 +411,40 @@ mod tests {
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Holds [`ENV_LOCK`] for the whole test and unsets everything it set, so a
+    /// failing assertion cannot leak `REDISCOPE_HOME` into the next test.
+    struct ScopedEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        names: Vec<&'static str>,
+    }
+
+    impl ScopedEnv {
+        fn new() -> Self {
+            Self {
+                _guard: env_guard(),
+                names: Vec::new(),
+            }
+        }
+
+        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+            self.names.push(name);
+            // SAFETY: ENV_LOCK serialises every environment mutation in this
+            // module, and nothing else in the test binary reads the process
+            // environment while the guard is held.
+            unsafe { std::env::set_var(name, value) };
+            self
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for name in self.names.drain(..) {
+                // SAFETY: as in `set` - the guard is still held here.
+                unsafe { std::env::remove_var(name) };
+            }
+        }
     }
 
     #[test]
@@ -456,9 +511,9 @@ mod tests {
 
     #[test]
     fn keychain_profiles_do_not_write_a_password_to_disk() {
-        let _guard = env_guard();
+        let mut env = ScopedEnv::new();
         let dir = tempdir();
-        std::env::set_var("REDISCOPE_HOME", &dir);
+        env.set("REDISCOPE_HOME", &dir);
         let store = Store {
             connections: vec![Connection {
                 name: "vault".into(),
@@ -472,16 +527,19 @@ mod tests {
         let text = fs::read_to_string(config_file()).unwrap();
         assert!(!text.contains("should-not-persist"));
         assert!(text.contains("\"use_keychain\": true"));
-        std::env::remove_var("REDISCOPE_HOME");
     }
 
     fn tempdir() -> PathBuf {
+        // A timestamp alone is not unique: two tests can read the same
+        // nanosecond and then share - and overwrite - one config file.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "rediscope-test-{}",
+            "rediscope-test-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&p).unwrap();
         p
@@ -489,7 +547,8 @@ mod tests {
 
     #[test]
     fn password_placeholder_expands_from_env() {
-        std::env::set_var("REDISCOPE_TEST_PW", "hunter2");
+        let mut env = ScopedEnv::new();
+        env.set("REDISCOPE_TEST_PW", "hunter2");
         let c = Connection {
             password: "${REDISCOPE_TEST_PW}".into(),
             ..Default::default()
@@ -507,9 +566,9 @@ mod tests {
     /// every saved profile.
     #[test]
     fn an_unparseable_file_is_kept_and_never_overwritten() {
-        let _guard = env_guard();
+        let mut env = ScopedEnv::new();
         let dir = tempdir();
-        std::env::set_var("REDISCOPE_HOME", &dir);
+        env.set("REDISCOPE_HOME", &dir);
         fs::write(config_file(), "{ this is not json").unwrap();
 
         let (store, notice) = Store::load();
@@ -524,7 +583,6 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1, "the original file is still there");
         assert_eq!(fs::read_to_string(&kept[0]).unwrap(), "{ this is not json");
-        std::env::remove_var("REDISCOPE_HOME");
     }
 
     #[test]
@@ -540,14 +598,13 @@ mod tests {
 
     #[test]
     fn a_missing_file_still_seeds_a_local_profile() {
-        let _guard = env_guard();
+        let mut env = ScopedEnv::new();
         let dir = tempdir();
-        std::env::set_var("REDISCOPE_HOME", &dir);
+        env.set("REDISCOPE_HOME", &dir);
         let (store, notice) = Store::load();
         assert_eq!(store.connections.len(), 1);
         assert_eq!(store.connections[0].name, "local");
         assert!(notice.is_none(), "a first run is not an error");
-        std::env::remove_var("REDISCOPE_HOME");
     }
 
     #[test]
@@ -558,9 +615,9 @@ mod tests {
 
     #[test]
     fn the_selected_theme_survives_a_reload() {
-        let _guard = env_guard();
+        let mut env = ScopedEnv::new();
         let dir = tempdir();
-        std::env::set_var("REDISCOPE_HOME", &dir);
+        env.set("REDISCOPE_HOME", &dir);
         let store = Store {
             theme: Theme::Dracula,
             ..Default::default()
@@ -570,14 +627,13 @@ mod tests {
         let (loaded, notice) = Store::load();
         assert_eq!(loaded.theme, Theme::Dracula);
         assert!(notice.is_none());
-        std::env::remove_var("REDISCOPE_HOME");
     }
 
     #[test]
     fn saving_keeps_the_previous_file_as_a_backup() {
-        let _guard = env_guard();
+        let mut env = ScopedEnv::new();
         let dir = tempdir();
-        std::env::set_var("REDISCOPE_HOME", &dir);
+        env.set("REDISCOPE_HOME", &dir);
         let first = Store {
             theme: Theme::default(),
             connections: vec![Connection {
@@ -605,15 +661,14 @@ mod tests {
             !config_file().with_extension("json.tmp").exists(),
             "no temp file is left behind"
         );
-        std::env::remove_var("REDISCOPE_HOME");
     }
 
     /// Round trip of a v0.2.0 file: every field added since must default.
     #[test]
     fn an_older_file_still_loads_every_profile() {
-        let _guard = env_guard();
+        let mut env = ScopedEnv::new();
         let dir = tempdir();
-        std::env::set_var("REDISCOPE_HOME", &dir);
+        env.set("REDISCOPE_HOME", &dir);
         fs::write(
             config_file(),
             r#"{"connections":[{"name":"local","host":"127.0.0.1","port":6379},
@@ -632,6 +687,5 @@ mod tests {
         );
         assert!(store.connections[1].tls);
         assert!(!store.connections[1].use_keychain);
-        std::env::remove_var("REDISCOPE_HOME");
     }
 }

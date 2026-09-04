@@ -2,8 +2,8 @@
 //! panics on small terminals and modals that mis-index their fields.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use rediscope::app::{App, Msg};
 use rediscope::config::{Connection, Store};
 use rediscope::redis_client::ServerInfo;
@@ -17,12 +17,15 @@ use rediscope::ui;
 fn isolate_config() {
     use std::sync::OnceLock;
     static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-    let dir = HOME.get_or_init(|| {
+    HOME.get_or_init(|| {
         let p = std::env::temp_dir().join(format!("rediscope-render-{}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
+        // SAFETY: OnceLock runs this exactly once, before any test in this
+        // binary has read the variable, and nothing here spawns a thread that
+        // reads the environment.
+        unsafe { std::env::set_var("REDISCOPE_HOME", &p) };
         p
     });
-    std::env::set_var("REDISCOPE_HOME", dir);
 }
 
 fn app() -> App {

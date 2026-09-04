@@ -37,7 +37,7 @@ pub fn pretty(text: &str) -> Option<String> {
             }
             Event::Empty(_) if depth == 0 => roots += 1,
             Event::End(_) => depth = depth.checked_sub(1)?,
-            Event::Text(text) if text.iter().all(u8::is_ascii_whitespace) => continue,
+            Event::Text(text) if text.bytes().all(|b| b.is_ascii_whitespace()) => continue,
             Event::Text(_) | Event::CData(_) if depth == 0 => return None,
             Event::Eof => break,
             _ => {}
