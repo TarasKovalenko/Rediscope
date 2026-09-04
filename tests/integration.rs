@@ -519,7 +519,8 @@ async fn diagnostics_read_the_slow_log_clients_and_config() {
 
 #[tokio::test]
 async fn a_lua_script_sees_the_keys_it_was_given() {
-    let c = client!(7);
+    // db7 belongs to the memory scan, which flushes and counts what it finds.
+    let c = client!(0);
     c.set_string("script:key", "value").await.unwrap();
     let out = c
         .eval(
@@ -535,9 +536,9 @@ async fn a_lua_script_sees_the_keys_it_was_given() {
 
 #[tokio::test]
 async fn a_read_only_profile_refuses_every_write() {
-    let Some(base) = conn(8) else { return };
+    let Some(base) = conn(1) else { return };
     let writable = Client::connect(base.clone()).await.expect("connect");
-    writable.set_string("guarded", "before").await.unwrap();
+    writable.set_string("ro:guarded", "before").await.unwrap();
 
     let guarded = Client::connect(Connection {
         read_only: true,
@@ -550,7 +551,7 @@ async fn a_read_only_profile_refuses_every_write() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let mut app = App::new(Store::default(), tx);
     app.on_msg(Msg::Connected(Box::new(Ok(guarded))));
-    app.current = Some(writable.key_info("guarded").await.unwrap());
+    app.current = Some(writable.key_info("ro:guarded").await.unwrap());
     // Every write key is refused before a modal ever opens.
     for key in ['n', 'D', 'R', 't', 'a', 'e', 'x'] {
         app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
@@ -559,14 +560,14 @@ async fn a_read_only_profile_refuses_every_write() {
     }
 
     match writable
-        .read_value("guarded", KeyType::String)
+        .read_value("ro:guarded", KeyType::String)
         .await
         .unwrap()
     {
         KeyValue::Str(s) => assert_eq!(s, "before", "nothing was written"),
         other => panic!("unexpected value: {other:?}"),
     }
-    writable.delete_key("guarded").await.unwrap();
+    writable.delete_key("ro:guarded").await.unwrap();
 }
 
 #[tokio::test]
