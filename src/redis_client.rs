@@ -23,6 +23,10 @@ pub enum KeyType {
     Set,
     ZSet,
     Stream,
+    /// RedisJSON document (`ReJSON-RL`).
+    Json,
+    /// RedisTimeSeries key (`TSDB-TYPE`).
+    TimeSeries,
     Other,
 }
 
@@ -35,6 +39,8 @@ impl KeyType {
             "set" => Self::Set,
             "zset" => Self::ZSet,
             "stream" => Self::Stream,
+            "ReJSON-RL" => Self::Json,
+            "TSDB-TYPE" => Self::TimeSeries,
             _ => Self::Other,
         }
     }
@@ -47,6 +53,8 @@ impl KeyType {
             Self::Set => "set",
             Self::ZSet => "zset",
             Self::Stream => "stream",
+            Self::Json => "json",
+            Self::TimeSeries => "timeseries",
             Self::Other => "unknown",
         }
     }
@@ -60,6 +68,8 @@ impl KeyType {
             Self::Set => "E",
             Self::ZSet => "Z",
             Self::Stream => "X",
+            Self::Json => "J",
+            Self::TimeSeries => "T",
             Self::Other => "?",
         }
     }
@@ -96,14 +106,110 @@ pub enum KeyValue {
 pub struct Client {
     pub conn: Connection,
     mgr: MultiplexedConnection,
+    /// Kept so a feature needing a connection of its own — pub/sub, which
+    /// cannot share the multiplexed one — can open it.
+    raw: redis::Client,
+    /// The `ssh -L` process this connection rides on, dropped (and killed)
+    /// with the last clone of the client.
+    _tunnel: Option<std::sync::Arc<Tunnel>>,
 }
 
-fn connection_info(conn: &Connection, password: &str) -> Result<ConnectionInfo> {
-    let mut info = (conn.host.as_str(), conn.port).into_connection_info()?;
+/// A local port forwarded to the Redis server by an `ssh -L` child process.
+/// Killed when the last client holding it goes away.
+#[derive(Debug)]
+pub struct Tunnel {
+    child: std::process::Child,
+    pub local_port: u16,
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Ask the OS for a free loopback port. Racy in principle, but the window
+/// between the probe and ssh binding it is small and the failure is loud.
+fn free_local_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("cannot reserve a local port for the SSH tunnel")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Start `ssh -N -L <local>:<host>:<port> <user@jump>` and wait for the
+/// forward to accept connections. Uses the system ssh, so the user's agent,
+/// config and known_hosts all apply.
+fn open_tunnel(conn: &Connection) -> Result<Tunnel> {
+    let local_port = free_local_port()?;
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.arg("-N")
+        .arg("-T")
+        // Fail loudly instead of leaving a tunnel that forwards nowhere.
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        // Never sit waiting for a password prompt behind the alternate screen.
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-p")
+        .arg(conn.ssh_port.to_string())
+        .arg("-L")
+        .arg(format!(
+            "127.0.0.1:{local_port}:{}:{}",
+            conn.host, conn.port
+        ));
+    if !conn.ssh_key_file.trim().is_empty() {
+        cmd.arg("-i")
+            .arg(crate::config::expand_home(&conn.ssh_key_file));
+    }
+    let target = if conn.ssh_user.trim().is_empty() {
+        conn.ssh_host.trim().to_string()
+    } else {
+        format!("{}@{}", conn.ssh_user.trim(), conn.ssh_host.trim())
+    };
+    cmd.arg(target);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
+        .context("cannot run ssh — is the OpenSSH client installed and on PATH?")?;
+    let mut tunnel = Tunnel { child, local_port };
+
+    // Wait for ssh to bind the forward. Ten seconds covers a slow handshake
+    // without hanging the UI on a jump host that will never answer.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], local_port));
+    loop {
+        if let Ok(Some(status)) = tunnel.child.try_wait() {
+            anyhow::bail!("ssh exited before the tunnel was up ({status})");
+        }
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200))
+            .is_ok()
+        {
+            return Ok(tunnel);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for the SSH tunnel to {}", conn.ssh_host);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn connection_info(conn: &Connection, password: &str, via: Option<u16>) -> Result<ConnectionInfo> {
+    let (host, port) = match via {
+        // Through a tunnel the socket is local, but TLS still has to be
+        // validated against the real server name.
+        Some(local) => ("127.0.0.1", local),
+        None => (conn.host.as_str(), conn.port),
+    };
+    let mut info = (host, port).into_connection_info()?;
     if conn.tls {
         info = info.set_addr(ConnectionAddr::TcpTls {
             host: conn.host.clone(),
-            port: conn.port,
+            port,
             insecure: conn.tls_insecure,
             tls_params: None,
         });
@@ -176,7 +282,7 @@ fn ensure_crypto_provider() {
 
 /// Resolve the password and certificates (both hit the filesystem or the OS
 /// keychain) off the async runtime, then build the redis client.
-async fn build_client(conn: &Connection) -> Result<redis::Client> {
+async fn build_client(conn: &Connection, via: Option<u16>) -> Result<redis::Client> {
     if conn.tls {
         ensure_crypto_provider();
     }
@@ -186,7 +292,7 @@ async fn build_client(conn: &Connection) -> Result<redis::Client> {
             Ok((probe.resolve_password()?, load_tls_certificates(&probe)?))
         })
         .await??;
-    let info = connection_info(conn, &password)?;
+    let info = connection_info(conn, &password, via)?;
     Ok(match certs {
         Some(certs) => redis::Client::build_with_tls(info, certs)?,
         None => redis::Client::open(info)?,
@@ -277,6 +383,203 @@ impl ServerInfo {
     }
 }
 
+/// One exported key: enough to write it back anywhere, including its TTL.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExportEntry {
+    pub key: String,
+    /// The Redis type name, for a human reading the file.
+    #[serde(default)]
+    pub kind: String,
+    /// Remaining life in milliseconds; negative means no expiry.
+    #[serde(default)]
+    pub pttl: i64,
+    /// The `DUMP` payload, hex encoded so the file stays text.
+    pub dump: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamGroup {
+    pub name: String,
+    pub consumers: u64,
+    pub pending: u64,
+    pub last_delivered: String,
+    pub lag: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamConsumer {
+    pub name: String,
+    pub pending: u64,
+    pub idle_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingEntry {
+    pub id: String,
+    pub consumer: String,
+    pub idle_ms: i64,
+    pub deliveries: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StreamGroupDetail {
+    pub consumers: Vec<StreamConsumer>,
+    pub pending: Vec<PendingEntry>,
+}
+
+/// One `SLOWLOG` entry.
+#[derive(Clone, Debug)]
+pub struct SlowEntry {
+    pub id: i64,
+    pub at: i64,
+    pub micros: i64,
+    pub command: String,
+    pub client: String,
+}
+
+/// One row of `CLIENT LIST`, reduced to the fields worth a column.
+#[derive(Clone, Debug, Default)]
+pub struct ClientEntry {
+    pub id: String,
+    pub addr: String,
+    pub name: String,
+    pub age_secs: i64,
+    pub idle_secs: i64,
+    pub db: String,
+    pub command: String,
+}
+
+/// Everything the diagnostics tabs need, read in one go so opening the pane is
+/// a single round of requests rather than a request per tab.
+#[derive(Clone, Debug, Default)]
+pub struct Diagnostics {
+    pub slowlog: Vec<SlowEntry>,
+    pub clients: Vec<ClientEntry>,
+    pub config: Vec<(String, String)>,
+    pub latency: Vec<(String, String)>,
+    pub cluster: Vec<(String, String)>,
+    pub modules: Vec<String>,
+}
+
+/// The server's command list: every name, plus the ones it flags as writes.
+#[derive(Clone, Debug, Default)]
+pub struct CommandTable {
+    pub names: Vec<String>,
+    pub writes: std::collections::HashSet<String>,
+}
+
+impl CommandTable {
+    /// Whether a console line would write. Unknown commands are treated as
+    /// writes: on a read-only profile, refusing too much beats letting a write
+    /// through because the server did not list the command.
+    pub fn is_write(&self, line: &str) -> bool {
+        let head = line.split_whitespace().next().unwrap_or("").to_uppercase();
+        if head.is_empty() {
+            return false;
+        }
+        if is_destructive(line) {
+            return true;
+        }
+        if self.names.is_empty() {
+            // No table (an old or restricted server): fall back to the names
+            // that are unambiguously reads.
+            return !READ_ONLY_COMMANDS.contains(&head.as_str());
+        }
+        self.writes.contains(&head) || !self.names.contains(&head)
+    }
+}
+
+/// Enough of the read side to keep the console usable when the server will not
+/// hand over its command table.
+const READ_ONLY_COMMANDS: &[&str] = &[
+    "GET",
+    "MGET",
+    "STRLEN",
+    "GETRANGE",
+    "EXISTS",
+    "TYPE",
+    "TTL",
+    "PTTL",
+    "KEYS",
+    "SCAN",
+    "HGET",
+    "HGETALL",
+    "HKEYS",
+    "HVALS",
+    "HLEN",
+    "HMGET",
+    "HSCAN",
+    "HEXISTS",
+    "HRANDFIELD",
+    "LRANGE",
+    "LLEN",
+    "LINDEX",
+    "LPOS",
+    "SMEMBERS",
+    "SCARD",
+    "SISMEMBER",
+    "SMISMEMBER",
+    "SRANDMEMBER",
+    "SSCAN",
+    "SINTER",
+    "SUNION",
+    "SDIFF",
+    "ZRANGE",
+    "ZREVRANGE",
+    "ZRANGEBYSCORE",
+    "ZRANGEBYLEX",
+    "ZSCORE",
+    "ZCARD",
+    "ZCOUNT",
+    "ZRANK",
+    "ZREVRANK",
+    "ZSCAN",
+    "ZRANDMEMBER",
+    "XRANGE",
+    "XREVRANGE",
+    "XLEN",
+    "XINFO",
+    "XPENDING",
+    "BITCOUNT",
+    "BITPOS",
+    "GETBIT",
+    "PFCOUNT",
+    "DBSIZE",
+    "INFO",
+    "PING",
+    "ECHO",
+    "TIME",
+    "COMMAND",
+    "CONFIG",
+    "CLIENT",
+    "MEMORY",
+    "OBJECT",
+    "LATENCY",
+    "SLOWLOG",
+    "ACL",
+    "CLUSTER",
+    "MODULE",
+    "LASTSAVE",
+    "RANDOMKEY",
+    "DUMP",
+    "SELECT",
+    "HELLO",
+    "AUTH",
+    "JSON.GET",
+    "JSON.TYPE",
+    "JSON.OBJLEN",
+    "TS.RANGE",
+    "TS.INFO",
+    "FT.SEARCH",
+    "FT.INFO",
+    "GEOPOS",
+    "GEODIST",
+    "GEOSEARCH",
+    "SUBSCRIBE",
+    "PSUBSCRIBE",
+    "WAIT",
+];
+
 /// The result of a connection test, shown in the server list.
 #[derive(Clone, Debug)]
 pub struct Probe {
@@ -305,7 +608,18 @@ impl Client {
     }
 
     pub async fn connect(conn: Connection) -> Result<Self> {
-        let client = build_client(&conn).await?;
+        // Opening the tunnel shells out and blocks on a TCP probe; keep both
+        // off the runtime's worker threads.
+        let tunnel = if conn.uses_ssh() {
+            let probe = conn.clone();
+            Some(std::sync::Arc::new(
+                tokio::task::spawn_blocking(move || open_tunnel(&probe)).await??,
+            ))
+        } else {
+            None
+        };
+        let via = tunnel.as_ref().map(|t| t.local_port);
+        let client = build_client(&conn, via).await?;
         let mut mgr = client
             .get_multiplexed_async_connection_with_config(
                 &redis::AsyncConnectionConfig::new()
@@ -314,33 +628,62 @@ impl Client {
             )
             .await?;
         redis::cmd("PING").query_async::<()>(&mut mgr).await?;
-        Ok(Self { conn, mgr })
+        Ok(Self {
+            conn,
+            mgr,
+            raw: client,
+            _tunnel: tunnel,
+        })
     }
 
-    /// Command names for console completion. `COMMAND` works on every server
-    /// version, unlike `COMMAND LIST`, and one reply per connection is cheap.
-    pub async fn command_names(&self) -> Result<Vec<String>> {
+    /// True when the profile refuses writes. Checked before every mutation so
+    /// a read-only server cannot be edited by any route, including the console.
+    pub fn read_only(&self) -> bool {
+        self.conn.read_only
+    }
+
+    /// A connection of its own, for pub/sub. The multiplexed connection cannot
+    /// be put into subscriber mode without breaking every other caller.
+    pub async fn pubsub(&self) -> Result<redis::aio::PubSub> {
+        Ok(self.raw.get_async_pubsub().await?)
+    }
+
+    /// Command names for console completion, and the subset flagged `write`.
+    /// `COMMAND` works on every server version, unlike `COMMAND LIST`, and one
+    /// reply per connection is cheap. The write set is what a read-only
+    /// profile refuses, so it comes from the server rather than a guess.
+    pub async fn command_names(&self) -> Result<CommandTable> {
         let mut c = self.mgr.clone();
         let reply: redis::Value = redis::cmd("COMMAND").query_async(&mut c).await?;
         let redis::Value::Array(items) = reply else {
-            return Ok(Vec::new());
+            return Ok(CommandTable::default());
         };
-        let mut names: Vec<String> = items
-            .iter()
-            .filter_map(|item| match item {
-                // Each entry is [name, arity, flags, ...]; only the name matters.
-                redis::Value::Array(fields) => fields.first(),
-                _ => None,
-            })
-            .filter_map(|name| match name {
-                redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).to_uppercase()),
-                redis::Value::SimpleString(s) => Some(s.to_uppercase()),
-                _ => None,
-            })
-            .collect();
+        let mut names: Vec<String> = Vec::with_capacity(items.len());
+        let mut writes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &items {
+            // Each entry is [name, arity, [flags], ...].
+            let redis::Value::Array(fields) = item else {
+                continue;
+            };
+            let Some(name) = fields.first().map(scalar) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let name = name.to_uppercase();
+            if let Some(redis::Value::Array(flags) | redis::Value::Set(flags)) = fields.get(2)
+                && flags
+                    .iter()
+                    .any(|f| scalar(f).eq_ignore_ascii_case("write"))
+            {
+                writes.insert(name.clone());
+            }
+            names.push(name);
+        }
         names.sort_unstable();
         names.dedup();
-        Ok(names)
+        Ok(CommandTable { names, writes })
     }
 
     /// One `SCAN` batch for the namespace memory report: every key counts
@@ -384,9 +727,19 @@ impl Client {
             // A server with `MEMORY USAGE` disabled still gives a useful key
             // count, so a failed measurement is not a failed report.
             if let Ok(sizes) = pipe.query_async::<Vec<Option<u64>>>(&mut c).await {
-                for (name, size) in sample.iter().zip(sizes) {
+                // `OBJECT FREQ` only answers under an LFU policy; asking for it
+                // is best effort, and its absence just leaves the column empty.
+                let mut freq_pipe = redis::pipe();
+                for name in &sample {
+                    freq_pipe.cmd("OBJECT").arg("FREQ").arg(name);
+                }
+                let freqs = freq_pipe
+                    .query_async::<Vec<Option<u64>>>(&mut c)
+                    .await
+                    .unwrap_or_default();
+                for (i, (name, size)) in sample.iter().zip(sizes).enumerate() {
                     if let Some(bytes) = size {
-                        rollup.measure(name, bytes);
+                        rollup.measure_with_freq(name, bytes, freqs.get(i).copied().flatten());
                     }
                 }
             }
@@ -625,6 +978,47 @@ impl Client {
                     total,
                 }
             }
+            KeyType::Json => {
+                // `JSON.GET key $` always answers with a one-element array;
+                // the bare path gives the document as stored.
+                let doc: Option<String> = redis::cmd("JSON.GET")
+                    .arg(name)
+                    .arg("$")
+                    .query_async(&mut c)
+                    .await?;
+                let doc = doc.unwrap_or_else(|| "null".into());
+                // Unwrap the `$` envelope so the pane shows the document.
+                let text = match serde_json::from_str::<serde_json::Value>(&doc) {
+                    Ok(serde_json::Value::Array(mut items)) if items.len() == 1 => {
+                        serde_json::to_string(&items.remove(0)).unwrap_or(doc)
+                    }
+                    _ => doc,
+                };
+                KeyValue::Str(text)
+            }
+            KeyType::TimeSeries => {
+                let raw: Vec<(u64, f64)> = redis::cmd("TS.RANGE")
+                    .arg(name)
+                    .arg("-")
+                    .arg("+")
+                    .arg("COUNT")
+                    .arg(lim)
+                    .query_async(&mut c)
+                    .await?;
+                let total = raw.len() as u64;
+                let rows = raw
+                    .into_iter()
+                    .map(|(ts, v)| Row {
+                        id: ts.to_string(),
+                        cells: vec![ts.to_string(), format_score(v)],
+                    })
+                    .collect();
+                KeyValue::Rows {
+                    headers: vec!["timestamp", "value"],
+                    rows,
+                    total,
+                }
+            }
             KeyType::Other => KeyValue::Unsupported(
                 "This key's type has no viewer yet. Use the command console (:) to inspect it."
                     .into(),
@@ -689,6 +1083,20 @@ impl Client {
                     .arg("field")
                     .arg("value")
                     .query_async(&mut c)
+                    .await?;
+            }
+            KeyType::Json => {
+                redis::cmd("JSON.SET")
+                    .arg(name)
+                    .arg("$")
+                    .arg("{}")
+                    .query_async::<()>(&mut c)
+                    .await?;
+            }
+            KeyType::TimeSeries => {
+                redis::cmd("TS.CREATE")
+                    .arg(name)
+                    .query_async::<()>(&mut c)
                     .await?;
             }
             KeyType::Other => return Err(anyhow!("unsupported key type")),
@@ -785,6 +1193,518 @@ impl Client {
         Ok(())
     }
 
+    pub async fn json_set(&self, name: &str, path: &str, value: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("JSON.SET")
+            .arg(name)
+            .arg(path)
+            .arg(value)
+            .query_async::<()>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn ts_add(&self, name: &str, timestamp: &str, value: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        let ts = if timestamp.trim().is_empty() {
+            "*"
+        } else {
+            timestamp.trim()
+        };
+        redis::cmd("TS.ADD")
+            .arg(name)
+            .arg(ts)
+            .arg(value.trim())
+            .query_async::<i64>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn ts_del(&self, name: &str, timestamp: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        // TS.DEL takes a range; one sample is the range [ts, ts].
+        redis::cmd("TS.DEL")
+            .arg(name)
+            .arg(timestamp)
+            .arg(timestamp)
+            .query_async::<i64>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    // ---- diagnostics ------------------------------------------------------
+
+    /// Slow log, client list, running config, latency events and cluster state.
+    /// Every part is optional: a managed provider that blocks `CONFIG` or
+    /// `CLIENT LIST` still gets the tabs it is allowed to see.
+    pub async fn diagnostics(&self) -> Result<Diagnostics> {
+        let mut c = self.mgr.clone();
+        let slowlog = match redis::cmd("SLOWLOG")
+            .arg("GET")
+            .arg(128)
+            .query_async::<redis::Value>(&mut c)
+            .await
+        {
+            Ok(v) => parse_slowlog(&v),
+            Err(_) => Vec::new(),
+        };
+        let clients = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async::<String>(&mut c)
+            .await
+            .map(|raw| parse_client_list(&raw))
+            .unwrap_or_default();
+        let config: Vec<(String, String)> = redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("*")
+            .query_async::<Vec<String>>(&mut c)
+            .await
+            .map(|flat| {
+                let mut pairs: Vec<(String, String)> = flat
+                    .chunks(2)
+                    .filter_map(|p| match p {
+                        [k, v] => Some((k.clone(), v.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                pairs
+            })
+            .unwrap_or_default();
+        let latency = self.latency_rows(&mut c).await;
+        let cluster = redis::cmd("CLUSTER")
+            .arg("INFO")
+            .query_async::<String>(&mut c)
+            .await
+            .map(|raw| {
+                raw.lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let modules = redis::cmd("MODULE")
+            .arg("LIST")
+            .query_async::<redis::Value>(&mut c)
+            .await
+            .map(|v| {
+                as_maps(&v)
+                    .into_iter()
+                    .map(|m| {
+                        format!(
+                            "{} v{}",
+                            m.get("name").cloned().unwrap_or_default(),
+                            m.get("ver").cloned().unwrap_or_default()
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Diagnostics {
+            slowlog,
+            clients,
+            config,
+            latency,
+            cluster,
+            modules,
+        })
+    }
+
+    /// `LATENCY LATEST` plus a fresh ping sample, so the tab says something
+    /// useful even on a server with latency monitoring switched off.
+    async fn latency_rows(&self, c: &mut MultiplexedConnection) -> Vec<(String, String)> {
+        let mut rows = Vec::new();
+        let mut best = f64::MAX;
+        let mut worst: f64 = 0.0;
+        let mut total = 0.0;
+        const SAMPLES: usize = 5;
+        for _ in 0..SAMPLES {
+            let start = std::time::Instant::now();
+            if redis::cmd("PING").query_async::<()>(c).await.is_err() {
+                break;
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            best = best.min(ms);
+            worst = worst.max(ms);
+            total += ms;
+        }
+        if best.is_finite() && worst > 0.0 {
+            rows.push((
+                "ping (5 samples)".into(),
+                format!(
+                    "min {best:.2} ms · avg {:.2} ms · max {worst:.2} ms",
+                    total / SAMPLES as f64
+                ),
+            ));
+        }
+        if let Ok(events) = redis::cmd("LATENCY")
+            .arg("LATEST")
+            .query_async::<Vec<(String, i64, i64, i64)>>(c)
+            .await
+        {
+            for (event, at, last_ms, max_ms) in events {
+                rows.push((
+                    event,
+                    format!("last {last_ms} ms · worst {max_ms} ms · at unix {at}"),
+                ));
+            }
+        }
+        if rows.len() == 1 {
+            rows.push((
+                "latency events".into(),
+                "none recorded — set latency-monitor-threshold to collect them".into(),
+            ));
+        }
+        rows
+    }
+
+    /// Change one running config parameter. Not persisted to the config file;
+    /// that is `CONFIG REWRITE`, which stays a console command on purpose.
+    pub async fn config_set(&self, param: &str, value: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("CONFIG")
+            .arg("SET")
+            .arg(param)
+            .arg(value)
+            .query_async::<()>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    /// Disconnect a client by id.
+    pub async fn client_kill(&self, id: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(id)
+            .query_async::<redis::Value>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn slowlog_reset(&self) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("SLOWLOG")
+            .arg("RESET")
+            .query_async::<()>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    // ---- bulk key operations ---------------------------------------------
+
+    /// `UNLINK` every named key in one pipeline per chunk, so a thousand marked
+    /// keys is a handful of round trips rather than a thousand.
+    pub async fn delete_keys(&self, names: &[String]) -> Result<u64> {
+        let mut c = self.mgr.clone();
+        let mut removed = 0u64;
+        for chunk in names.chunks(256) {
+            let mut pipe = redis::pipe();
+            for name in chunk {
+                pipe.cmd("UNLINK").arg(name);
+            }
+            let counts: Vec<i64> = pipe.query_async(&mut c).await?;
+            removed += counts.iter().map(|n| (*n).max(0) as u64).sum::<u64>();
+        }
+        Ok(removed)
+    }
+
+    /// Set (or with `None`, clear) the expiry on many keys at once.
+    pub async fn expire_keys(&self, names: &[String], seconds: Option<i64>) -> Result<u64> {
+        let mut c = self.mgr.clone();
+        let mut changed = 0u64;
+        for chunk in names.chunks(256) {
+            let mut pipe = redis::pipe();
+            for name in chunk {
+                match seconds {
+                    Some(s) if s >= 0 => pipe.cmd("EXPIRE").arg(name).arg(s),
+                    _ => pipe.cmd("PERSIST").arg(name),
+                };
+            }
+            let counts: Vec<i64> = pipe.query_async(&mut c).await?;
+            changed += counts.iter().map(|n| (*n).max(0) as u64).sum::<u64>();
+        }
+        Ok(changed)
+    }
+
+    /// Copy one key's value, type and TTL somewhere else: another name, another
+    /// database, or another server. `DUMP` + `RESTORE` carries every type
+    /// faithfully, which a type-by-type copy would not.
+    pub async fn copy_key(
+        &self,
+        source: &str,
+        target_name: &str,
+        target: &Client,
+        replace: bool,
+    ) -> Result<()> {
+        let mut c = self.mgr.clone();
+        let payload: Option<Vec<u8>> = redis::cmd("DUMP").arg(source).query_async(&mut c).await?;
+        let Some(payload) = payload else {
+            anyhow::bail!("'{source}' no longer exists");
+        };
+        // A negative TTL means "no expiry", which RESTORE spells as 0.
+        let ttl: i64 = redis::cmd("PTTL").arg(source).query_async(&mut c).await?;
+        let mut t = target.mgr.clone();
+        let mut cmd = redis::cmd("RESTORE");
+        cmd.arg(target_name).arg(ttl.max(0)).arg(payload);
+        if replace {
+            cmd.arg("REPLACE");
+        }
+        cmd.query_async::<()>(&mut t)
+            .await
+            .with_context(|| format!("cannot write '{target_name}' on the target server"))?;
+        Ok(())
+    }
+
+    /// Keys whose *value* contains `needle`, searched case-insensitively.
+    /// Walks the keyspace with `SCAN` and reads each value bounded, so it stays
+    /// affordable; returns whether the limit cut the search short.
+    pub async fn grep_values(
+        &self,
+        pattern: &str,
+        needle: &str,
+        limit: usize,
+    ) -> Result<(Vec<KeyInfo>, bool)> {
+        let (candidates, truncated) = self.scan_keys(pattern, limit).await?;
+        let needle = needle.to_lowercase();
+        let mut hits = Vec::new();
+        for key in candidates {
+            let Ok(value) = self.read_value(&key.name, key.kind).await else {
+                continue;
+            };
+            let found = match &value {
+                KeyValue::Str(s) => s.to_lowercase().contains(&needle),
+                KeyValue::Rows { rows, .. } => rows
+                    .iter()
+                    .any(|r| r.cells.iter().any(|c| c.to_lowercase().contains(&needle))),
+                KeyValue::Unsupported(_) => false,
+            };
+            if found {
+                hits.push(key);
+            }
+        }
+        Ok((hits, truncated))
+    }
+
+    // ---- export and import -----------------------------------------------
+
+    /// Serialize keys with `DUMP`, so every type — and the TTL — survives the
+    /// round trip through a file.
+    pub async fn export_keys(&self, names: &[String]) -> Result<Vec<ExportEntry>> {
+        let mut c = self.mgr.clone();
+        let mut out = Vec::with_capacity(names.len());
+        for chunk in names.chunks(128) {
+            let mut pipe = redis::pipe();
+            for name in chunk {
+                pipe.cmd("DUMP").arg(name);
+                pipe.cmd("PTTL").arg(name);
+                pipe.cmd("TYPE").arg(name);
+            }
+            let replies: Vec<redis::Value> = pipe.query_async(&mut c).await?;
+            for (name, triple) in chunk.iter().zip(replies.chunks(3)) {
+                let [dump, pttl, kind] = triple else { continue };
+                let redis::Value::BulkString(bytes) = dump else {
+                    // The key expired between the scan and the dump.
+                    continue;
+                };
+                let pttl = match pttl {
+                    redis::Value::Int(i) => *i,
+                    _ => -1,
+                };
+                out.push(ExportEntry {
+                    key: name.clone(),
+                    kind: format_value(kind, 0).trim().to_string(),
+                    pttl,
+                    dump: hex_encode(bytes),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write exported keys back. `replace` overwrites keys that already exist;
+    /// without it an existing key is an error the caller reports.
+    pub async fn import_entries(&self, entries: &[ExportEntry], replace: bool) -> Result<u64> {
+        let mut c = self.mgr.clone();
+        let mut written = 0u64;
+        for entry in entries {
+            let payload = hex_decode(&entry.dump)
+                .with_context(|| format!("'{}' has a corrupt payload", entry.key))?;
+            let mut cmd = redis::cmd("RESTORE");
+            cmd.arg(&entry.key).arg(entry.pttl.max(0)).arg(payload);
+            if replace {
+                cmd.arg("REPLACE");
+            }
+            cmd.query_async::<()>(&mut c)
+                .await
+                .with_context(|| format!("cannot restore '{}'", entry.key))?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Indexes this server knows about, when the search module is loaded.
+    pub async fn search_indexes(&self) -> Result<Vec<String>> {
+        let mut c = self.mgr.clone();
+        let reply: redis::Value = redis::cmd("FT._LIST").query_async(&mut c).await?;
+        Ok(match reply {
+            redis::Value::Array(items) | redis::Value::Set(items) => {
+                items.iter().map(scalar).collect()
+            }
+            _ => Vec::new(),
+        })
+    }
+
+    /// Run a RediSearch query and render the reply for the results pane.
+    pub async fn search(&self, index: &str, query: &str, limit: usize) -> Result<String> {
+        let mut c = self.mgr.clone();
+        let value: redis::Value = redis::cmd("FT.SEARCH")
+            .arg(index)
+            .arg(query)
+            .arg("LIMIT")
+            .arg(0)
+            .arg(limit)
+            .query_async(&mut c)
+            .await?;
+        Ok(format_value(&value, 0))
+    }
+
+    // ---- scripting --------------------------------------------------------
+
+    /// Run a Lua script. `keys` become KEYS[1..], `args` become ARGV[1..].
+    pub async fn eval(&self, script: &str, keys: &[String], args: &[String]) -> Result<String> {
+        let mut c = self.mgr.clone();
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(script).arg(keys.len());
+        for k in keys {
+            cmd.arg(k);
+        }
+        for a in args {
+            cmd.arg(a);
+        }
+        let value: redis::Value = cmd.query_async(&mut c).await?;
+        Ok(format_value(&value, 0))
+    }
+
+    // ---- streams ----------------------------------------------------------
+
+    /// Consumer groups on a stream, with their pending counts.
+    pub async fn stream_groups(&self, key: &str) -> Result<Vec<StreamGroup>> {
+        let mut c = self.mgr.clone();
+        let reply: redis::Value = redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg(key)
+            .query_async(&mut c)
+            .await?;
+        Ok(as_maps(&reply)
+            .into_iter()
+            .map(|m| StreamGroup {
+                name: m.get("name").cloned().unwrap_or_default(),
+                consumers: m.get("consumers").and_then(|v| v.parse().ok()).unwrap_or(0),
+                pending: m.get("pending").and_then(|v| v.parse().ok()).unwrap_or(0),
+                last_delivered: m.get("last-delivered-id").cloned().unwrap_or_default(),
+                lag: m.get("lag").cloned().unwrap_or_else(|| "-".into()),
+            })
+            .collect())
+    }
+
+    /// Consumers of one group, and the entries that group has not acked.
+    pub async fn stream_group_detail(&self, key: &str, group: &str) -> Result<StreamGroupDetail> {
+        let mut c = self.mgr.clone();
+        let consumers: redis::Value = redis::cmd("XINFO")
+            .arg("CONSUMERS")
+            .arg(key)
+            .arg(group)
+            .query_async(&mut c)
+            .await?;
+        let consumers = as_maps(&consumers)
+            .into_iter()
+            .map(|m| StreamConsumer {
+                name: m.get("name").cloned().unwrap_or_default(),
+                pending: m.get("pending").and_then(|v| v.parse().ok()).unwrap_or(0),
+                idle_ms: m.get("idle").and_then(|v| v.parse().ok()).unwrap_or(0),
+            })
+            .collect();
+        // `XPENDING key group - + n` lists the entries themselves, which is
+        // what makes a stuck consumer visible.
+        let raw: Vec<(String, String, i64, i64)> = redis::cmd("XPENDING")
+            .arg(key)
+            .arg(group)
+            .arg("-")
+            .arg("+")
+            .arg(VALUE_LIMIT)
+            .query_async(&mut c)
+            .await
+            .unwrap_or_default();
+        let pending = raw
+            .into_iter()
+            .map(|(id, consumer, idle_ms, deliveries)| PendingEntry {
+                id,
+                consumer,
+                idle_ms,
+                deliveries,
+            })
+            .collect();
+        Ok(StreamGroupDetail { consumers, pending })
+    }
+
+    pub async fn stream_group_create(&self, key: &str, group: &str, start: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(key)
+            .arg(group)
+            .arg(if start.trim().is_empty() { "$" } else { start })
+            .arg("MKSTREAM")
+            .query_async::<()>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn stream_group_destroy(&self, key: &str, group: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("XGROUP")
+            .arg("DESTROY")
+            .arg(key)
+            .arg(group)
+            .query_async::<i64>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn stream_ack(&self, key: &str, group: &str, id: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("XACK")
+            .arg(key)
+            .arg(group)
+            .arg(id)
+            .query_async::<i64>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    /// Hand a pending entry to another consumer, so work stuck behind a dead
+    /// worker can be picked up again.
+    pub async fn stream_claim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        id: &str,
+    ) -> Result<()> {
+        let mut c = self.mgr.clone();
+        redis::cmd("XCLAIM")
+            .arg(key)
+            .arg(group)
+            .arg(consumer)
+            .arg(0)
+            .arg(id)
+            .query_async::<redis::Value>(&mut c)
+            .await?;
+        Ok(())
+    }
+
     // ---- raw console -----------------------------------------------------
 
     pub async fn execute_raw(&self, line: &str) -> Result<String> {
@@ -800,6 +1720,134 @@ impl Client {
         let value: redis::Value = cmd.query_async(&mut c).await?;
         Ok(format_value(&value, 0))
     }
+}
+
+/// Flatten a RESP reply that is a list of maps (`XINFO`, `MODULE LIST`) into
+/// string pairs. Redis answers with a map in RESP3 and a flat array in RESP2,
+/// so both shapes are accepted.
+fn as_maps(v: &redis::Value) -> Vec<std::collections::HashMap<String, String>> {
+    let flat = |item: &redis::Value| -> std::collections::HashMap<String, String> {
+        match item {
+            redis::Value::Map(pairs) => pairs
+                .iter()
+                .map(|(k, val)| (scalar(k), scalar(val)))
+                .collect(),
+            redis::Value::Array(fields) => fields
+                .chunks(2)
+                .filter_map(|p| match p {
+                    [k, val] => Some((scalar(k), scalar(val))),
+                    _ => None,
+                })
+                .collect(),
+            _ => Default::default(),
+        }
+    };
+    match v {
+        redis::Value::Array(items) | redis::Value::Set(items) => items.iter().map(flat).collect(),
+        other => vec![flat(other)],
+    }
+}
+
+/// One RESP value as plain text, without the console's list formatting.
+fn scalar(v: &redis::Value) -> String {
+    match v {
+        redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+        redis::Value::SimpleString(s) => s.clone(),
+        redis::Value::Int(i) => i.to_string(),
+        redis::Value::Double(d) => d.to_string(),
+        redis::Value::Nil => String::new(),
+        other => format_value(other, 0).trim().to_string(),
+    }
+}
+
+/// `SLOWLOG GET` answers with `[id, unix time, microseconds, [argv], client
+/// addr, client name]`.
+fn parse_slowlog(v: &redis::Value) -> Vec<SlowEntry> {
+    let items = match v {
+        redis::Value::Array(items) | redis::Value::Set(items) => items,
+        _ => return Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|entry| {
+            let redis::Value::Array(f) = entry else {
+                return None;
+            };
+            let int = |i: usize| match f.get(i) {
+                Some(redis::Value::Int(n)) => *n,
+                _ => 0,
+            };
+            let command = match f.get(3) {
+                Some(redis::Value::Array(argv)) => {
+                    argv.iter().map(scalar).collect::<Vec<_>>().join(" ")
+                }
+                _ => String::new(),
+            };
+            let client = match (f.get(4), f.get(5)) {
+                (Some(addr), Some(name)) => {
+                    let name = scalar(name);
+                    if name.is_empty() {
+                        scalar(addr)
+                    } else {
+                        format!("{} ({name})", scalar(addr))
+                    }
+                }
+                (Some(addr), None) => scalar(addr),
+                _ => String::new(),
+            };
+            Some(SlowEntry {
+                id: int(0),
+                at: int(1),
+                micros: int(2),
+                command,
+                client,
+            })
+        })
+        .collect()
+}
+
+/// `CLIENT LIST` is one line per client of `field=value` pairs.
+fn parse_client_list(raw: &str) -> Vec<ClientEntry> {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let mut entry = ClientEntry::default();
+            for (k, v) in line.split_whitespace().filter_map(|p| p.split_once('=')) {
+                match k {
+                    "id" => entry.id = v.to_string(),
+                    "addr" => entry.addr = v.to_string(),
+                    "name" => entry.name = v.to_string(),
+                    "age" => entry.age_secs = v.parse().unwrap_or(0),
+                    "idle" => entry.idle_secs = v.parse().unwrap_or(0),
+                    "db" => entry.db = v.to_string(),
+                    "cmd" => entry.command = v.to_string(),
+                    _ => {}
+                }
+            }
+            entry
+        })
+        .collect()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return Err(anyhow!("odd number of hex digits"));
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let s = std::str::from_utf8(pair)?;
+            Ok(u8::from_str_radix(s, 16)?)
+        })
+        .collect()
 }
 
 /// Pull one `key:value` line out of an `INFO` reply.

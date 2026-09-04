@@ -103,6 +103,14 @@ rediscope
 - **Live TTLs.** Expiries count down in place, and a key leaves the tree the
   second it expires, so nothing stale sits in the view between scans.
 - **Search.** `/` filters by glob against the server, not just what's on screen.
+- **Search inside values.** `F` reads the values of the keys on screen and
+  keeps the ones containing your text, case-insensitively, across every type —
+  for when you know what is in the value but not what the key is called.
+- **Marks and bulk actions.** `m` marks a key, or every key under a folder.
+  `D` then deletes the marked set (pipelined `UNLINK`, not one round trip per
+  key) and `t` sets or clears their TTLs together. `u` clears the marks.
+- **Session memory.** Each profile remembers its database, search pattern, open
+  folders and selected key, and reopens where you left it.
 
 ### Editing
 
@@ -120,17 +128,34 @@ rediscope
   with a `json` badge. The editor opens it pretty-printed, `Ctrl+F` reformats,
   and `Ctrl+S` refuses to save a document that no longer parses. Key order is
   preserved, and a value stored on one line is written back minified.
+- **Copy a key** (`C`). Anywhere: another name, another database, or another
+  saved server. `DUMP` + `RESTORE` carries the type and the remaining TTL, so a
+  sorted set arrives as a sorted set.
+- **Export and import** (`w` / `I`). Write the marked keys — or everything on
+  screen — to a JSON file of `DUMP` payloads, and restore them here or on
+  another server, optionally overwriting what is already there.
+- **RedisJSON and RedisTimeSeries.** A `ReJSON-RL` document opens in the JSON
+  editor and saves through `JSON.SET`; a time series lists its samples, and `a`
+  appends one.
+- **Lua** (`L`). An editor, `ctrl+s` to `EVAL`. The marked keys arrive as
+  `KEYS[1..]`, so a script says what it touches.
 - **JSON and XML inside collections.** Structured elements of a hash, list, set,
   sorted set or stream get a formatted preview below the collection. `PgUp` /
   `PgDn` scrolls that preview while the arrow keys keep moving between elements.
 
 ### Diagnosing
 
-- **Server info** (`i`). `INFO` in five tabs: Server (version, uptime, clients
+- **Server info** (`i`). Ten tabs. The first four read `INFO`: Server (version, uptime, clients
   and key count up top), Memory (a used / `maxmemory` bar), Stats, Key
   Statistics (per-db key and TTL counts, a hit-rate bar, expirations and
-  evictions) and the full raw reply. `/` filters the open section, `y` copies
-  it, `r` re-reads.
+  evictions). The rest come from a single diagnostics fetch alongside it:
+  **Slowlog** (slowest first, `x` resets it), **Clients** (`CLIENT LIST` sorted
+  by idle time, `x` disconnects the selected one), **Config** (every running
+  parameter, `e` edits one through `CONFIG SET`), **Latency** (a live ping
+  sample plus `LATENCY LATEST`), **Cluster** (`CLUSTER INFO` and the loaded
+  modules), and the full raw reply. `/` filters the open section, `y` copies
+  it, `r` re-reads. Anything a managed provider refuses simply says so in its
+  tab.
 - **Namespace memory** (`M`). Which key prefix is holding the RAM. A background
   `SCAN` counts every key and measures an evenly spaced sample with
   `MEMORY USAGE`, so a multi-million-key server answers in seconds instead of
@@ -138,7 +163,20 @@ rediscope
   size with a share bar, `1` `2` `3` regroup by one, two or three name segments
   without rescanning, and the header always says how much of the keyspace the
   estimate is based on. Past 5,000 distinct prefixes the tail is pooled into
-  `(other prefixes)` so a `user:<id>` scheme cannot explode the table.
+  `(other prefixes)` so a `user:<id>` scheme cannot explode the table. `t`
+  switches the same scan to the biggest individual keys it measured, with the
+  `OBJECT FREQ` counter beside each one where the server keeps one.
+- **Pub/Sub** (`P`). Subscribe to channel patterns and watch messages arrive,
+  `w` publishes one, `f` follows the tail, `y` copies the feed.
+- **Keyspace events** (`N`). The same feed pointed at
+  `__keyevent@<db>__:*`, so you can watch keys being written, expired and
+  evicted live. Needs `notify-keyspace-events` set on the server.
+- **Consumer groups** (`S`, on a stream). Every group with its pending count
+  and lag, the consumers behind it, and the entries none of them have acked.
+  `n` creates a group, `d` destroys one, `a` acks an entry and `c` claims one
+  for another consumer — enough to unstick a queue whose worker died.
+- **Search** (`Q`). Pick a RediSearch index and run a query; the reply opens in
+  a scrollable pane.
 - **Raw command console** (`:`). Anything `redis-cli` takes, with history that
   survives a restart (500 commands), `Ctrl+R` reverse search, and `Tab`
   completion of command names and of keys already on screen. `FLUSHALL`,
@@ -160,6 +198,14 @@ rediscope
   profile can keep its secret in the OS keychain (macOS Keychain, Windows
   Credential Manager, freedesktop Secret Service) so the file holds no secret at
   all.
+- **Read-only profiles.** A profile marked read-only refuses every write —
+  edits, deletes, TTLs, bulk actions, imports, and the writing commands in the
+  console, which are identified from the server's own command table rather than
+  a guess. The title bar says `READ-ONLY` while such a session is open.
+- **SSH tunnels.** Give a profile a jump host and rediscope runs
+  `ssh -N -L …` for the life of the connection, then connects through the local
+  port. It uses your system ssh, so your agent, `~/.ssh/config` and
+  `known_hosts` all apply; the tunnel dies with the connection.
 - **Database switching.** `Ctrl+D` picks another index and reconnects.
 - **ACL usernames.** Redis 6+ `user` / `password` pairs, per profile or via
   `-u`.
@@ -206,6 +252,11 @@ Press `?` in the app for this list at any time.
 | `n` `D` `R` | New key · delete key · rename key |
 | `t` | Set or clear TTL |
 | `y` | Copy the selected key name to the clipboard |
+| `m` / `u` | Mark the key or folder · clear every mark |
+| `F` | Find keys whose value contains some text |
+| `C` | Copy the key to another name, database or server |
+| `w` / `I` | Export the marked keys to a file · import a file back |
+| `L` | Run a Lua script (marked keys become `KEYS[1..]`) |
 | `r` | Refresh keys and the open value |
 | `e` | Edit. A string opens the editor, a row opens a form |
 | `a` | Add an element to a hash / list / set / zset / stream |
@@ -213,6 +264,9 @@ Press `?` in the app for this list at any time.
 | `PgUp` `PgDn` | Scroll the selected JSON or XML preview |
 | `i` | Server info |
 | `M` | Namespace memory report |
+| `P` / `N` | Pub/sub feed · keyspace event feed |
+| `S` | Consumer groups of the selected stream |
+| `Q` | Run a RediSearch query |
 | `p` | Colour theme picker |
 | `:` | Raw command console |
 | `Ctrl+D` | Switch database (reconnects) |
@@ -222,21 +276,41 @@ Press `?` in the app for this list at any time.
 ### Server info (`i`)
 | Key | Action |
 |---|---|
-| `Tab` `←` `→` `h` `l` / `1`-`5` | Change section |
+| `Tab` `←` `→` `h` `l` / `1`-`9` `0` | Change section |
 | `↑` `↓` `j` `k` `PgUp` `PgDn` `g` `G` | Scroll |
 | `/` | Filter the open section |
+| `e` | Edit the selected parameter (Config tab) |
+| `x` | Disconnect the selected client, or reset the slow log |
 | `y` | Copy the open tab |
-| `r` | Re-read `INFO` |
+| `r` | Re-read everything |
 | `Esc` / `q` | Clear the filter, then close |
 
 ### Namespace memory (`M`)
 | Key | Action |
 |---|---|
 | `1` `2` `3` | Group by one, two or three name segments |
+| `t` | Switch between prefixes and the biggest individual keys |
 | `↑` `↓` `j` `k` / `g` | Scroll · back to the top |
 | `r` | Rescan |
 | `y` | Copy the report |
 | `Esc` / `q` | Cancel the scan and close |
+
+### Pub/Sub and keyspace events (`P` / `N`)
+| Key | Action |
+|---|---|
+| `s` | Change what the feed is subscribed to |
+| `w` | Publish a message |
+| `f` | Follow the newest message · `↑` `↓` `PgUp` `PgDn` scroll back |
+| `c` / `y` | Clear the feed · copy it |
+| `Esc` / `q` | Stop the subscription and close |
+
+### Consumer groups (`S`)
+| Key | Action |
+|---|---|
+| `↑` `↓` `j` `k` | Move · `Tab` switches between groups and pending entries |
+| `n` / `d` | Create a group · destroy the selected one |
+| `a` / `c` | Ack the selected pending entry · claim it for another consumer |
+| `r` | Refresh · `Esc` closes |
 
 ### Console (`:`)
 | Key | Action |
@@ -286,10 +360,38 @@ rediscope -H cache.internal --tls-cert ~/certs/client.crt --tls-key ~/certs/clie
 | `--tls-cert FILE` | PEM client certificate (needs `--tls-key`) |
 | `--tls-key FILE` | PEM client key (needs `--tls-cert`) |
 | `--tls-insecure` | Accept any server certificate. Dev servers only |
+| `--profile NAME` | Open a saved profile directly, by name |
+| `--read-only` | Refuse every write for this session |
+| `--ssh HOST` | Reach the server through `ssh -L` on this jump host |
+| `--ssh-user`, `--ssh-port`, `--ssh-key` | Details for `--ssh` |
 | `--config-path` | Print the connections file path and exit |
 | `-V`, `--version` | Version |
 
 Naming any certificate implies `--tls`, so you rarely need the flag itself.
+
+### Scripting
+
+The same binary answers without opening the TUI, so it can be used from a
+script or a CI job. Every subcommand takes the connection flags above, or
+`--profile` to reuse a saved one:
+
+```sh
+rediscope --profile prod keys --pattern 'session:*' --json
+rediscope --profile prod info --json | jq .Memory.used_memory
+rediscope --profile prod mem-report --depth 2 --json
+rediscope --profile prod export --pattern 'user:*' --out users.json
+rediscope -H localhost import --file users.json --replace
+```
+
+| Subcommand | What it prints |
+|---|---|
+| `keys` | One line per key: type, TTL and name. `--json` for objects |
+| `info` | The raw `INFO` reply, or `--json` for sections as objects |
+| `mem-report` | The namespace estimate, including the biggest keys under `--json` |
+| `export` | `DUMP` payloads and TTLs as JSON, to `--out` or stdout |
+| `import` | Restores such a file; `--replace` overwrites existing keys |
+
+A read-only profile refuses `import`, the same as it does in the UI.
 
 | Environment variable | Meaning |
 |---|---|
@@ -299,9 +401,10 @@ Naming any certificate implies `--tls`, so you rarely need the flag itself.
 ## Connections and secrets
 
 A connection profile holds the server address, database index, optional ACL
-username, TLS settings, and how to find its password. The editor is one form
-with `Server`, `Authentication` and `TLS` sections; `Tab` moves between fields,
-`Space` toggles a switch, and the form scrolls when the terminal is short.
+username, TLS settings, a read-only switch, an optional SSH jump host, and how
+to find its password. The editor is one form with `Server`, `Authentication`,
+`TLS` and `SSH tunnel` sections; `Tab` moves between fields, `Space` toggles a
+switch, and the form scrolls when the terminal is short.
 
 Passwords resolve in one of three ways:
 
@@ -329,7 +432,9 @@ on macOS, `%APPDATA%\rediscope` on Windows. Override the directory with
 rediscope --config-path
 ```
 
-The same file keeps your theme, so the colours come back on the next run.
+The same file keeps your theme, so the colours come back on the next run, and
+one entry per profile recording where you left it — database, search pattern,
+open folders and selected key.
 
 The file is written atomically: a scratch file renamed over the old one, with
 the previous version kept as `connections.json.bak`, so an interrupted save
@@ -358,6 +463,23 @@ on purpose; the header carries the real total.
 **The memory report says it sampled a small share.** That's the honest basis for
 the estimate on a big keyspace, not an error. Let it run longer, or read the
 numbers as the ranking they are.
+
+**Writes are refused with "this connection is read-only".** The profile has its
+read-only switch on (the title bar says `READ-ONLY`). Turn it off in the profile
+editor, or connect without `--read-only`.
+
+**The SSH tunnel times out.** rediscope runs the system `ssh` in batch mode, so
+it never waits at a password prompt. Check that `ssh <host>` works on its own,
+with a key your agent already holds.
+
+**The keyspace feed stays empty.** Redis publishes those events only when
+`notify-keyspace-events` is configured — `CONFIG SET notify-keyspace-events KEA`
+turns everything on for a test.
+
+**Keys on a cluster come back as `MOVED` errors.** rediscope talks to the node
+you point it at; it does not follow slot redirects yet. Point it at the node
+that owns the keys, or use the Cluster tab of the info pane (`i`) to see the
+topology.
 
 **The keychain switch refuses to turn on.** No Secret Service is running, which
 is normal on a headless Linux box. Use `${SOME_ENV_VAR}` for that profile.

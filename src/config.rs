@@ -15,6 +15,10 @@ fn default_port() -> u16 {
     6379
 }
 
+fn default_ssh_port() -> u16 {
+    22
+}
+
 /// A single saved server profile.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
@@ -50,6 +54,23 @@ pub struct Connection {
     /// dangerous anywhere else.
     #[serde(default)]
     pub tls_insecure: bool,
+
+    /// Refuse every write from this profile: edits, deletes, and the console
+    /// commands that change data. Set it on production servers.
+    #[serde(default)]
+    pub read_only: bool,
+
+    /// Reach the server through `ssh -L`, e.g. a bastion in front of a managed
+    /// cache. Empty means a direct connection.
+    #[serde(default)]
+    pub ssh_host: String,
+    #[serde(default)]
+    pub ssh_user: String,
+    #[serde(default = "default_ssh_port")]
+    pub ssh_port: u16,
+    /// Private key passed to ssh as `-i`. Empty leaves the choice to ssh.
+    #[serde(default)]
+    pub ssh_key_file: String,
 }
 
 impl Default for Connection {
@@ -67,11 +88,21 @@ impl Default for Connection {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_insecure: false,
+            read_only: false,
+            ssh_host: String::new(),
+            ssh_user: String::new(),
+            ssh_port: default_ssh_port(),
+            ssh_key_file: String::new(),
         }
     }
 }
 
 impl Connection {
+    /// True when this profile reaches the server through an SSH tunnel.
+    pub fn uses_ssh(&self) -> bool {
+        !self.ssh_host.trim().is_empty()
+    }
+
     /// The password to authenticate with: the keychain entry when this profile
     /// opts in, otherwise the stored value with `${VAR}` placeholders expanded.
     ///
@@ -150,6 +181,21 @@ pub fn config_file() -> PathBuf {
     config_dir().join("connections.json")
 }
 
+/// Where a profile was left last time: the database, the search pattern, the
+/// folders that were open and the key that was selected. Restored on connect
+/// so reopening a server lands where you were rather than at the root.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Session {
+    #[serde(default)]
+    pub db: i64,
+    #[serde(default)]
+    pub pattern: String,
+    #[serde(default)]
+    pub expanded: Vec<String>,
+    #[serde(default)]
+    pub selected_key: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Store {
     /// The UI colour theme. Missing in older files, so those keep the classic
@@ -158,6 +204,9 @@ pub struct Store {
     pub theme: Theme,
     #[serde(default)]
     pub connections: Vec<Connection>,
+    /// Per-profile view state, keyed by profile name.
+    #[serde(default)]
+    pub sessions: std::collections::HashMap<String, Session>,
     /// Set when the file exists but could not be read. Saving is refused while
     /// it is set, so a bad read can never overwrite good profiles with an
     /// empty list.
@@ -185,6 +234,7 @@ impl Store {
                             name: "local".into(),
                             ..Default::default()
                         }],
+                        sessions: Default::default(),
                         read_error: None,
                     },
                     None,
@@ -196,6 +246,7 @@ impl Store {
                     Self {
                         theme: Theme::default(),
                         connections: Vec::new(),
+                        sessions: Default::default(),
                         read_error: Some(notice.clone()),
                     },
                     Some(format!("{notice} — saving is disabled so nothing is lost")),
@@ -220,6 +271,7 @@ impl Store {
                         Self {
                             theme: Theme::default(),
                             connections: Vec::new(),
+                            sessions: Default::default(),
                             read_error: Some(notice.clone()),
                         },
                         Some(format!(
@@ -257,6 +309,7 @@ impl Store {
                     }
                 })
                 .collect(),
+            sessions: self.sessions.clone(),
             read_error: None,
         };
         let text = serde_json::to_string_pretty(&sanitized)?;
@@ -595,6 +648,7 @@ mod tests {
         let store = Store {
             theme: Theme::default(),
             connections: Vec::new(),
+            sessions: Default::default(),
             read_error: Some("permission denied".into()),
         };
         let err = store.save().unwrap_err().to_string();
@@ -645,6 +699,7 @@ mod tests {
                 name: "prod".into(),
                 ..Default::default()
             }],
+            sessions: Default::default(),
             read_error: None,
         };
         first.save().unwrap();
@@ -654,6 +709,7 @@ mod tests {
                 name: "staging".into(),
                 ..Default::default()
             }],
+            sessions: Default::default(),
             read_error: None,
         };
         second.save().unwrap();

@@ -16,10 +16,14 @@ use crate::input::{Completion, InputBuf, ReverseSearch, complete};
 use crate::json::{self, JsonMode};
 use crate::memory::{PrefixRow, Rollup};
 use crate::redis_client::{
-    Client, KEY_LIMIT, KeyInfo, KeyType, KeyValue, ServerInfo, is_destructive,
+    Client, CommandTable, Diagnostics, ExportEntry, KEY_LIMIT, KeyInfo, KeyType, KeyValue,
+    ServerInfo, StreamGroup, StreamGroupDetail, is_destructive,
 };
 use crate::theme::Theme;
 use crate::tree::{Tree, VisibleRow};
+
+/// The "copy to" target that means the connection already open.
+pub const THIS_CONNECTION: &str = "(this connection)";
 
 pub const NEW_KEY_TYPES: [KeyType; 6] = [
     KeyType::String,
@@ -46,8 +50,28 @@ pub enum Msg {
     /// A write finished; `Ok` carries the status line to show.
     Mutated(Result<String, String>),
     Console(String),
-    /// The server's command names, for console completion.
-    Commands(Vec<String>),
+    /// The server's command names, for console completion, and which of them
+    /// write — a read-only profile refuses those.
+    Commands(Box<CommandTable>),
+    /// A value search finished: the keys whose contents matched.
+    Found {
+        keys: Vec<KeyInfo>,
+        truncated: bool,
+        needle: String,
+    },
+    /// One message from the pub/sub feed.
+    PubSub {
+        channel: String,
+        payload: String,
+    },
+    /// Consumer groups of the open stream.
+    Groups(Box<Result<Vec<StreamGroup>, String>>),
+    /// Consumers and pending entries of the selected group.
+    GroupDetail(Box<Result<StreamGroupDetail, String>>),
+    /// A Lua script finished; the text is its reply.
+    Script(Result<String, String>),
+    /// The RediSearch indexes this server has.
+    Indexes(Vec<String>),
     /// A batch of the namespace memory scan; `done` on the last one.
     Memory {
         rollup: Box<Rollup>,
@@ -55,8 +79,9 @@ pub enum Msg {
     },
     /// A connection test finished: profile name, then the result.
     Probe(String, Box<Result<crate::redis_client::Probe, String>>),
-    /// An `INFO` read finished, for the server-info modal.
-    Info(Box<Result<ServerInfo, String>>),
+    /// An `INFO` read finished, for the server-info modal, together with the
+    /// diagnostics its other tabs show.
+    Info(Box<Result<(ServerInfo, Diagnostics), String>>),
     Status(String),
     Error(String),
     Noop,
@@ -77,27 +102,101 @@ pub enum Focus {
 /// What a modal does when submitted.
 #[derive(Clone, Debug)]
 pub enum Action {
-    SaveConnection { replacing: Option<String> },
+    SaveConnection {
+        replacing: Option<String>,
+    },
     DeleteConnection(String),
     NewKey,
     DeleteKey(String),
     RenameKey(String),
     SetTtl(String),
     EditString(String),
-    HashSet { key: String, field: Option<String> },
-    HashDel { key: String, field: String },
+    EditJson(String),
+    TsAdd(String),
+    TsDel {
+        key: String,
+        timestamp: String,
+    },
+    HashSet {
+        key: String,
+        field: Option<String>,
+    },
+    HashDel {
+        key: String,
+        field: String,
+    },
     ListAdd(String),
-    ListSet { key: String, index: isize },
-    ListDel { key: String, index: isize },
+    ListSet {
+        key: String,
+        index: isize,
+    },
+    ListDel {
+        key: String,
+        index: isize,
+    },
     SetAdd(String),
-    SetReplace { key: String, old: String },
-    SetDel { key: String, member: String },
-    ZsetSet { key: String, old: Option<String> },
-    ZsetDel { key: String, member: String },
+    SetReplace {
+        key: String,
+        old: String,
+    },
+    SetDel {
+        key: String,
+        member: String,
+    },
+    ZsetSet {
+        key: String,
+        old: Option<String>,
+    },
+    ZsetDel {
+        key: String,
+        member: String,
+    },
     StreamAdd(String),
-    StreamDel { key: String, id: String },
+    StreamDel {
+        key: String,
+        id: String,
+    },
     SelectDb,
     RunCommand(String),
+    /// Subscribe the pub/sub feed to the typed patterns.
+    Subscribe,
+    /// Publish a message from the pub/sub feed.
+    Publish,
+    /// Delete every marked key.
+    DeleteMarked(Vec<String>),
+    /// Set or clear the TTL on every marked key.
+    TtlMarked(Vec<String>),
+    /// Copy one key elsewhere: another name, database or server.
+    CopyKey(String),
+    /// Search key values for a substring.
+    GrepValues,
+    /// Write keys to a file, and read them back.
+    Export(Vec<String>),
+    Import,
+    /// Run the Lua script in the editor.
+    RunLua,
+    /// Run a RediSearch query.
+    Search,
+    /// `CONFIG SET` the parameter the info modal has selected.
+    SetConfig(String),
+    /// Disconnect a client by id.
+    KillClient(String),
+    ResetSlowlog,
+    CreateGroup(String),
+    DestroyGroup {
+        key: String,
+        group: String,
+    },
+    AckPending {
+        key: String,
+        group: String,
+        id: String,
+    },
+    ClaimPending {
+        key: String,
+        group: String,
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -167,8 +266,25 @@ impl Field {
     }
 }
 
-/// Tabs of the server-info modal, in display order.
-pub const INFO_TABS: [&str; 5] = ["Server", "Memory", "Stats", "Key Statistics", "All"];
+/// Tabs of the server-info modal, in display order. The first four read
+/// `INFO`; the rest come from the diagnostics fetched alongside it.
+pub const INFO_TABS: [&str; 10] = [
+    "Server",
+    "Memory",
+    "Stats",
+    "Key Statistics",
+    "Slowlog",
+    "Clients",
+    "Config",
+    "Latency",
+    "Cluster",
+    "All",
+];
+
+/// Tabs whose rows can be acted on, so the modal knows when to show a cursor.
+pub fn tab_is_actionable(tab: usize) -> bool {
+    matches!(INFO_TABS.get(tab), Some(&"Config") | Some(&"Clients"))
+}
 
 /// One rendered line of the server-info modal.
 #[derive(Clone, Debug, PartialEq)]
@@ -199,8 +315,12 @@ impl InfoRow {
 
 pub struct InfoState {
     pub info: ServerInfo,
+    /// Slow log, clients, config, latency and cluster state.
+    pub diag: Diagnostics,
     pub tab: usize,
     pub scroll: u16,
+    /// Selected row on the tabs that can be acted on (Config, Clients).
+    pub cursor: usize,
     /// Live text of the field filter, while it has focus.
     pub filter: Option<InputBuf>,
     /// The applied filter. Empty means "show everything".
@@ -208,13 +328,53 @@ pub struct InfoState {
 }
 
 impl InfoState {
-    pub fn new(info: ServerInfo) -> Self {
+    pub fn new(info: ServerInfo, diag: Diagnostics) -> Self {
         Self {
             info,
+            diag,
             tab: 0,
             scroll: 0,
+            cursor: 0,
             filter: None,
             query: String::new(),
+        }
+    }
+
+    /// The `param = value` pair under the cursor on the Config tab.
+    pub fn selected_config(&self) -> Option<(String, String)> {
+        if INFO_TABS.get(self.tab) != Some(&"Config") {
+            return None;
+        }
+        match self.rows().get(self.cursor) {
+            Some(InfoRow::Field(k, v)) => Some((k.clone(), v.clone())),
+            _ => None,
+        }
+    }
+
+    /// The client id under the cursor on the Clients tab.
+    pub fn selected_client(&self) -> Option<(String, String)> {
+        if INFO_TABS.get(self.tab) != Some(&"Clients") {
+            return None;
+        }
+        match self.rows().get(self.cursor) {
+            Some(InfoRow::Field(id, rest)) => Some((id.clone(), rest.clone())),
+            _ => None,
+        }
+    }
+
+    /// First row to draw, given how many fit. Keeps the cursor on screen on
+    /// the tabs that have one without the update half knowing the height.
+    pub fn view_start(&self, height: usize) -> usize {
+        let scroll = self.scroll as usize;
+        if !tab_is_actionable(self.tab) || height == 0 {
+            return scroll;
+        }
+        if self.cursor < scroll {
+            self.cursor
+        } else if self.cursor >= scroll + height {
+            self.cursor + 1 - height
+        } else {
+            scroll
         }
     }
 
@@ -227,6 +387,11 @@ impl InfoState {
             "Memory" => self.memory(),
             "Stats" => section_rows(&self.info, "Stats"),
             "Key Statistics" => self.key_statistics(),
+            "Slowlog" => self.slowlog(),
+            "Clients" => self.clients(),
+            "Config" => self.config(),
+            "Latency" => self.latency(),
+            "Cluster" => self.cluster(),
             _ => self
                 .info
                 .sections
@@ -241,6 +406,125 @@ impl InfoState {
                 .collect(),
         };
         filter_rows(rows, &self.query)
+    }
+
+    /// Slowest commands first: the log is what explains a latency spike.
+    fn slowlog(&self) -> Vec<InfoRow> {
+        if self.diag.slowlog.is_empty() {
+            return vec![
+                InfoRow::Head("Slow log".into()),
+                InfoRow::Field(
+                    "empty".into(),
+                    "nothing has crossed slowlog-log-slower-than".into(),
+                ),
+            ];
+        }
+        let mut entries = self.diag.slowlog.clone();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.micros));
+        let mut rows = vec![InfoRow::Head(format!(
+            "Slow log — {} entries, slowest first",
+            entries.len()
+        ))];
+        rows.extend(entries.iter().map(|e| {
+            InfoRow::Field(
+                format!("{:.2} ms", e.micros as f64 / 1000.0),
+                format!("#{} · {} · {}", e.id, e.command, e.client),
+            )
+        }));
+        rows
+    }
+
+    /// Connected clients, longest idle first — an idle client holding a
+    /// connection is the one worth seeing.
+    fn clients(&self) -> Vec<InfoRow> {
+        if self.diag.clients.is_empty() {
+            return vec![
+                InfoRow::Head("Clients".into()),
+                InfoRow::Field("unavailable".into(), "CLIENT LIST was refused".into()),
+            ];
+        }
+        let mut clients = self.diag.clients.clone();
+        clients.sort_by_key(|c| std::cmp::Reverse(c.idle_secs));
+        let mut rows = vec![InfoRow::Head(format!(
+            "{} connected client(s) — x disconnects the selected one",
+            clients.len()
+        ))];
+        rows.extend(clients.iter().map(|c| {
+            let name = if c.name.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", c.name)
+            };
+            InfoRow::Field(
+                c.id.clone(),
+                format!(
+                    "{} · db{} · idle {}s · age {}s · last {}{name}",
+                    c.addr, c.db, c.idle_secs, c.age_secs, c.command
+                ),
+            )
+        }));
+        rows
+    }
+
+    fn config(&self) -> Vec<InfoRow> {
+        if self.diag.config.is_empty() {
+            return vec![
+                InfoRow::Head("Config".into()),
+                InfoRow::Field("unavailable".into(), "CONFIG GET was refused".into()),
+            ];
+        }
+        let mut rows = vec![InfoRow::Head(format!(
+            "{} running parameters — e edits the selected one",
+            self.diag.config.len()
+        ))];
+        rows.extend(
+            self.diag
+                .config
+                .iter()
+                .map(|(k, v)| InfoRow::Field(k.clone(), v.clone())),
+        );
+        rows
+    }
+
+    fn latency(&self) -> Vec<InfoRow> {
+        let mut rows = vec![InfoRow::Head("Latency".into())];
+        rows.extend(
+            self.diag
+                .latency
+                .iter()
+                .map(|(k, v)| InfoRow::Field(k.clone(), v.clone())),
+        );
+        rows
+    }
+
+    fn cluster(&self) -> Vec<InfoRow> {
+        let mut rows = Vec::new();
+        if self.diag.cluster.is_empty() {
+            rows.push(InfoRow::Head("Cluster".into()));
+            rows.push(InfoRow::Field(
+                "cluster_enabled".into(),
+                "0 — this server is not in cluster mode".into(),
+            ));
+        } else {
+            rows.push(InfoRow::Head("Cluster".into()));
+            rows.extend(
+                self.diag
+                    .cluster
+                    .iter()
+                    .map(|(k, v)| InfoRow::Field(k.clone(), v.clone())),
+            );
+        }
+        if !self.diag.modules.is_empty() {
+            rows.push(InfoRow::Head("Modules".into()));
+            rows.extend(
+                self.diag
+                    .modules
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| InfoRow::Field(format!("module {}", i + 1), m.clone())),
+            );
+        }
+        rows
     }
 
     /// Headline facts first, then the whole Server section.
@@ -456,6 +740,8 @@ pub struct MemoryState {
     /// `DBSIZE` when the scan started, for the progress bar and the stride.
     pub dbsize: u64,
     pub running: bool,
+    /// False shows prefixes, true shows the biggest individual keys.
+    pub show_keys: bool,
     /// Set when the report closes, so the scan task stops at the next batch.
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub scroll: usize,
@@ -468,6 +754,7 @@ impl MemoryState {
             depth: 1,
             dbsize,
             running: true,
+            show_keys: false,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scroll: 0,
         }
@@ -480,6 +767,116 @@ impl MemoryState {
 
     pub fn rows(&self) -> Vec<PrefixRow> {
         self.rollup.rows(self.depth)
+    }
+}
+
+/// The live pub/sub feed: what it is subscribed to, and what has arrived.
+pub struct PubSubState {
+    /// The patterns passed to `PSUBSCRIBE`, as typed.
+    pub patterns: Vec<String>,
+    /// True when the feed is following keyspace notifications rather than
+    /// application channels, which only changes how it is labelled.
+    pub keyspace: bool,
+    /// Newest last. Capped, so a busy channel cannot grow without bound.
+    pub messages: Vec<(String, String)>,
+    /// Stopped when the modal closes, so no task outlives the view.
+    pub task: Option<tokio::task::JoinHandle<()>>,
+    pub scroll: usize,
+    /// Set by `f`: keep the view pinned to the newest message.
+    pub follow: bool,
+}
+
+/// How many messages the feed keeps.
+pub const PUBSUB_LIMIT: usize = 2_000;
+
+impl PubSubState {
+    pub fn new(patterns: Vec<String>, keyspace: bool) -> Self {
+        Self {
+            patterns,
+            keyspace,
+            messages: Vec::new(),
+            task: None,
+            scroll: 0,
+            follow: true,
+        }
+    }
+
+    pub fn push(&mut self, channel: String, payload: String) {
+        self.messages.push((channel, payload));
+        if self.messages.len() > PUBSUB_LIMIT {
+            let overflow = self.messages.len() - PUBSUB_LIMIT;
+            self.messages.drain(..overflow);
+            self.scroll = self.scroll.saturating_sub(overflow);
+        }
+        if self.follow {
+            self.scroll = self.messages.len().saturating_sub(1);
+        }
+    }
+
+    pub fn title(&self) -> String {
+        let what = if self.keyspace {
+            "Keyspace events"
+        } else {
+            "Pub/Sub"
+        };
+        format!("{what} — {}", self.patterns.join(" "))
+    }
+
+    /// Stop the subscription. Called when the modal closes and before it is
+    /// re-subscribed, so a feed never keeps running behind the browser.
+    pub fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Which half of the consumer-group view has the cursor.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum GroupPane {
+    Groups,
+    Pending,
+}
+
+/// Consumer groups of one stream, and the entries they have not acked.
+pub struct GroupsState {
+    pub key: String,
+    pub groups: Vec<StreamGroup>,
+    pub selected: usize,
+    pub detail: StreamGroupDetail,
+    pub pane: GroupPane,
+    pub pending_sel: usize,
+}
+
+impl GroupsState {
+    pub fn new(key: String) -> Self {
+        Self {
+            key,
+            groups: Vec::new(),
+            selected: 0,
+            detail: StreamGroupDetail::default(),
+            pane: GroupPane::Groups,
+            pending_sel: 0,
+        }
+    }
+
+    /// Replace the group list, keeping the cursor on the same group where it
+    /// still exists so a refresh does not move the selection.
+    pub fn set_groups(&mut self, groups: Vec<StreamGroup>) {
+        let previous = self.selected_group();
+        self.groups = groups;
+        self.selected = previous
+            .and_then(|name| self.groups.iter().position(|g| g.name == name))
+            .unwrap_or(0)
+            .min(self.groups.len().saturating_sub(1));
+    }
+
+    pub fn selected_group(&self) -> Option<String> {
+        self.groups.get(self.selected).map(|g| g.name.clone())
+    }
+
+    pub fn selected_pending(&self) -> Option<crate::redis_client::PendingEntry> {
+        self.detail.pending.get(self.pending_sel).cloned()
     }
 }
 
@@ -517,9 +914,13 @@ pub enum Modal {
     Message {
         title: String,
         body: String,
+        /// First line shown, so a long reply can be read past the box.
+        scroll: u16,
     },
     Console(ConsoleState),
     Memory(MemoryState),
+    PubSub(PubSubState),
+    Groups(GroupsState),
     Info(Box<InfoState>),
     ThemePicker {
         selected: usize,
@@ -546,8 +947,14 @@ pub struct App {
 
     pub client: Option<Client>,
     pub server_line: String,
-    /// Command names for console completion, read once per connection.
-    pub commands: Vec<String>,
+    /// The server's command table, read once per connection: console
+    /// completion, and which commands a read-only profile has to refuse.
+    pub commands: CommandTable,
+    /// Keys marked with `m`, for the bulk operations.
+    pub marked: HashSet<String>,
+    /// The pub/sub feed while a dialog is on top of it, so publishing does not
+    /// throw away the subscription and everything it has collected.
+    pub held_feed: Option<PubSubState>,
     /// The keys behind the tree, kept so a TTL can expire one locally.
     pub keys: Vec<KeyInfo>,
     pub tree: Tree,
@@ -568,6 +975,9 @@ pub struct App {
     pub value_scroll: u16,
 
     pub modal: Option<Modal>,
+
+    /// A key named by a restored session, selected once the tree is built.
+    pending_selection: Option<String>,
 
     /// When the TTL clock last advanced.
     last_tick: std::time::Instant,
@@ -591,7 +1001,9 @@ impl App {
             conn_query: String::new(),
             testing: None,
             client: None,
-            commands: Vec::new(),
+            commands: CommandTable::default(),
+            marked: HashSet::new(),
+            held_feed: None,
             server_line: String::new(),
             keys: Vec::new(),
             tree: Tree::default(),
@@ -610,6 +1022,7 @@ impl App {
             value_state: TableState::default(),
             value_scroll: 0,
             modal: None,
+            pending_selection: None,
             last_tick: std::time::Instant::now(),
         }
     }
@@ -684,6 +1097,10 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
+        if client.read_only() {
+            self.status = "This connection is read-only — no writes are sent".into();
+            return;
+        }
         let ok = ok_status.to_string();
         self.spawn(async move {
             match f(client).await {
@@ -772,15 +1189,29 @@ impl App {
                         // that will not give it just means no completion.
                         let names = client.clone();
                         self.spawn(async move {
-                            Msg::Commands(names.command_names().await.unwrap_or_default())
+                            Msg::Commands(Box::new(names.command_names().await.unwrap_or_default()))
                         });
+                        let session = self.store.sessions.get(&client.conn.name).cloned();
                         self.client = Some(client);
                         self.screen = Screen::Browser;
-                        self.pattern = "*".into();
                         self.status.clear();
                         self.current = None;
                         self.value = None;
+                        self.marked.clear();
                         self.expanded.clear();
+                        // Reopen where this profile was left: same filter, same
+                        // folders, same key.
+                        self.pattern = "*".into();
+                        self.pending_selection = None;
+                        if let Some(session) = session {
+                            if !session.pattern.is_empty() {
+                                self.pattern = session.pattern;
+                            }
+                            self.expanded.extend(session.expanded);
+                            if !session.selected_key.is_empty() {
+                                self.pending_selection = Some(session.selected_key);
+                            }
+                        }
                         self.reload_keys();
                     }
                     Err(e) => self.status = format!("Connection failed: {e}"),
@@ -805,6 +1236,17 @@ impl App {
                     self.expanded.extend(self.tree.all_folder_paths());
                 }
                 self.rebuild_rows();
+                // A restored session names the key it was on; find it now that
+                // the tree exists.
+                if let Some(wanted) = self.pending_selection.take()
+                    && let Some(index) = self
+                        .rows
+                        .iter()
+                        .position(|r| r.key.as_ref().is_some_and(|k| k.name == wanted))
+                {
+                    self.tree_state.select(Some(index));
+                    self.on_tree_move();
+                }
                 if self.rows.is_empty() {
                     self.tree_state.select(None);
                 } else {
@@ -835,7 +1277,93 @@ impl App {
                 self.reload_value();
             }
             Msg::Mutated(Err(e)) => self.status = format!("Error: {e}"),
-            Msg::Commands(names) => self.commands = names,
+            Msg::Commands(table) => self.commands = *table,
+            Msg::Found {
+                keys,
+                truncated,
+                needle,
+            } => {
+                self.loading = false;
+                self.status = if keys.is_empty() {
+                    format!("No values contain '{needle}'")
+                } else {
+                    format!(
+                        "{} key(s) contain '{needle}'{}",
+                        keys.len(),
+                        if truncated { " (search truncated)" } else { "" }
+                    )
+                };
+                let pattern = self.pattern.clone();
+                self.on_msg(Msg::Keys {
+                    keys,
+                    truncated,
+                    dbsize: self.dbsize,
+                    pattern,
+                });
+            }
+            Msg::PubSub { channel, payload } => match &mut self.modal {
+                Some(Modal::PubSub(state)) => state.push(channel, payload),
+                // The feed is behind a dialog: keep collecting for it.
+                _ => match &mut self.held_feed {
+                    Some(feed) => feed.push(channel, payload),
+                    // Nothing is listening any more, so neither is the task.
+                    None => self.stop_feeds(),
+                },
+            },
+            Msg::Groups(result) => match *result {
+                Ok(groups) => {
+                    if let Some(Modal::Groups(state)) = &mut self.modal {
+                        state.set_groups(groups);
+                        let want = state.selected_group();
+                        if let Some(group) = want {
+                            self.load_group_detail(&group);
+                        }
+                    }
+                }
+                Err(e) => self.status = format!("Error: {e}"),
+            },
+            Msg::GroupDetail(result) => match *result {
+                Ok(detail) => {
+                    if let Some(Modal::Groups(state)) = &mut self.modal {
+                        state.detail = detail;
+                        state.pending_sel = 0;
+                    }
+                }
+                Err(e) => self.status = format!("Error: {e}"),
+            },
+            Msg::Indexes(indexes) => {
+                self.status.clear();
+                let options: Vec<&str> = indexes.iter().map(String::as_str).collect();
+                self.modal = Some(Modal::Form {
+                    title: "Search".into(),
+                    hint: "←→ picks the index · Enter runs FT.SEARCH".into(),
+                    fields: vec![
+                        Field::choice("Index", &options, 0),
+                        Field::text("Query", "*"),
+                    ],
+                    focus: 1,
+                    error: None,
+                    action: Action::Search,
+                });
+            }
+            Msg::Script(Ok(out)) => {
+                self.modal = Some(Modal::Message {
+                    title: "Result".into(),
+                    body: if out.trim().is_empty() {
+                        "(no reply)".into()
+                    } else {
+                        out
+                    },
+                    scroll: 0,
+                });
+            }
+            Msg::Script(Err(e)) => {
+                self.modal = Some(Modal::Message {
+                    title: "Error".into(),
+                    body: e,
+                    scroll: 0,
+                });
+            }
             Msg::Memory { rollup, done } => {
                 if let Some(Modal::Memory(state)) = &mut self.modal {
                     state.rollup = *rollup;
@@ -858,16 +1386,17 @@ impl App {
                 };
             }
             Msg::Info(result) => match *result {
-                Ok(info) => {
-                    let (tab, scroll) = match &self.modal {
-                        Some(Modal::Info(state)) => (state.tab, state.scroll),
-                        _ => (0, 0),
+                Ok((info, diag)) => {
+                    let (tab, scroll, cursor) = match &self.modal {
+                        Some(Modal::Info(state)) => (state.tab, state.scroll, state.cursor),
+                        _ => (0, 0, 0),
                     };
                     self.status.clear();
                     self.modal = Some(Modal::Info(Box::new(InfoState {
                         tab,
                         scroll,
-                        ..InfoState::new(info)
+                        cursor,
+                        ..InfoState::new(info, diag)
                     })));
                 }
                 Err(e) => self.status = format!("Error: INFO failed: {e}"),
@@ -994,7 +1523,12 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(c) = self.selected_connection() {
+                if let Some(mut c) = self.selected_connection() {
+                    // Reconnecting from the list returns to the database this
+                    // profile was last browsing.
+                    if let Some(session) = self.store.sessions.get(&c.name) {
+                        c.db = session.db;
+                    }
                     self.connect(c);
                 } else {
                     self.open_connection_form(None);
@@ -1185,6 +1719,10 @@ impl App {
                 Field::text("Host", &c.host),
                 Field::text("Port", &c.port.to_string()),
                 Field::text("Database", &c.db.to_string()),
+                Field::boolean(
+                    "Read-only (refuse every write from this profile)",
+                    c.read_only,
+                ),
                 Field::section("Authentication"),
                 Field::text("Username (optional)", &c.username),
                 Field::secret(
@@ -1198,6 +1736,11 @@ impl App {
                 Field::text("Client certificate file (optional)", &c.tls_cert_file),
                 Field::text("Client key file (optional)", &c.tls_key_file),
                 Field::boolean("Skip certificate verification (unsafe)", c.tls_insecure),
+                Field::section("SSH tunnel"),
+                Field::text("SSH host (blank connects directly)", &c.ssh_host),
+                Field::text("SSH user (optional)", &c.ssh_user),
+                Field::text("SSH port", &c.ssh_port.to_string()),
+                Field::text("SSH private key file (optional)", &c.ssh_key_file),
             ],
             focus: 1,
             error: None,
@@ -1212,7 +1755,11 @@ impl App {
         match key.code {
             KeyCode::Char('d') if ctrl => self.prompt_select_db(),
             KeyCode::Char('n') if ctrl => self.back_to_connections(),
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => {
+                self.save_session();
+                self.stop_feeds();
+                self.should_quit = true;
+            }
             KeyCode::Esc => {
                 if self.pattern != "*" {
                     self.pattern = "*".into();
@@ -1236,6 +1783,21 @@ impl App {
             KeyCode::Char('y') => self.yank_key_name(),
             KeyCode::Char('i') => self.load_info(),
             KeyCode::Char('M') => self.start_memory_report(),
+            KeyCode::Char('m') => self.toggle_mark(),
+            KeyCode::Char('u') => {
+                let count = self.marked.len();
+                self.marked.clear();
+                self.status = format!("Cleared {count} mark(s)");
+            }
+            KeyCode::Char('C') => self.prompt_copy_key(),
+            KeyCode::Char('F') => self.prompt_grep(),
+            KeyCode::Char('w') => self.prompt_export(),
+            KeyCode::Char('I') => self.prompt_import(),
+            KeyCode::Char('L') => self.prompt_lua(),
+            KeyCode::Char('P') => self.prompt_pubsub(),
+            KeyCode::Char('N') => self.watch_keyspace(),
+            KeyCode::Char('S') => self.open_stream_groups(),
+            KeyCode::Char('Q') => self.prompt_search(),
             KeyCode::Char('n') => self.prompt_new_key(),
             KeyCode::Char('t') => self.prompt_ttl(),
             KeyCode::Char('R') => self.prompt_rename(),
@@ -1384,13 +1946,202 @@ impl App {
 
     // ---- browser commands --------------------------------------------------
 
+    /// Remember where this profile was left, so reconnecting lands here again.
+    /// Best effort: a session we cannot write is not worth a message.
+    fn save_session(&mut self) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let session = crate::config::Session {
+            db: client.conn.db,
+            pattern: self.pattern.clone(),
+            expanded: {
+                let mut folders: Vec<String> = self.expanded.iter().cloned().collect();
+                folders.sort();
+                folders
+            },
+            selected_key: self
+                .current
+                .as_ref()
+                .map(|k| k.name.clone())
+                .unwrap_or_default(),
+        };
+        self.store
+            .sessions
+            .insert(client.conn.name.clone(), session);
+        let _ = self.store.save();
+    }
+
     fn back_to_connections(&mut self) {
+        self.save_session();
+        self.stop_feeds();
         self.client = None;
         self.screen = Screen::Connections;
         self.current = None;
         self.value = None;
         self.rows.clear();
         self.status.clear();
+    }
+
+    /// Mark or unmark the selected key, or every key under the selected
+    /// folder — marking a whole namespace one key at a time is no use.
+    fn toggle_mark(&mut self) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        match (row.key, row.folder_path) {
+            (Some(k), _) => {
+                if !self.marked.remove(&k.name) {
+                    self.marked.insert(k.name);
+                }
+            }
+            (None, Some(path)) => {
+                let prefix = format!("{path}:");
+                let under: Vec<String> = self
+                    .keys
+                    .iter()
+                    .filter(|k| k.name == path || k.name.starts_with(&prefix))
+                    .map(|k| k.name.clone())
+                    .collect();
+                let all_marked = under.iter().all(|n| self.marked.contains(n));
+                for name in under {
+                    if all_marked {
+                        self.marked.remove(&name);
+                    } else {
+                        self.marked.insert(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.status = format!("{} key(s) marked", self.marked.len());
+    }
+
+    /// The keys a bulk action applies to: the marked set, or the selected key
+    /// when nothing is marked.
+    fn target_keys(&self) -> Vec<String> {
+        if !self.marked.is_empty() {
+            let mut names: Vec<String> = self.marked.iter().cloned().collect();
+            names.sort();
+            return names;
+        }
+        self.current.iter().map(|k| k.name.clone()).collect()
+    }
+
+    fn prompt_copy_key(&mut self) {
+        let Some(k) = self.current.clone() else {
+            self.status = "Select a key first".into();
+            return;
+        };
+        if self.refuse_write() {
+            return;
+        }
+        let db = self.client.as_ref().map_or(0, |c| c.conn.db);
+        let mut targets = vec![THIS_CONNECTION.to_string()];
+        targets.extend(self.store.connections.iter().map(|c| c.name.clone()));
+        let options: Vec<&str> = targets.iter().map(String::as_str).collect();
+        self.modal = Some(Modal::Form {
+            title: format!("Copy '{}'", k.name),
+            hint: "←→ picks the target server · Enter copies".into(),
+            fields: vec![
+                Field::text("New key name", &k.name),
+                Field::choice("Target server", &options, 0),
+                Field::text("Target database", &db.to_string()),
+                Field::boolean("Overwrite the target if it exists", false),
+            ],
+            focus: 0,
+            error: None,
+            action: Action::CopyKey(k.name),
+        });
+    }
+
+    fn prompt_grep(&mut self) {
+        self.modal = Some(Modal::Form {
+            title: "Find in values".into(),
+            hint: format!(
+                "Searches the values of keys matching '{}' · case-insensitive",
+                self.pattern
+            ),
+            fields: vec![Field::text("Text to find", "")],
+            focus: 0,
+            error: None,
+            action: Action::GrepValues,
+        });
+    }
+
+    fn prompt_export(&mut self) {
+        let names = if self.marked.is_empty() {
+            self.keys.iter().map(|k| k.name.clone()).collect()
+        } else {
+            self.target_keys()
+        };
+        if names.is_empty() {
+            self.status = "Nothing to export".into();
+            return;
+        }
+        self.modal = Some(Modal::Form {
+            title: format!("Export {} key(s)", names.len()),
+            hint: "DUMP payloads and TTLs, as JSON · Enter writes the file".into(),
+            fields: vec![Field::text("File", "rediscope-export.json")],
+            focus: 0,
+            error: None,
+            action: Action::Export(names),
+        });
+    }
+
+    fn prompt_import(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
+        self.modal = Some(Modal::Form {
+            title: "Import keys".into(),
+            hint: "Reads a file written by the export above".into(),
+            fields: vec![
+                Field::text("File", "rediscope-export.json"),
+                Field::boolean("Overwrite keys that already exist", false),
+            ],
+            focus: 0,
+            error: None,
+            action: Action::Import,
+        });
+    }
+
+    /// Query a RediSearch index. The index list comes from the server, so a
+    /// server without the module says so rather than offering an empty form.
+    fn prompt_search(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.status = "Reading the search indexes ...".into();
+        self.spawn(async move {
+            match client.search_indexes().await {
+                Ok(indexes) if indexes.is_empty() => {
+                    Msg::Status("No search indexes on this server".into())
+                }
+                Ok(indexes) => Msg::Indexes(indexes),
+                Err(e) => Msg::Error(format!(
+                    "FT._LIST failed: {e} — is the search module loaded?"
+                )),
+            }
+        });
+    }
+
+    fn prompt_lua(&mut self) {
+        let keys = self.target_keys();
+        let mut ta = TextArea::from(vec!["return redis.call('PING')"]);
+        ta.set_cursor_line_style(ratatui::style::Style::default());
+        let title = if keys.is_empty() {
+            "Lua script — no KEYS".to_string()
+        } else {
+            format!("Lua script — KEYS: {}", keys.join(", "))
+        };
+        self.modal = Some(Modal::Editor {
+            title,
+            textarea: Box::new(ta),
+            action: Action::RunLua,
+            json: JsonMode::None,
+            error: None,
+        });
     }
 
     fn yank_key_name(&mut self) {
@@ -1402,6 +2153,9 @@ impl App {
     }
 
     fn prompt_new_key(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
         let types: Vec<&str> = NEW_KEY_TYPES.iter().map(|t| t.name()).collect();
         self.modal = Some(Modal::Form {
             title: "New key".into(),
@@ -1417,6 +2171,21 @@ impl App {
     }
 
     fn confirm_delete_key(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
+        // Marks win over the cursor: having marked a set, `D` is about that set.
+        if !self.marked.is_empty() {
+            let names = self.target_keys();
+            self.modal = Some(Modal::Confirm {
+                message: format!(
+                    "Delete {} marked key(s)? This cannot be undone.",
+                    names.len()
+                ),
+                action: Action::DeleteMarked(names),
+            });
+            return;
+        }
         let Some(k) = self.current.clone() else {
             self.status = "No key selected".into();
             return;
@@ -1428,6 +2197,9 @@ impl App {
     }
 
     fn prompt_rename(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
         let Some(k) = self.current.clone() else {
             return;
         };
@@ -1442,6 +2214,21 @@ impl App {
     }
 
     fn prompt_ttl(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
+        if !self.marked.is_empty() {
+            let names = self.target_keys();
+            self.modal = Some(Modal::Form {
+                title: format!("TTL for {} marked key(s)", names.len()),
+                hint: "Seconds, or blank to clear the expiry".into(),
+                fields: vec![Field::text("Seconds", "")],
+                focus: 0,
+                error: None,
+                action: Action::TtlMarked(names),
+            });
+            return;
+        }
         let Some(k) = self.current.clone() else {
             return;
         };
@@ -1473,6 +2260,9 @@ impl App {
     }
 
     fn prompt_add_item(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
         let Some(k) = self.current.clone() else {
             return;
         };
@@ -1524,19 +2314,31 @@ impl App {
                 error: None,
                 action: Action::StreamAdd(name),
             },
-            KeyType::String | KeyType::Other => Modal::Message {
+            KeyType::TimeSeries => Modal::Form {
+                title: format!("Add a sample to '{name}'"),
+                hint: "Timestamp * means now · Enter saves · Esc cancels".into(),
+                fields: vec![Field::text("Timestamp", "*"), Field::text("Value", "0")],
+                focus: 0,
+                error: None,
+                action: Action::TsAdd(name),
+            },
+            KeyType::String | KeyType::Json | KeyType::Other => Modal::Message {
                 title: "Nothing to add".into(),
-                body: "Strings hold a single value — press 'e' to edit it.".into(),
+                body: "This key holds a single document — press 'e' to edit it.".into(),
+                scroll: 0,
             },
         });
     }
 
     fn prompt_edit(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
         let Some(k) = self.current.clone() else {
             return;
         };
         let name = k.name.clone();
-        if k.kind == KeyType::String {
+        if matches!(k.kind, KeyType::String | KeyType::Json) {
             let current = match &self.value {
                 Some(KeyValue::Str(s)) => s.clone(),
                 _ => String::new(),
@@ -1550,15 +2352,29 @@ impl App {
             };
             let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
             ta.set_cursor_line_style(ratatui::style::Style::default());
-            let title = if mode.is_json() {
+            let title = if k.kind == KeyType::Json {
+                format!("Edit document '{name}'")
+            } else if mode.is_json() {
                 format!("Edit JSON '{name}'")
             } else {
                 format!("Edit string '{name}'")
             };
+            // A RedisJSON document is always JSON, whatever the text looks like
+            // right now, so it is checked before it is written back.
+            let mode = if k.kind == KeyType::Json {
+                JsonMode::Pretty
+            } else {
+                mode
+            };
+            let action = if k.kind == KeyType::Json {
+                Action::EditJson(name)
+            } else {
+                Action::EditString(name)
+            };
             self.modal = Some(Modal::Editor {
                 title,
                 textarea: Box::new(ta),
-                action: Action::EditString(name),
+                action,
                 json: mode,
                 error: None,
             });
@@ -1616,14 +2432,23 @@ impl App {
                     old: Some(row.id),
                 },
             },
-            KeyType::Stream | KeyType::String | KeyType::Other => Modal::Message {
+            KeyType::TimeSeries => Modal::Message {
+                title: "Not editable".into(),
+                body: "A time-series sample is written by timestamp. Add one with 'a'.".into(),
+                scroll: 0,
+            },
+            KeyType::Stream | KeyType::String | KeyType::Json | KeyType::Other => Modal::Message {
                 title: "Not editable".into(),
                 body: "Stream entries are immutable. Add a new entry with 'a', or delete this one with 'x'.".into(),
+                scroll: 0,
             },
         });
     }
 
     fn confirm_delete_row(&mut self) {
+        if self.refuse_write() {
+            return;
+        }
         let Some(k) = self.current.clone() else {
             return;
         };
@@ -1668,7 +2493,14 @@ impl App {
                     id: row.id,
                 },
             ),
-            KeyType::String | KeyType::Other => {
+            KeyType::TimeSeries => (
+                format!("Delete the sample at {} from '{name}'?", row.id),
+                Action::TsDel {
+                    key: name,
+                    timestamp: row.id,
+                },
+            ),
+            KeyType::String | KeyType::Json | KeyType::Other => {
                 self.status = "Use 'D' to delete the whole key".into();
                 return;
             }
@@ -1682,9 +2514,146 @@ impl App {
             return;
         };
         self.status = "Loading server info ...".into();
-        self.spawn(
-            async move { Msg::Info(Box::new(client.info().await.map_err(|e| e.to_string()))) },
-        );
+        self.spawn(async move {
+            let result = async {
+                let info = client.info().await.map_err(|e| e.to_string())?;
+                // Diagnostics are best effort: a provider that blocks CONFIG
+                // or CLIENT LIST should still get the INFO tabs.
+                let diag = client.diagnostics().await.unwrap_or_default();
+                Ok((info, diag))
+            }
+            .await;
+            Msg::Info(Box::new(result))
+        });
+    }
+
+    // ---- pub/sub -----------------------------------------------------------
+
+    /// Subscribe to `patterns` and stream what arrives into the feed modal.
+    /// Pub/sub needs a connection of its own, so this opens one and drops it
+    /// when the modal closes.
+    fn start_pubsub(&mut self, patterns: Vec<String>, keyspace: bool) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        if let Some(Modal::PubSub(old)) = &mut self.modal {
+            old.stop();
+        }
+        let mut state = PubSubState::new(patterns.clone(), keyspace);
+        let tx = self.tx.clone();
+        state.task = Some(tokio::spawn(async move {
+            let mut pubsub = match client.pubsub().await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("cannot subscribe: {e}")));
+                    return;
+                }
+            };
+            for pattern in &patterns {
+                if let Err(e) = pubsub.psubscribe(pattern).await {
+                    let _ = tx.send(Msg::Error(format!("cannot subscribe to {pattern}: {e}")));
+                    return;
+                }
+            }
+            let mut stream = pubsub.on_message();
+            while let Some(msg) = futures_util::StreamExt::next(&mut stream).await {
+                let channel = msg.get_channel_name().to_string();
+                let payload: String = msg.get_payload().unwrap_or_default();
+                if tx.send(Msg::PubSub { channel, payload }).is_err() {
+                    return;
+                }
+            }
+        }));
+        self.modal = Some(Modal::PubSub(state));
+    }
+
+    /// Abort any subscription still running with nothing to show it in.
+    fn stop_feeds(&mut self) {
+        if let Some(Modal::PubSub(state)) = &mut self.modal {
+            state.stop();
+        }
+        if let Some(feed) = &mut self.held_feed {
+            feed.stop();
+        }
+        self.held_feed = None;
+    }
+
+    fn prompt_pubsub(&mut self) {
+        self.modal = Some(Modal::Form {
+            title: "Subscribe".into(),
+            hint: "Space-separated patterns, e.g. news.* jobs · Enter subscribes".into(),
+            fields: vec![Field::text("Channel patterns", "*")],
+            focus: 0,
+            error: None,
+            action: Action::Subscribe,
+        });
+    }
+
+    /// Follow keyspace notifications for the current database. Needs
+    /// `notify-keyspace-events` to be configured on the server; the feed says
+    /// so when nothing arrives.
+    fn watch_keyspace(&mut self) {
+        let db = self.client.as_ref().map_or(0, |c| c.conn.db);
+        self.start_pubsub(vec![format!("__keyevent@{db}__:*")], true);
+    }
+
+    // ---- consumer groups ---------------------------------------------------
+
+    fn open_stream_groups(&mut self) {
+        let Some(key) = self.current.clone() else {
+            self.status = "Select a stream first".into();
+            return;
+        };
+        if key.kind != KeyType::Stream {
+            self.status = "Consumer groups belong to streams".into();
+            return;
+        }
+        self.modal = Some(Modal::Groups(GroupsState::new(key.name.clone())));
+        self.load_groups();
+    }
+
+    fn load_groups(&mut self) {
+        let (Some(client), Some(Modal::Groups(state))) = (self.client.clone(), &self.modal) else {
+            return;
+        };
+        let key = state.key.clone();
+        self.spawn(async move {
+            Msg::Groups(Box::new(
+                client.stream_groups(&key).await.map_err(|e| e.to_string()),
+            ))
+        });
+    }
+
+    fn load_group_detail(&mut self, group: &str) {
+        let (Some(client), Some(Modal::Groups(state))) = (self.client.clone(), &self.modal) else {
+            return;
+        };
+        let (key, group) = (state.key.clone(), group.to_string());
+        self.spawn(async move {
+            Msg::GroupDetail(Box::new(
+                client
+                    .stream_group_detail(&key, &group)
+                    .await
+                    .map_err(|e| e.to_string()),
+            ))
+        });
+    }
+
+    // ---- read-only guard ---------------------------------------------------
+
+    /// True when this profile refuses writes. Every path that changes data
+    /// asks first, so the guard cannot be walked around through a form, the
+    /// console, or a bulk action.
+    pub fn read_only(&self) -> bool {
+        self.client.as_ref().is_some_and(Client::read_only)
+    }
+
+    fn refuse_write(&mut self) -> bool {
+        if self.read_only() {
+            self.status = "This connection is read-only — no writes are sent".into();
+            return true;
+        }
+        false
     }
 
     /// Open the namespace memory report and start the scan behind it.
@@ -1762,7 +2731,7 @@ impl App {
         if key.code == KeyCode::Tab
             && matches!(self.modal, Some(Modal::Console(ref c)) if c.search.is_none())
         {
-            let commands = self.commands.clone();
+            let commands = self.commands.names.clone();
             let keys: Vec<String> = self.keys.iter().map(|k| k.name.clone()).collect();
             if let Some(Modal::Console(state)) = &mut self.modal {
                 complete_console(state, &commands, &keys);
@@ -1812,10 +2781,33 @@ impl App {
             }
             return;
         }
+        // The consumer-group view issues follow-up requests as it is driven,
+        // which the borrow of `self.modal` below would rule out.
+        if matches!(self.modal, Some(Modal::Groups(_))) {
+            self.groups_key(key);
+            return;
+        }
         match self.modal.as_mut().expect("modal_key with no modal") {
-            Modal::Help | Modal::Message { .. } => {
+            Modal::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.modal = None;
+                }
+            }
+            Modal::Message { body, scroll, .. } => {
+                let last = body.lines().count().saturating_sub(1) as u16;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.modal = None,
+                    KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(last),
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown => *scroll = (*scroll + 10).min(last),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => *scroll = last,
+                    KeyCode::Char('y') => {
+                        crate::osc52::copy(body);
+                        self.status = "Copied to the clipboard".into();
+                    }
+                    _ => {}
                 }
             }
             Modal::Confirm { action, .. } => match key.code {
@@ -1881,7 +2873,9 @@ impl App {
                 error,
                 ..
             } => match key.code {
-                KeyCode::Esc => self.modal = None,
+                KeyCode::Esc => {
+                    self.modal = self.held_feed.take().map(Modal::PubSub);
+                }
                 KeyCode::Tab | KeyCode::Down => *focus = next_focus(fields, *focus, 1),
                 KeyCode::BackTab | KeyCode::Up => *focus = next_focus(fields, *focus, -1),
                 KeyCode::Enter => {
@@ -1956,31 +2950,81 @@ impl App {
                     KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                         state.tab = (state.tab + 1) % INFO_TABS.len();
                         state.scroll = 0;
+                        state.cursor = 0;
                     }
                     KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                         state.tab = (state.tab + INFO_TABS.len() - 1) % INFO_TABS.len();
                         state.scroll = 0;
+                        state.cursor = 0;
                     }
-                    KeyCode::Char(c @ '1'..='5') => {
-                        state.tab = c as usize - '1' as usize;
+                    // 1-9 pick a tab, 0 is the tenth ("All").
+                    KeyCode::Char(c @ '0'..='9') => {
+                        let index = (c as usize + 9 - '0' as usize) % 10;
+                        state.tab = index.min(INFO_TABS.len() - 1);
                         state.scroll = 0;
+                        state.cursor = 0;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        state.scroll = (state.scroll + 1).min(last)
+                        state.scroll = (state.scroll + 1).min(last);
+                        state.cursor = (state.cursor + 1).min(last as usize);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        state.scroll = state.scroll.saturating_sub(1)
+                        state.scroll = state.scroll.saturating_sub(1);
+                        state.cursor = state.cursor.saturating_sub(1);
                     }
-                    KeyCode::PageDown => state.scroll = (state.scroll + 10).min(last),
-                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
-                    KeyCode::Char('g') | KeyCode::Home => state.scroll = 0,
-                    KeyCode::Char('G') | KeyCode::End => state.scroll = last,
+                    KeyCode::PageDown => {
+                        state.scroll = (state.scroll + 10).min(last);
+                        state.cursor = (state.cursor + 10).min(last as usize);
+                    }
+                    KeyCode::PageUp => {
+                        state.scroll = state.scroll.saturating_sub(10);
+                        state.cursor = state.cursor.saturating_sub(10);
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        state.scroll = 0;
+                        state.cursor = 0;
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        state.scroll = last;
+                        state.cursor = last as usize;
+                    }
                     KeyCode::Char('y') => {
                         let tab = INFO_TABS[state.tab];
                         crate::osc52::copy(&state.text());
                         self.status = format!("Copied the {tab} tab to the clipboard");
                     }
                     KeyCode::Char('r') => self.load_info(),
+                    // `e` on the Config tab edits the selected parameter.
+                    KeyCode::Char('e') => {
+                        if let Some((param, value)) = state.selected_config() {
+                            self.modal = Some(Modal::Form {
+                                title: format!("CONFIG SET {param}"),
+                                hint: "Applies to the running server, not its config file".into(),
+                                fields: vec![Field::text(&param, &value)],
+                                focus: 0,
+                                error: None,
+                                action: Action::SetConfig(param),
+                            });
+                        }
+                    }
+                    // `x` disconnects a client, or clears the slow log.
+                    KeyCode::Char('x') => match INFO_TABS.get(state.tab) {
+                        Some(&"Clients") => {
+                            if let Some((id, addr)) = state.selected_client() {
+                                self.modal = Some(Modal::Confirm {
+                                    message: format!("Disconnect client {id} ({addr})?"),
+                                    action: Action::KillClient(id),
+                                });
+                            }
+                        }
+                        Some(&"Slowlog") => {
+                            self.modal = Some(Modal::Confirm {
+                                message: "Reset the slow log?".into(),
+                                action: Action::ResetSlowlog,
+                            });
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -2076,6 +3120,13 @@ impl App {
                 }
                 KeyCode::Char(c @ '1'..='3') => {
                     state.depth = c.to_digit(10).unwrap_or(1) as usize;
+                    state.show_keys = false;
+                    state.scroll = 0;
+                }
+                // The same scan already measured individual keys; `t` shows
+                // them rather than their prefixes.
+                KeyCode::Char('t') => {
+                    state.show_keys = !state.show_keys;
                     state.scroll = 0;
                 }
                 KeyCode::Down | KeyCode::Char('j') => state.scroll = state.scroll.saturating_add(1),
@@ -2093,7 +3144,200 @@ impl App {
                 }
                 _ => {}
             },
-            Modal::ThemePicker { .. } => unreachable!("handled above"),
+            Modal::PubSub(state) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    state.stop();
+                    self.modal = None;
+                }
+                KeyCode::Char('c') => {
+                    state.messages.clear();
+                    state.scroll = 0;
+                }
+                KeyCode::Char('f') => {
+                    state.follow = !state.follow;
+                    if state.follow {
+                        state.scroll = state.messages.len().saturating_sub(1);
+                    }
+                }
+                KeyCode::Char('s') => {
+                    state.stop();
+                    let current = state.patterns.join(" ");
+                    self.modal = Some(Modal::Form {
+                        title: "Subscribe".into(),
+                        hint: "Space-separated patterns · Enter subscribes".into(),
+                        fields: vec![Field::text("Channel patterns", &current)],
+                        focus: 0,
+                        error: None,
+                        action: Action::Subscribe,
+                    });
+                }
+                KeyCode::Char('w') => {
+                    let channel = state
+                        .messages
+                        .last()
+                        .map(|(c, _)| c.clone())
+                        .unwrap_or_default();
+                    // Set the feed aside rather than dropping it: the
+                    // subscription and its history come back after publishing.
+                    if let Some(Modal::PubSub(feed)) = self.modal.take() {
+                        self.held_feed = Some(feed);
+                    }
+                    self.modal = Some(Modal::Form {
+                        title: "Publish".into(),
+                        hint: "Enter publishes · Esc cancels".into(),
+                        fields: vec![Field::text("Channel", &channel), Field::text("Message", "")],
+                        focus: 0,
+                        error: None,
+                        action: Action::Publish,
+                    });
+                }
+                KeyCode::Char('y') => {
+                    let text = state
+                        .messages
+                        .iter()
+                        .map(|(c, p)| format!("{c}  {p}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    crate::osc52::copy(&text);
+                    self.status = "Copied the feed to the clipboard".into();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.follow = false;
+                    state.scroll = (state.scroll + 1).min(state.messages.len().saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.follow = false;
+                    state.scroll = state.scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    state.follow = false;
+                    state.scroll = (state.scroll + 10).min(state.messages.len().saturating_sub(1));
+                }
+                KeyCode::PageUp => {
+                    state.follow = false;
+                    state.scroll = state.scroll.saturating_sub(10);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    state.follow = false;
+                    state.scroll = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    state.scroll = state.messages.len().saturating_sub(1);
+                    state.follow = true;
+                }
+                _ => {}
+            },
+            Modal::Groups(_) | Modal::ThemePicker { .. } => unreachable!("handled above"),
+        }
+    }
+
+    /// Drive the consumer-group view. Split out because most of its keys start
+    /// another request, which cannot happen while the modal is borrowed.
+    fn groups_key(&mut self, key: KeyEvent) {
+        let Some(Modal::Groups(state)) = &mut self.modal else {
+            return;
+        };
+        let stream = state.key.clone();
+        let mut follow_up: Option<String> = None;
+        let mut refresh = false;
+        let mut next_modal: Option<Modal> = None;
+        let mut close = false;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => close = true,
+            KeyCode::Tab => {
+                state.pane = match state.pane {
+                    GroupPane::Groups => GroupPane::Pending,
+                    GroupPane::Pending => GroupPane::Groups,
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => match state.pane {
+                GroupPane::Groups => {
+                    if !state.groups.is_empty() {
+                        state.selected = (state.selected + 1).min(state.groups.len() - 1);
+                        follow_up = state.selected_group();
+                    }
+                }
+                GroupPane::Pending => {
+                    state.pending_sel =
+                        (state.pending_sel + 1).min(state.detail.pending.len().saturating_sub(1));
+                }
+            },
+            KeyCode::Up | KeyCode::Char('k') => match state.pane {
+                GroupPane::Groups => {
+                    state.selected = state.selected.saturating_sub(1);
+                    follow_up = state.selected_group();
+                }
+                GroupPane::Pending => state.pending_sel = state.pending_sel.saturating_sub(1),
+            },
+            KeyCode::Enter => follow_up = state.selected_group(),
+            KeyCode::Char('r') => refresh = true,
+            KeyCode::Char('n') => {
+                next_modal = Some(Modal::Form {
+                    title: format!("New consumer group on '{stream}'"),
+                    hint: "Start at $ for new entries, 0 for the whole stream".into(),
+                    fields: vec![Field::text("Group", ""), Field::text("Start at", "$")],
+                    focus: 0,
+                    error: None,
+                    action: Action::CreateGroup(stream.clone()),
+                });
+            }
+            KeyCode::Char('d') => {
+                if let Some(group) = state.selected_group() {
+                    next_modal = Some(Modal::Confirm {
+                        message: format!("Destroy group '{group}' on '{stream}'?"),
+                        action: Action::DestroyGroup {
+                            key: stream.clone(),
+                            group,
+                        },
+                    });
+                }
+            }
+            KeyCode::Char('a') => {
+                if let (Some(group), Some(entry)) =
+                    (state.selected_group(), state.selected_pending())
+                {
+                    next_modal = Some(Modal::Confirm {
+                        message: format!("Ack entry {} for group '{group}'?", entry.id),
+                        action: Action::AckPending {
+                            key: stream.clone(),
+                            group,
+                            id: entry.id,
+                        },
+                    });
+                }
+            }
+            KeyCode::Char('c') => {
+                if let (Some(group), Some(entry)) =
+                    (state.selected_group(), state.selected_pending())
+                {
+                    next_modal = Some(Modal::Form {
+                        title: format!("Claim {} in '{group}'", entry.id),
+                        hint: "The consumer that should own this entry next".into(),
+                        fields: vec![Field::text("Consumer", &entry.consumer)],
+                        focus: 0,
+                        error: None,
+                        action: Action::ClaimPending {
+                            key: stream.clone(),
+                            group,
+                            id: entry.id,
+                        },
+                    });
+                }
+            }
+            _ => {}
+        }
+        if close {
+            self.modal = None;
+            return;
+        }
+        if let Some(modal) = next_modal {
+            self.modal = Some(modal);
+            return;
+        }
+        if refresh {
+            self.load_groups();
+        } else if let Some(group) = follow_up {
+            self.load_group_detail(&group);
         }
     }
 
@@ -2101,6 +3345,15 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
+        if client.read_only() && self.commands.is_write(&line) {
+            let refusal = "(error) this connection is read-only".to_string();
+            if let Some(Modal::Console(c)) = &mut self.modal {
+                c.log.push(refusal);
+            } else {
+                self.status = "This connection is read-only — no writes are sent".into();
+            }
+            return;
+        }
         // `SELECT` through the console would desync our idea of the current db.
         let select_target = parse_select(&line);
         self.spawn(async move {
@@ -2137,8 +3390,8 @@ impl App {
                     .as_deref()
                     .and_then(|n| self.store.connections.iter().find(|c| c.name == n))
                     .cloned();
-                let typed_password = v(5);
-                let use_keychain = v(6) == "true";
+                let typed_password = v(6);
+                let use_keychain = v(7) == "true";
                 let conn = Connection {
                     name: v(0).trim().to_string(),
                     host: {
@@ -2147,18 +3400,23 @@ impl App {
                     },
                     port: v(2).trim().parse().unwrap_or(6379),
                     db: v(3).trim().parse().unwrap_or(0),
-                    username: v(4).trim().to_string(),
+                    read_only: v(4) == "true",
+                    username: v(5).trim().to_string(),
                     password: if use_keychain {
                         String::new()
                     } else {
                         typed_password.clone()
                     },
                     use_keychain,
-                    tls: v(7) == "true",
-                    tls_ca_file: v(8).trim().to_string(),
-                    tls_cert_file: v(9).trim().to_string(),
-                    tls_key_file: v(10).trim().to_string(),
-                    tls_insecure: v(11) == "true",
+                    tls: v(8) == "true",
+                    tls_ca_file: v(9).trim().to_string(),
+                    tls_cert_file: v(10).trim().to_string(),
+                    tls_key_file: v(11).trim().to_string(),
+                    tls_insecure: v(12) == "true",
+                    ssh_host: v(13).trim().to_string(),
+                    ssh_user: v(14).trim().to_string(),
+                    ssh_port: v(15).trim().parse().unwrap_or(22),
+                    ssh_key_file: v(16).trim().to_string(),
                 };
                 let new_name = conn.name.clone();
                 self.store.upsert(conn, replacing.as_deref());
@@ -2242,6 +3500,23 @@ impl App {
                     c.set_string(&name, &value).await
                 });
             }
+            Action::EditJson(name) => {
+                let value = v(0);
+                self.mutate("Document saved", move |c| async move {
+                    c.json_set(&name, "$", &value).await
+                });
+            }
+            Action::TsAdd(name) => {
+                let (ts, value) = (v(0), v(1));
+                self.mutate("Sample added", move |c| async move {
+                    c.ts_add(&name, &ts, &value).await
+                });
+            }
+            Action::TsDel { key, timestamp } => {
+                self.mutate("Sample deleted", move |c| async move {
+                    c.ts_del(&key, &timestamp).await
+                });
+            }
             Action::HashSet { key, field } => {
                 let (f, val) = match field {
                     Some(f) => (f, v(0)),
@@ -2312,6 +3587,339 @@ impl App {
             Action::StreamDel { key, id } => self.mutate("Entry deleted", move |c| async move {
                 c.stream_delete(&key, &id).await
             }),
+            Action::Subscribe => {
+                let patterns: Vec<String> = v(0).split_whitespace().map(str::to_string).collect();
+                if patterns.is_empty() {
+                    self.status = "No pattern given".into();
+                    return;
+                }
+                self.start_pubsub(patterns, false);
+            }
+            Action::Publish => {
+                // Whatever happens, the feed underneath comes back.
+                if let Some(feed) = self.held_feed.take() {
+                    self.modal = Some(Modal::PubSub(feed));
+                }
+                if self.refuse_write() {
+                    return;
+                }
+                let (channel, payload) = (v(0), v(1));
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client
+                        .execute_raw(&format!("PUBLISH {channel} {payload:?}"))
+                        .await
+                    {
+                        Ok(out) => Msg::Status(format!("Published to {channel} — {}", out.trim())),
+                        Err(e) => Msg::Error(format!("publish failed: {e}")),
+                    }
+                });
+            }
+            Action::DeleteMarked(names) => {
+                if self.refuse_write() {
+                    return;
+                }
+                let count = names.len();
+                self.marked.clear();
+                self.current = None;
+                self.value = None;
+                self.mutate(&format!("{count} key(s) deleted"), move |c| async move {
+                    c.delete_keys(&names).await.map(|_| ())
+                });
+            }
+            Action::TtlMarked(names) => {
+                if self.refuse_write() {
+                    return;
+                }
+                let raw = v(0).trim().to_string();
+                let seconds = if raw.is_empty() {
+                    None
+                } else {
+                    raw.parse::<i64>().ok()
+                };
+                let count = names.len();
+                self.mutate(&format!("TTL set on {count} key(s)"), move |c| async move {
+                    c.expire_keys(&names, seconds).await.map(|_| ())
+                });
+            }
+            Action::CopyKey(source) => {
+                let target_name = v(0).trim().to_string();
+                let profile = v(1);
+                let db: i64 = v(2).trim().parse().unwrap_or(0);
+                let replace = v(3) == "true";
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                // Copying onto this same connection is refused when it would
+                // overwrite the source with itself.
+                let same_server = profile == THIS_CONNECTION;
+                if same_server && target_name == source && db == client.conn.db {
+                    self.status = "Error: the target is the source".into();
+                    return;
+                }
+                let mut target_conn = if same_server {
+                    client.conn.clone()
+                } else {
+                    match self.store.connections.iter().find(|c| c.name == profile) {
+                        Some(c) => c.clone(),
+                        None => {
+                            self.status = format!("Error: no saved profile called '{profile}'");
+                            return;
+                        }
+                    }
+                };
+                target_conn.db = db;
+                if target_conn.read_only {
+                    self.status = format!("Error: '{}' is read-only", target_conn.name);
+                    return;
+                }
+                self.status = format!("Copying '{source}' ...");
+                self.spawn(async move {
+                    // A copy inside the same database needs no second
+                    // connection; anything else opens one for the target.
+                    let target = if same_server && db == client.conn.db {
+                        client.clone()
+                    } else {
+                        match Client::connect(target_conn).await {
+                            Ok(c) => c,
+                            Err(e) => return Msg::Error(format!("cannot reach the target: {e}")),
+                        }
+                    };
+                    match client
+                        .copy_key(&source, &target_name, &target, replace)
+                        .await
+                    {
+                        Ok(()) => Msg::Mutated(Ok(format!("Copied '{source}' to '{target_name}'"))),
+                        Err(e) => Msg::Mutated(Err(e.to_string())),
+                    }
+                });
+            }
+            Action::GrepValues => {
+                let needle = v(0);
+                if needle.is_empty() {
+                    return;
+                }
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                let pattern = self.pattern.clone();
+                self.loading = true;
+                self.status = format!("Searching values for '{needle}' ...");
+                self.spawn(async move {
+                    match client.grep_values(&pattern, &needle, KEY_LIMIT).await {
+                        Ok((keys, truncated)) => Msg::Found {
+                            keys,
+                            truncated,
+                            needle,
+                        },
+                        Err(e) => Msg::Error(format!("search failed: {e}")),
+                    }
+                });
+            }
+            Action::Export(names) => {
+                let path = crate::config::expand_home(v(0).trim());
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                if names.is_empty() {
+                    self.status = "Nothing to export".into();
+                    return;
+                }
+                self.status = format!("Exporting {} key(s) ...", names.len());
+                self.spawn(async move {
+                    let entries = match client.export_keys(&names).await {
+                        Ok(entries) => entries,
+                        Err(e) => return Msg::Error(format!("export failed: {e}")),
+                    };
+                    let count = entries.len();
+                    let text = match serde_json::to_string_pretty(&entries) {
+                        Ok(text) => text,
+                        Err(e) => return Msg::Error(format!("export failed: {e}")),
+                    };
+                    match tokio::task::spawn_blocking(move || std::fs::write(&path, text)).await {
+                        Ok(Ok(())) => Msg::Status(format!("Exported {count} key(s)")),
+                        Ok(Err(e)) => Msg::Error(format!("cannot write the export: {e}")),
+                        Err(e) => Msg::Error(e.to_string()),
+                    }
+                });
+            }
+            Action::Import => {
+                if self.refuse_write() {
+                    return;
+                }
+                let path = crate::config::expand_home(v(0).trim());
+                let replace = v(1) == "true";
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.status = "Importing ...".into();
+                self.spawn(async move {
+                    let text =
+                        match tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
+                            .await
+                        {
+                            Ok(Ok(text)) => text,
+                            Ok(Err(e)) => return Msg::Error(format!("cannot read the file: {e}")),
+                            Err(e) => return Msg::Error(e.to_string()),
+                        };
+                    let entries: Vec<ExportEntry> = match serde_json::from_str(&text) {
+                        Ok(entries) => entries,
+                        Err(e) => return Msg::Error(format!("not a rediscope export: {e}")),
+                    };
+                    match client.import_entries(&entries, replace).await {
+                        Ok(n) => Msg::Mutated(Ok(format!("Imported {n} key(s)"))),
+                        Err(e) => Msg::Mutated(Err(e.to_string())),
+                    }
+                });
+            }
+            Action::RunLua => {
+                let script = v(0);
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                // Marked keys become KEYS[1..], which is how a script is meant
+                // to name what it touches.
+                let mut keys: Vec<String> = self.marked.iter().cloned().collect();
+                keys.sort();
+                if keys.is_empty()
+                    && let Some(current) = &self.current
+                {
+                    keys.push(current.name.clone());
+                }
+                if self.read_only() && self.commands.is_write("EVAL") {
+                    self.status = "This connection is read-only — no writes are sent".into();
+                    return;
+                }
+                self.status = "Running the script ...".into();
+                self.spawn(async move {
+                    Msg::Script(
+                        client
+                            .eval(&script, &keys, &[])
+                            .await
+                            .map_err(|e| e.to_string()),
+                    )
+                });
+            }
+            Action::Search => {
+                let (index, query) = (v(0), v(1));
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.status = format!("Searching {index} ...");
+                self.spawn(async move {
+                    match client
+                        .search(&index, &query, crate::redis_client::VALUE_LIMIT)
+                        .await
+                    {
+                        Ok(out) => Msg::Script(Ok(out)),
+                        Err(e) => Msg::Script(Err(e.to_string())),
+                    }
+                });
+            }
+            Action::SetConfig(param) => {
+                if self.refuse_write() {
+                    return;
+                }
+                let value = v(0);
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client.config_set(&param, &value).await {
+                        Ok(()) => Msg::Status(format!("{param} set to '{value}'")),
+                        Err(e) => Msg::Error(format!("CONFIG SET failed: {e}")),
+                    }
+                });
+                self.load_info();
+            }
+            Action::KillClient(id) => {
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client.client_kill(&id).await {
+                        Ok(()) => Msg::Status(format!("Client {id} disconnected")),
+                        Err(e) => Msg::Error(format!("CLIENT KILL failed: {e}")),
+                    }
+                });
+                self.load_info();
+            }
+            Action::ResetSlowlog => {
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client.slowlog_reset().await {
+                        Ok(()) => Msg::Status("Slow log reset".into()),
+                        Err(e) => Msg::Error(format!("SLOWLOG RESET failed: {e}")),
+                    }
+                });
+                self.load_info();
+            }
+            Action::CreateGroup(key) => {
+                if self.refuse_write() {
+                    return;
+                }
+                let (group, start) = (v(0).trim().to_string(), v(1).trim().to_string());
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client.stream_group_create(&key, &group, &start).await {
+                        Ok(()) => Msg::Status(format!("Group '{group}' created")),
+                        Err(e) => Msg::Error(format!("XGROUP CREATE failed: {e}")),
+                    }
+                });
+                self.load_groups();
+            }
+            Action::DestroyGroup { key, group } => {
+                if self.refuse_write() {
+                    return;
+                }
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client.stream_group_destroy(&key, &group).await {
+                        Ok(()) => Msg::Status(format!("Group '{group}' destroyed")),
+                        Err(e) => Msg::Error(format!("XGROUP DESTROY failed: {e}")),
+                    }
+                });
+                self.load_groups();
+            }
+            Action::AckPending { key, group, id } => {
+                if self.refuse_write() {
+                    return;
+                }
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client.stream_ack(&key, &group, &id).await {
+                        Ok(()) => Msg::Status(format!("Acked {id}")),
+                        Err(e) => Msg::Error(format!("XACK failed: {e}")),
+                    }
+                });
+                self.load_groups();
+            }
+            Action::ClaimPending { key, group, id } => {
+                if self.refuse_write() {
+                    return;
+                }
+                let consumer = v(0).trim().to_string();
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                self.spawn(async move {
+                    match client.stream_claim(&key, &group, &consumer, &id).await {
+                        Ok(()) => Msg::Status(format!("{id} claimed by {consumer}")),
+                        Err(e) => Msg::Error(format!("XCLAIM failed: {e}")),
+                    }
+                });
+                self.load_groups();
+            }
             Action::SelectDb => {
                 if let Ok(db) = v(0).trim().parse::<i64>() {
                     self.switch_db(db);
@@ -2346,16 +3954,22 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
             }
             // Opting into the keychain on a machine without one would silently
             // lose the password.
-            if get(6) == "true"
+            if get(7) == "true"
                 && let Some(reason) = crate::secrets::unavailable_reason()
             {
                 return Some(format!("No OS keychain available here: {reason}"));
             }
-            if get(7) != "true" && [8, 9, 10].iter().any(|i| !get(*i).is_empty()) {
+            if get(8) != "true" && [9, 10, 11].iter().any(|i| !get(*i).is_empty()) {
                 return Some("Certificate files need TLS switched on".into());
             }
-            if get(9).is_empty() != get(10).is_empty() {
+            if get(10).is_empty() != get(11).is_empty() {
                 return Some("Mutual TLS needs both a client certificate and a key".into());
+            }
+            if get(15).parse::<u16>().is_err() {
+                return Some("SSH port must be a number between 0 and 65535".into());
+            }
+            if get(13).is_empty() && [14, 16].iter().any(|i| !get(*i).is_empty()) {
+                return Some("SSH settings need an SSH host".into());
             }
             None
         }
@@ -2405,6 +4019,17 @@ fn memory_report_text(state: &MemoryState) -> String {
         state.rollup.sampled(),
         state.dbsize.max(state.rollup.scanned())
     );
+    if state.show_keys {
+        for key in state.rollup.top_keys() {
+            out.push_str(&format!(
+                "{:<52} {:>12}{}\n",
+                key.key,
+                crate::memory::human_bytes(key.bytes),
+                key.freq.map(|f| format!("  freq {f}")).unwrap_or_default()
+            ));
+        }
+        return out;
+    }
     for row in state.rows() {
         out.push_str(&format!(
             "{:<40} {:>12} {:>12} {:>6.1}%\n",
@@ -2548,7 +4173,7 @@ mod tests {
         let info = crate::redis_client::ServerInfo::parse(
             "# Memory\nused_memory_human:1.20M\n\n# Stats\nkeyspace_hits:75\nkeyspace_misses:25\nexpired_keys:4\n\n# Keyspace\ndb0:keys=10,expires=2,avg_ttl=0\ndb1:keys=5,expires=1,avg_ttl=0\n",
         );
-        let mut state = InfoState::new(info);
+        let mut state = InfoState::new(info, Diagnostics::default());
         state.tab = INFO_TABS
             .iter()
             .position(|t| *t == "Key Statistics")
@@ -2563,9 +4188,12 @@ mod tests {
 
     #[test]
     fn server_tab_leads_with_an_overview_and_missing_sections_say_so() {
-        let mut state = InfoState::new(crate::redis_client::ServerInfo::parse(
-            "# Server\nredis_version:7.2.4\nredis_mode:standalone\nuptime_in_seconds:90061\nos:Linux\n",
-        ));
+        let mut state = InfoState::new(
+            crate::redis_client::ServerInfo::parse(
+                "# Server\nredis_version:7.2.4\nredis_mode:standalone\nuptime_in_seconds:90061\nos:Linux\n",
+            ),
+            Diagnostics::default(),
+        );
         let text = state.text();
         assert!(text.contains("version: redis 7.2.4 · standalone"), "{text}");
         assert!(text.contains("uptime: 1d1h"), "{text}");
@@ -2576,9 +4204,12 @@ mod tests {
 
     #[test]
     fn memory_tab_gauges_usage_against_maxmemory() {
-        let mut state = InfoState::new(crate::redis_client::ServerInfo::parse(
-            "# Memory\nused_memory:750\nused_memory_human:750B\nmaxmemory:1000\nmaxmemory_human:1000B\nmaxmemory_policy:allkeys-lru\n",
-        ));
+        let mut state = InfoState::new(
+            crate::redis_client::ServerInfo::parse(
+                "# Memory\nused_memory:750\nused_memory_human:750B\nmaxmemory:1000\nmaxmemory_human:1000B\nmaxmemory_policy:allkeys-lru\n",
+            ),
+            Diagnostics::default(),
+        );
         state.tab = 1;
         let gauge = state
             .rows()
@@ -2601,9 +4232,12 @@ mod tests {
 
     #[test]
     fn the_filter_keeps_matching_fields_and_their_headings() {
-        let mut state = InfoState::new(crate::redis_client::ServerInfo::parse(
-            "# Server\nredis_version:7.2.4\n\n# Memory\nused_memory_human:1.20M\nmem_allocator:libc\n",
-        ));
+        let mut state = InfoState::new(
+            crate::redis_client::ServerInfo::parse(
+                "# Server\nredis_version:7.2.4\n\n# Memory\nused_memory_human:1.20M\nmem_allocator:libc\n",
+            ),
+            Diagnostics::default(),
+        );
         state.tab = INFO_TABS.iter().position(|t| *t == "All").unwrap();
         state.query = "mem_alloc".into();
         assert_eq!(
@@ -2746,10 +4380,13 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
         let mut app = App::new(crate::config::Store::default(), tx);
         app.screen = Screen::Browser;
-        app.commands = ["GET", "GETDEL", "DBSIZE", "SET"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+        app.commands = CommandTable {
+            names: ["GET", "GETDEL", "DBSIZE", "SET"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            writes: ["SET", "GETDEL"].iter().map(|s| (*s).to_string()).collect(),
+        };
         app.keys = vec![info("user:1", -1), info("user:2", -1)];
         app.open_console();
         app

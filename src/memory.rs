@@ -42,6 +42,19 @@ pub struct PrefixRow {
     pub share: f64,
 }
 
+/// The biggest individual keys the sample ran into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BigKey {
+    pub key: String,
+    pub bytes: u64,
+    /// `OBJECT FREQ`, when the server runs an LFU eviction policy. `None`
+    /// everywhere else, because the counter does not exist there.
+    pub freq: Option<u64>,
+}
+
+/// How many individual keys the "biggest keys" view keeps.
+pub const TOP_KEYS: usize = 200;
+
 #[derive(Debug, Default, Clone)]
 pub struct Rollup {
     buckets: HashMap<String, Bucket>,
@@ -49,6 +62,8 @@ pub struct Rollup {
     scanned: u64,
     sampled: u64,
     bytes: u64,
+    /// Measured keys, largest first, capped at [`TOP_KEYS`].
+    top: Vec<BigKey>,
 }
 
 impl Rollup {
@@ -69,6 +84,36 @@ impl Rollup {
         } else {
             self.other.keys += 1;
         }
+    }
+
+    /// Record that `key`, already counted, measured `bytes`. `freq` is the
+    /// `OBJECT FREQ` counter where the server keeps one.
+    pub fn measure_with_freq(&mut self, key: &str, bytes: u64, freq: Option<u64>) {
+        self.record_top(key, bytes, freq);
+        self.measure(key, bytes);
+    }
+
+    /// Keep the sampled key if it is among the biggest seen so far. The list
+    /// is short, so an insertion into a sorted vector beats a heap here.
+    fn record_top(&mut self, key: &str, bytes: u64, freq: Option<u64>) {
+        if self.top.len() == TOP_KEYS && self.top.last().is_some_and(|last| last.bytes >= bytes) {
+            return;
+        }
+        let at = self.top.partition_point(|existing| existing.bytes >= bytes);
+        self.top.insert(
+            at,
+            BigKey {
+                key: key.to_string(),
+                bytes,
+                freq,
+            },
+        );
+        self.top.truncate(TOP_KEYS);
+    }
+
+    /// The biggest measured keys, largest first.
+    pub fn top_keys(&self) -> &[BigKey] {
+        &self.top
     }
 
     /// Record that `key`, already counted, measured `bytes`.
