@@ -317,6 +317,83 @@ impl Client {
         Ok(Self { conn, mgr })
     }
 
+    /// Command names for console completion. `COMMAND` works on every server
+    /// version, unlike `COMMAND LIST`, and one reply per connection is cheap.
+    pub async fn command_names(&self) -> Result<Vec<String>> {
+        let mut c = self.mgr.clone();
+        let reply: redis::Value = redis::cmd("COMMAND").query_async(&mut c).await?;
+        let redis::Value::Array(items) = reply else {
+            return Ok(Vec::new());
+        };
+        let mut names: Vec<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                // Each entry is [name, arity, flags, ...]; only the name matters.
+                redis::Value::Array(fields) => fields.first(),
+                _ => None,
+            })
+            .filter_map(|name| match name {
+                redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).to_uppercase()),
+                redis::Value::SimpleString(s) => Some(s.to_uppercase()),
+                _ => None,
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// One `SCAN` batch for the namespace memory report: every key counts
+    /// toward its prefix, every `stride`-th key is measured with
+    /// `MEMORY USAGE`. Returns true when the keyspace has been walked.
+    ///
+    /// Measuring all of a large keyspace would take hours, so the stride is
+    /// what keeps the report affordable; the sampled keys go out in one
+    /// pipeline per batch rather than one round trip each.
+    pub async fn memory_batch(
+        &self,
+        scan: &mut MemoryScan,
+        stride: u64,
+        rollup: &mut crate::memory::Rollup,
+    ) -> Result<bool> {
+        let mut c = self.mgr.clone();
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(scan.cursor)
+            .arg("COUNT")
+            .arg(500)
+            .query_async(&mut c)
+            .await?;
+        scan.cursor = next;
+        scan.started = true;
+
+        let stride = stride.max(1);
+        let mut sample: Vec<String> = Vec::new();
+        for name in batch {
+            if scan.seen.is_multiple_of(stride) {
+                sample.push(name.clone());
+            }
+            scan.seen += 1;
+            rollup.count(&name);
+        }
+
+        if !sample.is_empty() {
+            let mut pipe = redis::pipe();
+            for name in &sample {
+                pipe.cmd("MEMORY").arg("USAGE").arg(name);
+            }
+            // A server with `MEMORY USAGE` disabled still gives a useful key
+            // count, so a failed measurement is not a failed report.
+            if let Ok(sizes) = pipe.query_async::<Vec<Option<u64>>>(&mut c).await {
+                for (name, size) in sample.iter().zip(sizes) {
+                    if let Some(bytes) = size {
+                        rollup.measure(name, bytes);
+                    }
+                }
+            }
+        }
+        Ok(scan.cursor == 0)
+    }
+
     pub async fn dbsize(&self) -> Result<u64> {
         let mut c = self.mgr.clone();
         Ok(redis::cmd("DBSIZE").query_async(&mut c).await?)
@@ -752,6 +829,26 @@ fn format_score(s: f64) -> String {
 }
 
 /// Render a redis reply for the console, one line per element.
+/// Where a memory scan has got to. Held by the caller so the scan can be
+/// stopped between batches without unwinding anything.
+#[derive(Debug, Default, Clone)]
+pub struct MemoryScan {
+    cursor: u64,
+    /// Keys seen so far, which is what the sampling stride counts against.
+    seen: u64,
+    started: bool,
+}
+
+impl MemoryScan {
+    /// Fraction of the keyspace walked, judged against `dbsize`.
+    pub fn progress(&self, dbsize: u64) -> f64 {
+        if dbsize == 0 {
+            return 1.0;
+        }
+        (self.seen as f64 / dbsize as f64).min(1.0)
+    }
+}
+
 pub fn format_value(v: &redis::Value, depth: usize) -> String {
     let pad = "  ".repeat(depth);
     match v {
