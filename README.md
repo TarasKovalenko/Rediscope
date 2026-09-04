@@ -1,13 +1,19 @@
 # rediscope
 
 A terminal UI Redis client. Browse the keyspace as a folder tree, read and edit
-every value type, manage TTLs, and drop into a raw command console - in one
-static binary, no Electron and no Python runtime.
+every value type, watch TTLs count down, find out which prefix is eating your
+RAM, and drop into a raw command console. One static binary, no Electron and no
+Python runtime.
 
 Main view             |  Connections view | Server Info
 :-------------------------:|:-------------------------:|:-------------------------:
 <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/17b807bb-5ae3-452b-a879-06c9b5b828d9" />  |  <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/a0e80e28-d436-4e67-a464-155dd8563b7d" /> | <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/5d071494-37bc-44e5-b8d1-c32f691b2208" />
 
+**Contents:** [Install](#install) · [Quick start](#quick-start) ·
+[Features](#features) · [Keybindings](#keybindings) ·
+[Command line](#command-line) · [Connections and secrets](#connections-and-secrets) ·
+[Configuration](#configuration) · [Troubleshooting](#troubleshooting) ·
+[Development](#development)
 
 ## Install
 
@@ -53,83 +59,123 @@ Prebuilt targets: macOS `aarch64` / `x86_64`, Linux `x86_64` and `aarch64`
 (both glibc and musl), Windows `x86_64` and `aarch64` (MSVC). Unix builds ship
 as `.tar.gz`, Windows builds as `.zip`.
 
-On Windows use [Windows Terminal](https://aka.ms/terminal) (or any ConPTY-based
-terminal on Windows 10 1809+). The legacy `conhost` console window does not
-render the interface correctly.
+## Quick start
 
-## Run
+Connect to a local server and look around:
 
 ```sh
-rediscope                                  # start at the saved-server list
-rediscope -H 127.0.0.1 -p 6379 -n 0        # connect immediately
-rediscope --url rediss://user@host:6380/2  # or via a URL
-
-# TLS against a private CA, and mutual TLS
-rediscope -H cache.internal --tls-ca ~/certs/ca.pem
-rediscope -H cache.internal --tls-cert ~/certs/client.crt --tls-key ~/certs/client.key
+rediscope -H 127.0.0.1 -p 6379
 ```
 
-Naming any certificate implies `--tls`, so you rarely need the flag itself.
+Your first minute, in order:
 
-Pass the password through `REDISCOPE_PASSWORD` rather than `-a`: a flag is
-visible to anyone who can run `ps`.
+1. The key tree fills on the left. Keys split on `:`, so `user:42:profile` sits
+   under `user` → `42`. Move with `j` / `k`, open a folder with `Enter` or `l`.
+2. Selecting a key loads its value on the right, with its type and TTL in the
+   header. `Tab` moves focus into the value pane and back.
+3. Press `/` and type `session` to filter. A bare word becomes `*session*`;
+   write your own glob if you want something exact. `Esc` clears it.
+4. Press `e` to edit. A string opens a full editor (`Ctrl+S` saves), a hash
+   field or list item opens a small form.
+5. Press `i` for server info, `M` to see which prefix holds the memory, `:` for
+   a `redis-cli`-style console.
+6. Press `?` at any time for the full key list, `q` to quit.
+
+Run it with no arguments to start at the saved-server list instead, where `n`
+adds a connection you can reuse:
+
+```sh
+rediscope
+```
 
 ## Features
 
-- **Namespace tree** — keys grouped by `:` into collapsible folders, with a
+### Browsing
+
+- **Namespace tree.** Keys grouped by `:` into collapsible folders, with a
   per-folder key count and a type badge on every leaf.
-- **Safe listing** — `SCAN` in batches, never `KEYS *`, capped at 5,000 keys per
-  view. The header tells you when a result was truncated.
-- **Bounded value reads** — collections are read through `HSCAN`/`SSCAN` or a
+- **Safe listing.** `SCAN` in batches, never `KEYS *`, capped at 5,000 keys per
+  view. The header says so when a result was truncated, so you know to narrow
+  the pattern rather than trusting a short list.
+- **Bounded value reads.** Collections are read through `HSCAN`/`SSCAN` or a
   ranged `LRANGE`/`ZRANGE`, up to 1,000 elements, while still reporting the true
   total ("showing 1000 of 4.2M"). A million-element list will not stall the UI.
-- **Edit everything** — strings in a multi-line editor with JSON pretty-printing;
-  individual hash fields, list items, set members, sorted-set members and stream
-  entries added, edited and deleted in place.
-- **JSON values** — a string holding JSON is shown indented and syntax-coloured
-  and carries a `json` badge. The editor opens it pretty-printed, `ctrl+f`
-  reformats, and `ctrl+s` refuses to save a document that no longer parses.
-  Key order is preserved, and a value stored on one line is written back
-  minified.
-- **Structured collection values** — JSON and XML stored inside hashes, lists,
-  sets, sorted sets, or streams get a formatted preview below the collection.
-  `PgUp` / `PgDn` scrolls the selected preview while arrow keys continue moving
-  between elements.
-- **TTL management** — view, set, or drop the expiry on any key. TTLs count down
-  live and a key leaves the tree the second its expiry runs out, so nothing
-  stale sits in the view between scans.
-- **Server info** (`i`) — `INFO` in tabs: Server (version, uptime, clients and
-  key count up top), Memory (a used / `maxmemory` bar), Stats, Key Statistics
-  (per-db key and TTL counts, a hit-rate bar, expirations and evictions) and the
-  full reply. `/` filters the open section, `y` copies it.
-- **Namespace memory** (`M`) — which key prefix is holding the RAM. A background
+- **Live TTLs.** Expiries count down in place, and a key leaves the tree the
+  second it expires, so nothing stale sits in the view between scans.
+- **Search.** `/` filters by glob against the server, not just what's on screen.
+
+### Editing
+
+- **All six types.** Create a string, hash, list, set, sorted set or stream with
+  `n`, then add elements with `a`: a field and value for a hash, a value for a
+  list (`RPUSH`), a member for a set (`SADD`), a member and score for a sorted
+  set (`ZADD`), a field and value for a stream (`XADD *`).
+- **Strings in a real editor.** Multi-line, with `Ctrl+S` to save and `Esc` to
+  back out.
+- **Rows edited in place.** `e` on a hash field, list item, set member,
+  sorted-set member or stream entry opens a form; `x` deletes the selected one.
+- **Rename, delete, TTL.** `R` renames, `D` deletes after a confirmation, `t`
+  sets an expiry in seconds or clears it when left blank.
+- **JSON values.** A string holding JSON is shown indented and syntax-coloured
+  with a `json` badge. The editor opens it pretty-printed, `Ctrl+F` reformats,
+  and `Ctrl+S` refuses to save a document that no longer parses. Key order is
+  preserved, and a value stored on one line is written back minified.
+- **JSON and XML inside collections.** Structured elements of a hash, list, set,
+  sorted set or stream get a formatted preview below the collection. `PgUp` /
+  `PgDn` scrolls that preview while the arrow keys keep moving between elements.
+
+### Diagnosing
+
+- **Server info** (`i`). `INFO` in five tabs: Server (version, uptime, clients
+  and key count up top), Memory (a used / `maxmemory` bar), Stats, Key
+  Statistics (per-db key and TTL counts, a hit-rate bar, expirations and
+  evictions) and the full raw reply. `/` filters the open section, `y` copies
+  it, `r` re-reads.
+- **Namespace memory** (`M`). Which key prefix is holding the RAM. A background
   `SCAN` counts every key and measures an evenly spaced sample with
   `MEMORY USAGE`, so a multi-million-key server answers in seconds instead of
-  hours. Prefixes are ranked by estimated size with a share bar, `1` `2` `3`
-  regroup by one, two or three name segments without rescanning, and the header
-  always says how much of the keyspace the estimate is based on.
-- **Raw command console** (`:`) with history that survives a restart, `ctrl+r`
-  reverse search, `Tab` completion of command names and of keys already on
-  screen, and a confirmation prompt in front of `FLUSHALL`, `FLUSHDB`,
-  `SHUTDOWN` and friends. Commands carrying a password (`AUTH`, `HELLO ... AUTH`,
+  hours. The table fills in as the scan runs. Prefixes are ranked by estimated
+  size with a share bar, `1` `2` `3` regroup by one, two or three name segments
+  without rescanning, and the header always says how much of the keyspace the
+  estimate is based on. Past 5,000 distinct prefixes the tail is pooled into
+  `(other prefixes)` so a `user:<id>` scheme cannot explode the table.
+- **Raw command console** (`:`). Anything `redis-cli` takes, with history that
+  survives a restart (500 commands), `Ctrl+R` reverse search, and `Tab`
+  completion of command names and of keys already on screen. `FLUSHALL`,
+  `FLUSHDB`, `SHUTDOWN`, `DEBUG`, `SCRIPT`, `RESET` and `SWAPDB` ask first.
+  Commands carrying a password (`AUTH`, `HELLO ... AUTH`,
   `CONFIG SET requirepass`) are never written to the history file.
-- **Connection manager** — add, edit, duplicate (`c`), reorder (`J`/`K`), filter
+
+### Connecting
+
+- **Connection manager.** Add, edit, duplicate (`c`), reorder (`J`/`K`), filter
   (`/`), and test (`T`) saved servers. A test reports round-trip latency, the
   server version and its key count without opening the connection.
-- **Colour themes** (`p`) — preview and choose Redis, Dracula, Catppuccin Mocha,
-  Nord, Gruvbox Dark, or Tokyo Night. The choice is saved and restored on the
-  next run.
-- **TLS** — a private CA, mutual TLS with a client certificate and key, or an
+- **TLS.** A private CA, mutual TLS with a client certificate and key, or an
   explicit skip-verify for a self-signed dev server. Profiles show `TLS`,
   `no-verify` and `keychain` badges in the list.
-- **Password handling** — profiles are stored `0600` in your config dir (on
-  Windows, under `%APPDATA%`, which is already per-user). A
-  password of `${SOME_ENV_VAR}` is resolved from the environment at connect
-  time, or the profile can keep its secret in the OS keychain (macOS Keychain,
-  Windows Credential Manager, freedesktop Secret Service) so the file holds no
-  secret at all.
-- **Non-blocking** — every Redis call runs off the render loop, so the interface
+- **Password handling.** Profiles are stored `0600` in your config dir (on
+  Windows, under `%APPDATA%`, which is already per-user). A password of
+  `${SOME_ENV_VAR}` is resolved from the environment at connect time, or the
+  profile can keep its secret in the OS keychain (macOS Keychain, Windows
+  Credential Manager, freedesktop Secret Service) so the file holds no secret at
+  all.
+- **Database switching.** `Ctrl+D` picks another index and reconnects.
+- **ACL usernames.** Redis 6+ `user` / `password` pairs, per profile or via
+  `-u`.
+
+### Comfort
+
+- **Colour themes** (`p`). Preview and choose Redis, Dracula, Catppuccin Mocha,
+  Nord, Gruvbox Dark, or Tokyo Night. Arrow keys preview live, `Enter` saves the
+  choice for the next run, `Esc` puts the old one back.
+- **Clipboard over OSC 52.** `y` copies the key name, the open info tab or the
+  memory report straight through SSH and tmux, with no system clipboard tool
+  installed.
+- **Non-blocking.** Every Redis call runs off the render loop, so the interface
   stays responsive against slow or distant servers.
+- **Tiny terminals.** The layout is tested down to 10×5, so a split pane still
+  renders something usable.
 
 ## Keybindings
 
@@ -146,47 +192,109 @@ Press `?` in the app for this list at any time.
 | `T` | Test the connection without opening it |
 | `/` | Filter by name or host · `Esc` clears the filter |
 | `p` | Preview and choose a colour theme |
-| `q` | Quit |
+| `?` / `q` | Help / quit |
 
 ### Key browser
 | Key | Action |
 |---|---|
-| `j` `k` `↑` `↓` | Move · `g` / `G` jump to top / bottom |
+| `j` `k` `↑` `↓` | Move · `PgUp` `PgDn` jump 10 · `g` `G` (`Home` `End`) top / bottom |
 | `h` `l` `←` `→` | Collapse / expand folder |
-| `Enter` | Toggle a folder, or jump into the value pane |
+| `Enter` / `Space` | Toggle a folder, or jump into the value pane |
 | `Tab` | Switch between the key tree and the value pane |
-| `/` | Search by pattern — a bare word becomes `*word*` |
+| `/` | Search by pattern. A bare word becomes `*word*` |
 | `Esc` | Clear the search pattern |
 | `n` `D` `R` | New key · delete key · rename key |
 | `t` | Set or clear TTL |
-| `y` | Copy the selected key name to the clipboard (OSC 52) |
-| `r` | Refresh |
-| `e` | Edit — a string opens the editor, a row opens a form |
-| `Ctrl+F` | Reformat JSON in the editor (`Ctrl+S` validates before saving) |
-| `PgUp` `PgDn` | Scroll the selected JSON or XML collection preview |
+| `y` | Copy the selected key name to the clipboard |
+| `r` | Refresh keys and the open value |
+| `e` | Edit. A string opens the editor, a row opens a form |
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
-| `i` | Server info — Server / Memory / Stats / Key Statistics / All, with `/` to filter |
-| `M` | Namespace memory — `1` `2` `3` set the depth, `r` rescans, `y` copies |
-| `p` | Preview and choose a colour theme |
+| `PgUp` `PgDn` | Scroll the selected JSON or XML preview |
+| `i` | Server info |
+| `M` | Namespace memory report |
+| `p` | Colour theme picker |
 | `:` | Raw command console |
-| `Ctrl+D` | Switch database |
+| `Ctrl+D` | Switch database (reconnects) |
 | `Ctrl+N` | Back to the server list |
 | `?` / `q` | Help / quit |
 
-In server info: `Tab` / `←` `→` / `1`-`5` change section, `/` filters it, `↑` `↓`
-`PgUp` `PgDn` `g` `G` scroll, `y` copies the open tab, `r` re-reads `INFO`, `Esc`
-clears the filter and then closes.
+### Server info (`i`)
+| Key | Action |
+|---|---|
+| `Tab` `←` `→` `h` `l` / `1`-`5` | Change section |
+| `↑` `↓` `j` `k` `PgUp` `PgDn` `g` `G` | Scroll |
+| `/` | Filter the open section |
+| `y` | Copy the open tab |
+| `r` | Re-read `INFO` |
+| `Esc` / `q` | Clear the filter, then close |
 
-In the console: `↑` `↓` walk the history, `Ctrl+R` searches it backwards (again
-steps further back, `Enter` accepts, `Esc` returns to what you were typing), and
-`Tab` completes the command name or, after it, a key name from the tree.
+### Namespace memory (`M`)
+| Key | Action |
+|---|---|
+| `1` `2` `3` | Group by one, two or three name segments |
+| `↑` `↓` `j` `k` / `g` | Scroll · back to the top |
+| `r` | Rescan |
+| `y` | Copy the report |
+| `Esc` / `q` | Cancel the scan and close |
 
-Dialogs: `Esc` cancels, `Enter` confirms, `Ctrl+S` saves in the multi-line
-editor, `Tab` moves between fields, `Space` toggles a switch.
+### Console (`:`)
+| Key | Action |
+|---|---|
+| `Enter` | Run the command |
+| `↑` `↓` | Walk the history |
+| `Ctrl+R` | Reverse search. Again steps further back, `Enter` accepts, `Esc` restores the line you were typing |
+| `Tab` | Complete a command name, or after it a key name from the tree |
+| `Esc` | Close the console |
 
-In the theme picker, `↑` / `↓` (or `j` / `k`) previews a theme immediately,
-`Enter` saves it, and `Esc` restores the previous theme.
+### Editor and dialogs
+| Key | Action |
+|---|---|
+| `Ctrl+S` | Save (validates JSON first) |
+| `Ctrl+F` | Reformat JSON |
+| `Tab` / `↑` `↓` | Move between form fields |
+| `Space` | Toggle a switch · `←` `→` picks a choice |
+| `Enter` | Confirm |
+| `Esc` | Cancel |
+
+### Theme picker (`p`)
+`↑` `↓` (or `j` `k`) previews a theme immediately, `Enter` saves it, `Esc`
+restores the previous one.
+
+## Command line
+
+```sh
+rediscope                                  # start at the saved-server list
+rediscope -H 127.0.0.1 -p 6379 -n 0        # connect immediately
+rediscope --url rediss://user@host:6380/2  # or via a URL
+
+# TLS against a private CA, and mutual TLS
+rediscope -H cache.internal --tls-ca ~/certs/ca.pem
+rediscope -H cache.internal --tls-cert ~/certs/client.crt --tls-key ~/certs/client.key
+```
+
+| Flag | Meaning |
+|---|---|
+| `-H`, `--host` | Redis host. Given, rediscope connects straight away and skips the server list |
+| `-p`, `--port` | Port (default `6379`) |
+| `-n`, `--db` | Database index (default `0`) |
+| `-u`, `--username` | ACL username (Redis 6+) |
+| `-a`, `--password` | Password. Prefer `REDISCOPE_PASSWORD` |
+| `--url` | `redis://` or `rediss://` URL. Overrides the other flags |
+| `--tls` | Connect over TLS |
+| `--tls-ca FILE` | PEM root certificate for a private CA |
+| `--tls-cert FILE` | PEM client certificate (needs `--tls-key`) |
+| `--tls-key FILE` | PEM client key (needs `--tls-cert`) |
+| `--tls-insecure` | Accept any server certificate. Dev servers only |
+| `--config-path` | Print the connections file path and exit |
+| `-V`, `--version` | Version |
+
+Naming any certificate implies `--tls`, so you rarely need the flag itself.
+
+| Environment variable | Meaning |
+|---|---|
+| `REDISCOPE_PASSWORD` | Password, instead of `-a`. A flag is visible to anyone who can run `ps` |
+| `REDISCOPE_HOME` | Config directory, overriding the platform default |
 
 ## Connections and secrets
 
@@ -205,28 +313,54 @@ Passwords resolve in one of three ways:
 
 With the keychain switch on, leaving the password field blank keeps whatever is
 already stored, and renaming a profile migrates its entry. Switching it off
-removes the entry. If no keychain is available — a headless Linux box with no
-Secret Service — the form says so and refuses the switch rather than losing the
+removes the entry. If no keychain is available, say a headless Linux box with no
+Secret Service, the form says so and refuses the switch rather than losing the
 password silently.
 
 ## Configuration
 
 Saved connections live in `connections.json` under your platform config dir, and
-the console keeps its history beside it in `history` (mode `0600`, 500 commands) —
-`~/.config/rediscope` on Linux, `~/Library/Application Support/rediscope` on
-macOS, `%APPDATA%\rediscope` on Windows. Override the directory with
+the console keeps its history beside it in `history` (mode `0600`, 500 commands).
+That's `~/.config/rediscope` on Linux, `~/Library/Application Support/rediscope`
+on macOS, `%APPDATA%\rediscope` on Windows. Override the directory with
 `REDISCOPE_HOME`, or print the exact path:
 
 ```sh
 rediscope --config-path
 ```
 
-The file is written atomically — a scratch file renamed over the old one, with
-the previous version kept as `connections.json.bak` — so an interrupted save
+The same file keeps your theme, so the colours come back on the next run.
+
+The file is written atomically: a scratch file renamed over the old one, with
+the previous version kept as `connections.json.bak`, so an interrupted save
 cannot truncate it. A file that exists but does not parse is moved aside as
 `connections.json.bad-<timestamp>` rather than replaced, and a file that cannot
 be read at all disables saving for the session instead of overwriting profiles
 that are still on disk.
+
+## Troubleshooting
+
+**The interface renders as garbage on Windows.** Use
+[Windows Terminal](https://aka.ms/terminal), or any ConPTY-based terminal on
+Windows 10 1809+. The legacy `conhost` console window cannot draw it.
+
+**`y` copies nothing.** Copying uses the OSC 52 escape, which your terminal has
+to allow. iTerm2, WezTerm, Kitty, Alacritty and Windows Terminal do by default;
+tmux needs `set -g allow-passthrough on`, and some terminals hide the setting
+under "allow clipboard access".
+
+**The key list looks short.** A view is capped at 5,000 keys and the header says
+when it was truncated. Narrow it with `/`.
+
+**A collection shows fewer elements than it has.** Reads stop at 1,000 elements
+on purpose; the header carries the real total.
+
+**The memory report says it sampled a small share.** That's the honest basis for
+the estimate on a big keyspace, not an error. Let it run longer, or read the
+numbers as the ranking they are.
+
+**The keychain switch refuses to turn on.** No Secret Service is running, which
+is normal on a headless Linux box. Use `${SOME_ENV_VAR}` for that profile.
 
 ## Development
 
@@ -250,7 +384,7 @@ down to 10×5, which is what keeps the layout arithmetic honest.
 
 ## Releasing
 
-Tag and push — `.github/workflows/release.yml` cross-builds every target,
+Tag and push. `.github/workflows/release.yml` cross-builds every target,
 publishes the tarballs and Windows zips plus `SHA256SUMS`, and that is what
 `install.sh` and `install.ps1` read.
 
