@@ -91,6 +91,10 @@ visible to anyone who can run `ps`.
   reformats, and `ctrl+s` refuses to save a document that no longer parses.
   Key order is preserved, and a value stored on one line is written back
   minified.
+- **Structured collection values** — JSON and XML stored inside hashes, lists,
+  sets, sorted sets, or streams get a formatted preview below the collection.
+  `PgUp` / `PgDn` scrolls the selected preview while arrow keys continue moving
+  between elements.
 - **TTL management** — view, set, or drop the expiry on any key. TTLs count down
   live and a key leaves the tree the second its expiry runs out, so nothing
   stale sits in the view between scans.
@@ -150,6 +154,7 @@ Press `?` in the app for this list at any time.
 | `r` | Refresh |
 | `e` | Edit — a string opens the editor, a row opens a form |
 | `Ctrl+F` | Reformat JSON in the editor (`Ctrl+S` validates before saving) |
+| `PgUp` `PgDn` | Scroll the selected JSON or XML collection preview |
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
 | `i` | Server info — Server / Memory / Stats / Key Statistics / All, with `/` to filter |

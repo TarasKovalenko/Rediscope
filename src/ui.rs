@@ -6,6 +6,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Table, Wrap,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, ConsoleState, Field, FieldKind, Focus, InfoRow, InfoState, Modal, Screen, INFO_TABS,
@@ -323,7 +324,6 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     f.render_widget(header.block(panel("Key", false, palette)), rows[0]);
 
     let focused = app.focus == Focus::Value;
-    let block = panel("Value", focused, palette);
     match &app.value {
         None => f.render_widget(
             Paragraph::new(if app.current.is_some() {
@@ -332,7 +332,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 ""
             })
             .style(Style::new().fg(palette.dim))
-            .block(block),
+            .block(panel("Value", focused, palette)),
             rows[1],
         ),
         Some(KeyValue::Str(s)) => {
@@ -341,7 +341,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 Paragraph::new(text)
                     .wrap(Wrap { trim: false })
                     .scroll((app.value_scroll, 0))
-                    .block(block),
+                    .block(panel("Value", focused, palette)),
                 rows[1],
             );
         }
@@ -349,7 +349,7 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             Paragraph::new(msg.clone())
                 .wrap(Wrap { trim: true })
                 .style(Style::new().fg(palette.dim))
-                .block(block),
+                .block(panel("Value", focused, palette)),
             rows[1],
         ),
         Some(KeyValue::Rows {
@@ -378,9 +378,20 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                     )
                 })
                 .collect();
+
+            let preview = app
+                .selected_value_row()
+                .and_then(|row| structured_document(&row.cells, palette));
+            let show_preview = preview.is_some() && rows[1].height >= 10;
+            let panes = show_preview.then(|| {
+                Layout::vertical([Constraint::Percentage(38), Constraint::Percentage(62)])
+                    .split(rows[1])
+            });
+            let table_area = panes.as_ref().map_or(rows[1], |areas| areas[0]);
+            let table_title = if show_preview { "Elements" } else { "Value" };
             let table = Table::new(body, widths)
                 .header(header_row)
-                .block(block)
+                .block(panel(table_title, focused, palette))
                 .row_highlight_style(if focused {
                     Style::new()
                         .bg(palette.accent)
@@ -389,7 +400,18 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 } else {
                     Style::new().bg(palette.panel)
                 });
-            f.render_stateful_widget(table, rows[1], &mut app.value_state);
+            f.render_stateful_widget(table, table_area, &mut app.value_state);
+
+            if let (Some((kind, text)), Some(areas)) = (preview, panes) {
+                let title = format!("Selected {kind} · PgUp/PgDn scroll");
+                f.render_widget(
+                    Paragraph::new(text)
+                        .wrap(Wrap { trim: false })
+                        .scroll((app.value_scroll, 0))
+                        .block(panel(&title, false, palette)),
+                    areas[1],
+                );
+            }
         }
     }
 }
@@ -464,7 +486,7 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let Some(m) = &app.modal else { return };
     match m {
         Modal::Help => {
-            let rect = centered(area, 74, 31);
+            let rect = centered(area, 74, 32);
             clear_area(f, rect, palette);
             f.render_widget(
                 Paragraph::new(help_text(palette))
@@ -531,17 +553,23 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         } => {
             let rect = centered(area, 90, 26);
             clear_area(f, rect, palette);
-            let editor_title = if mode.is_json() {
-                format!("{title} — ctrl+s saves, ctrl+f formats, esc cancels")
+            let editor_title = truncate(title, rect.width.saturating_sub(4) as usize);
+            let controls = if mode.is_json() {
+                "ctrl+s saves · ctrl+f formats · esc cancels"
             } else {
-                format!("{title} — ctrl+s saves, esc cancels")
+                "ctrl+s saves · esc cancels"
             };
             let block = panel(&editor_title, true, palette);
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+            let rows = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
             f.render_widget(&**textarea, rows[0]);
-            let footer = match (error, mode.is_json()) {
+            let status = match (error, mode.is_json()) {
                 (Some(e), _) => Span::styled(
                     format!("invalid JSON — {e}"),
                     Style::new().fg(palette.red).bold(),
@@ -552,7 +580,11 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 ),
                 (None, false) => Span::raw(""),
             };
-            f.render_widget(Line::from(footer), rows[1]);
+            f.render_widget(Line::from(status), rows[1]);
+            f.render_widget(
+                Line::from(Span::styled(controls, Style::new().fg(palette.dim))).right_aligned(),
+                rows[2],
+            );
         }
         Modal::Console(state) => console(f, area, state, palette),
         Modal::Info(state) => server_info(f, area, state, palette),
@@ -580,7 +612,8 @@ fn form(f: &mut Frame, area: Rect, view: FormView<'_>, palette: Palette) {
     // +2 borders, +1 hint line.
     let rect = centered(area, 68, content_height + 3);
     clear_area(f, rect, palette);
-    let block = panel(title, true, palette);
+    let title = truncate(title, rect.width.saturating_sub(4) as usize);
+    let block = panel(&title, true, palette);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -981,11 +1014,39 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn truncate(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
+    if UnicodeWidthStr::width(s) <= width {
         s.to_string()
+    } else if width == 0 {
+        String::new()
     } else {
-        s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+        let mut used = 0;
+        let mut result = String::new();
+        for ch in s.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + ch_width > width - 1 {
+                break;
+            }
+            used += ch_width;
+            result.push(ch);
+        }
+        result.push('…');
+        result
     }
+}
+
+fn structured_document(
+    cells: &[String],
+    palette: Palette,
+) -> Option<(&'static str, Text<'static>)> {
+    for cell in cells {
+        if json::mode(cell).is_json() {
+            return Some(("JSON", json_text(cell, palette)));
+        }
+        if let Some(pretty) = crate::xml::pretty(cell) {
+            return Some(("XML", Text::raw(pretty)));
+        }
+    }
+    None
 }
 
 fn type_color(kind: KeyType, palette: Palette) -> Color {
@@ -1123,6 +1184,7 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         ),
         row("a", "add an element (hash / list / set / zset / stream)"),
         row("x", "delete the selected element"),
+        row("PgUp / PgDn", "scroll the selected JSON / XML preview"),
         head("Server"),
         row(
             "i",
@@ -1157,5 +1219,22 @@ mod tests {
     #[test]
     fn flattens_control_characters_in_cells() {
         assert_eq!(one_line("a\nb\tc"), "a b c");
+    }
+
+    #[test]
+    fn long_modal_titles_fit_inside_the_border() {
+        let title = truncate(
+            "Edit JSON 'medinsight:data-protection:keys:with:a:very:long:suffix'",
+            56,
+        );
+        assert!(UnicodeWidthStr::width(title.as_str()) <= 56, "{title}");
+        assert!(title.contains('…'), "{title}");
+    }
+
+    #[test]
+    fn truncation_uses_terminal_columns_not_character_count() {
+        let text = truncate("keys:🔑🔑🔑", 9);
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 9, "{text}");
+        assert!(text.ends_with('…'));
     }
 }

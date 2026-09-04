@@ -23,6 +23,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6"
 futures = "0.3"
 keyring = "4"
+quick-xml = "0.38.4"
 ratatui = "0.29"
 redis = { version = "1", default-features = false, features = ["tokio-comp", "tls-rustls", "tls-rustls-insecure", "tokio-rustls-comp", "tls-rustls-webpki-roots", "streams", "acl", "script"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
