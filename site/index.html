@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rediscope — a terminal UI Redis client</title>
+<meta name="description" content="Browse the Redis keyspace as a folder tree, edit every value type, watch TTLs count down, find out which prefix is eating your RAM. One static binary.">
+<meta property="og:title" content="rediscope">
+<meta property="og:description" content="A terminal UI Redis client. Browse the keyspace as a tree, edit every value type, run raw commands. One static binary.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="screenshots/browser.svg">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23bb9af7'/><text x='16' y='23' font-size='19' font-family='monospace' text-anchor='middle' fill='%231a1b26'>r</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="bar">
+  <a class="brand" href="#top">rediscope</a>
+  <nav>
+    <a href="#screens">Screens</a>
+    <a href="#features">Features</a>
+    <a href="#keys">Keys</a>
+    <a href="#install">Install</a>
+    <a class="ghost" href="https://github.com/TarasKovalenko/Rediscope">GitHub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+<section class="hero">
+  <p class="eyebrow">v__VERSION__ · MIT · macOS, Linux, Windows</p>
+  <h1>A Redis client that lives in your terminal.</h1>
+  <p class="lede">
+    Browse the keyspace as a folder tree, read and edit every value type, watch
+    TTLs count down, find out which prefix is eating your RAM, and drop into a
+    raw command console. One static binary. No Electron, no Python runtime.
+  </p>
+
+  <div class="install-quick">
+    <code id="quick-install">curl -fsSL https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.sh | sh</code>
+    <button class="copy" data-copy="#quick-install" type="button">Copy</button>
+  </div>
+
+  <p class="hero-links">
+    <a class="button" href="#install">All install options</a>
+    <a class="button ghost" href="https://github.com/TarasKovalenko/Rediscope/releases">Releases</a>
+  </p>
+
+  <figure class="hero-shot">
+    <img src="screenshots/browser.svg" alt="The rediscope key browser: a folder tree of Redis keys on the left, a formatted JSON value on the right." width="1268" height="590" loading="eager">
+  </figure>
+</section>
+
+<section id="screens" class="screens">
+  <h2>Every screen</h2>
+  <p class="section-lede">Real renders, generated straight from the app.</p>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected="false" data-shot="browser">Key browser</button>
+    <button role="tab" aria-selected="true" data-shot="connections">Server list</button>
+    <button role="tab" aria-selected="false" data-shot="server-info">Server info</button>
+    <button role="tab" aria-selected="false" data-shot="memory">Memory report</button>
+    <button role="tab" aria-selected="false" data-shot="pubsub">Pub/Sub feed</button>
+    <button role="tab" aria-selected="false" data-shot="editor">Value editor</button>
+  </div>
+
+  <figure class="shot" data-shot-panel>
+    <img src="screenshots/connections.svg" alt="Server list." width="1268" height="590" loading="lazy">
+    <figcaption>Saved profiles, each showing what it is: TLS, a keychain password, an SSH tunnel, and the read-only flag that refuses every write.</figcaption>
+  </figure>
+
+  <noscript>
+    <figure class="shot"><img src="screenshots/browser.svg" alt="The key browser." loading="lazy"><figcaption>Keys as a folder tree.</figcaption></figure>
+    <figure class="shot"><img src="screenshots/server-info.svg" alt="The server info dialog." loading="lazy"><figcaption>Server info, in sections.</figcaption></figure>
+    <figure class="shot"><img src="screenshots/memory.svg" alt="The namespace memory report." loading="lazy"><figcaption>Which prefix holds the RAM.</figcaption></figure>
+    <figure class="shot"><img src="screenshots/pubsub.svg" alt="The pub/sub feed." loading="lazy"><figcaption>The pub/sub feed.</figcaption></figure>
+    <figure class="shot"><img src="screenshots/editor.svg" alt="The JSON value editor." loading="lazy"><figcaption>Editing a JSON value.</figcaption></figure>
+  </noscript>
+</section>
+
+<section id="features" class="features">
+  <h2>What it does</h2>
+  <div class="grid">
+
+    <article>
+      <h3>Browse</h3>
+      <ul>
+        <li>The keyspace as a folder tree, split on <code>:</code>, with a count on every folder.</li>
+        <li><kbd>/</kbd> searches by pattern, <kbd>F</kbd> searches inside values.</li>
+        <li>Live TTLs: keys leave the tree as they expire.</li>
+        <li>Scans, never <code>KEYS</code>, so a big keyspace stays responsive.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Edit</h3>
+      <ul>
+        <li>Every type: strings, hashes, lists, sets, sorted sets, streams, JSON.</li>
+        <li>JSON is checked before it is saved, and reformatted on request.</li>
+        <li>Rename, re-TTL, copy and delete, one key or a marked batch.</li>
+        <li>Export and import keys with their TTLs, as <code>DUMP</code> payloads.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Diagnose</h3>
+      <ul>
+        <li>Server info in sections: memory, stats, clients, config, latency, cluster.</li>
+        <li>A namespace memory report: which prefix is holding the RAM, and how much of the keyspace the answer is based on.</li>
+        <li>Slow log and client list, with a kill on the selected client.</li>
+        <li>A pub/sub feed with a live rate sparkline and a per-channel breakdown.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Operate</h3>
+      <ul>
+        <li>A raw command console with completion, history and reverse search.</li>
+        <li>Consumer groups: pending entries, lag, ack and claim, to unstick a dead worker.</li>
+        <li>Lua scripts over the keys you marked.</li>
+        <li>Keyspace notifications as a live feed.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Connect</h3>
+      <ul>
+        <li>TLS and mutual TLS, with your own CA.</li>
+        <li>SSH tunnels, for a cache behind a bastion.</li>
+        <li>Passwords in the OS keychain, or from <code>${VAR}</code> at connect time.</li>
+        <li>A read-only flag per profile that refuses every write.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Feel</h3>
+      <ul>
+        <li>Six colour themes, previewed live.</li>
+        <li>Clipboard over OSC 52, so copying works through SSH and tmux.</li>
+        <li>Every call runs off the render loop: the UI never blocks on the network.</li>
+        <li>Tested down to a 10×5 terminal.</li>
+      </ul>
+    </article>
+
+  </div>
+</section>
+
+<section id="keys" class="keys">
+  <h2>Keys worth knowing</h2>
+  <div class="key-columns">
+    <table>
+      <caption>Browsing</caption>
+      <tbody>
+        <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>Move · <kbd>→</kbd> <kbd>←</kbd> open and fold a prefix</td></tr>
+        <tr><td><kbd>/</kbd></td><td>Search by pattern</td></tr>
+        <tr><td><kbd>F</kbd></td><td>Find a string inside values</td></tr>
+        <tr><td><kbd>Tab</kbd></td><td>Switch pane</td></tr>
+        <tr><td><kbd>m</kbd> <kbd>u</kbd></td><td>Mark a key · clear the marks</td></tr>
+        <tr><td><kbd>y</kbd></td><td>Copy the key name</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <caption>Changing things</caption>
+      <tbody>
+        <tr><td><kbd>n</kbd> <kbd>e</kbd></td><td>New key · edit the value</td></tr>
+        <tr><td><kbd>a</kbd> <kbd>x</kbd></td><td>Add an element · delete one</td></tr>
+        <tr><td><kbd>t</kbd> <kbd>R</kbd></td><td>Set a TTL · rename</td></tr>
+        <tr><td><kbd>D</kbd></td><td>Delete, with a confirmation</td></tr>
+        <tr><td><kbd>w</kbd> <kbd>I</kbd></td><td>Export · import</td></tr>
+        <tr><td><kbd>L</kbd></td><td>Run a Lua script over the marked keys</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <caption>Looking around</caption>
+      <tbody>
+        <tr><td><kbd>i</kbd></td><td>Server info</td></tr>
+        <tr><td><kbd>M</kbd></td><td>Namespace memory report</td></tr>
+        <tr><td><kbd>P</kbd> <kbd>N</kbd></td><td>Pub/sub feed · keyspace events</td></tr>
+        <tr><td><kbd>S</kbd></td><td>Consumer groups of a stream</td></tr>
+        <tr><td><kbd>:</kbd></td><td>Raw command console</td></tr>
+        <tr><td><kbd>?</kbd></td><td>Every other key</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="install" class="install">
+  <h2>Install</h2>
+
+  <div class="install-grid">
+    <div class="card">
+      <h3>macOS and Linux</h3>
+      <div class="snippet">
+        <code id="i-unix">curl -fsSL https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.sh | sh</code>
+        <button class="copy" data-copy="#i-unix" type="button">Copy</button>
+      </div>
+      <p>Downloads the binary for your platform into <code>~/.local/bin</code>.</p>
+    </div>
+
+    <div class="card">
+      <h3>Windows</h3>
+      <div class="snippet">
+        <code id="i-win">irm https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.ps1 | iex</code>
+        <button class="copy" data-copy="#i-win" type="button">Copy</button>
+      </div>
+      <p>PowerShell 5 or later.</p>
+    </div>
+
+    <div class="card">
+      <h3>From crates.io</h3>
+      <div class="snippet">
+        <code id="i-cargo">cargo install rediscope</code>
+        <button class="copy" data-copy="#i-cargo" type="button">Copy</button>
+      </div>
+      <p>Needs a Rust toolchain, 1.88 or later.</p>
+    </div>
+
+    <div class="card">
+      <h3>Then</h3>
+      <div class="snippet">
+        <code id="i-run">rediscope</code>
+        <button class="copy" data-copy="#i-run" type="button">Copy</button>
+      </div>
+      <p>Or go straight at a server: <code>rediscope redis://cache:6379/0</code>. Prebuilt binaries and checksums are on the <a href="https://github.com/TarasKovalenko/Rediscope/releases">releases page</a>.</p>
+    </div>
+  </div>
+
+  <p class="note">
+    <strong>Your credentials stay yours.</strong> Profiles live in a
+    <code>0600</code> file in your config directory. A password can sit in the OS
+    keychain or come from an environment variable at connect time, so nothing
+    has to be written down, and console history drops any line carrying a
+    secret.
+  </p>
+</section>
+
+</main>
+
+<footer>
+  <p>
+    <a href="https://github.com/TarasKovalenko/Rediscope">Source</a> ·
+    <a href="https://github.com/TarasKovalenko/Rediscope/issues">Issues</a> ·
+    <a href="https://crates.io/crates/rediscope">crates.io</a> ·
+    MIT licensed
+  </p>
+  <p class="dim">Built with ratatui. Screenshots generated from the app itself.</p>
+</footer>
+
+<script src="app.js" defer></script>
+</body>
+</html>

@@ -3,3 +3,6 @@
 
 .DS_Store
 dump.rdb
+# Assembled by the pages workflow.
+_site/
+site/screenshots/

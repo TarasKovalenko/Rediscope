@@ -1,0 +1,73 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "docs/screenshots/**"
+      - "Cargo.toml"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - "docs/screenshots/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Pages needs these; nothing else in the job writes to the repository.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and let a running one finish so a half-uploaded
+# artifact is never what the site serves.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -r site/. _site/
+          # The screenshots are generated into docs/ by `cargo run --example
+          # screenshots`, and stay there as the single source of truth.
+          cp -r docs/screenshots _site/screenshots
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          sed -i "s/__VERSION__/${version}/g" _site/index.html
+          if grep -q "__VERSION__" _site/index.html; then
+            echo "the version placeholder survived substitution" >&2
+            exit 1
+          fi
+          for file in index.html style.css app.js screenshots/browser.svg; do
+            if [ ! -s "_site/${file}" ]; then
+              echo "missing or empty: ${file}" >&2
+              exit 1
+            fi
+          done
+          echo "built site for v${version}"
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  # Pull requests build the artifact and stop there, so a broken page cannot
+  # reach the site.
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

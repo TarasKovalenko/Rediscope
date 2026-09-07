@@ -13,6 +13,8 @@ Python runtime.
 | **Pub/Sub feed** | **Value editor** |
 | <img src="docs/screenshots/pubsub.svg" alt="The pub/sub feed with a rate sparkline, channel breakdown and a JSON preview"> | <img src="docs/screenshots/editor.svg" alt="Editing a JSON value, checked before it is saved"> |
 
+**[taraskovalenko.github.io/Rediscope](https://taraskovalenko.github.io/Rediscope/)** — install commands, every screen, and the keys worth knowing.
+
 **Contents:** [Install](#install) · [Quick start](#quick-start) ·
 [Features](#features) · [Keybindings](#keybindings) ·
 [Command line](#command-line) · [Connections and secrets](#connections-and-secrets) ·
@@ -515,6 +517,13 @@ has the exact `openssl` and `redis-server` invocations. Point it at them with
 `REDISCOPE_TLS_PORT`, `REDISCOPE_MTLS_PORT` and `REDISCOPE_CERTS`. Every suite
 skips itself when its environment variables are absent, so a bare `cargo test`
 always works.
+
+The landing page is `site/`: one hand-written HTML file, a stylesheet and 30
+lines of JavaScript, with no build step. `.github/workflows/pages.yml` copies
+`docs/screenshots/` in beside it, substitutes the version from `Cargo.toml`, and
+publishes to GitHub Pages on every push to `main`. Preview it locally with any
+static server, e.g. `python3 -m http.server -d site`, after copying the
+screenshots into `site/screenshots/`.
 
 The README screenshots are generated, not captured. `cargo run --example
 screenshots` seeds a synthetic keyspace into database 9 of a local server,
