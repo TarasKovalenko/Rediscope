@@ -5,9 +5,15 @@ every value type, watch TTLs count down, find out which prefix is eating your
 RAM, and drop into a raw command console. One static binary, no Electron and no
 Python runtime.
 
-Main view             |  Connections view | Server Info
-:-------------------------:|:-------------------------:|:-------------------------:
-<img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/17b807bb-5ae3-452b-a879-06c9b5b828d9" />  |  <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/a0e80e28-d436-4e67-a464-155dd8563b7d" /> | <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/5d071494-37bc-44e5-b8d1-c32f691b2208" />
+| Key browser | Server list |
+|---|---|
+| <img src="docs/screenshots/browser.svg" alt="Browsing the keyspace as a tree, with a JSON value open"> | <img src="docs/screenshots/connections.svg" alt="The saved connection list, showing TLS, keychain, read-only and SSH profiles"> |
+| **Server info** | **Namespace memory** |
+| <img src="docs/screenshots/server-info.svg" alt="The server info dialog with its section tabs"> | <img src="docs/screenshots/memory.svg" alt="The namespace memory report, showing which prefixes hold the RAM"> |
+| **Pub/Sub feed** | **Value editor** |
+| <img src="docs/screenshots/pubsub.svg" alt="The pub/sub feed with a rate sparkline, channel breakdown and a JSON preview"> | <img src="docs/screenshots/editor.svg" alt="Editing a JSON value, checked before it is saved"> |
+
+**[taraskovalenko.github.io/Rediscope](https://taraskovalenko.github.io/Rediscope/)** — install commands, every screen, and the keys worth knowing.
 
 **Contents:** [Install](#install) · [Quick start](#quick-start) ·
 [Features](#features) · [Keybindings](#keybindings) ·
@@ -167,7 +173,11 @@ rediscope
   switches the same scan to the biggest individual keys it measured, with the
   `OBJECT FREQ` counter beside each one where the server keeps one.
 - **Pub/Sub** (`P`). Subscribe to channel patterns and watch messages arrive,
-  `w` publishes one, `f` follows the tail, `y` copies the feed.
+  stamped with how long after subscribing they landed. A sparkline over the last
+  minute carries the message rate, peak and total; a channel breakdown shows
+  which channels the traffic is on, each in its own colour; selecting a JSON or
+  XML message pretty-prints it below the feed. `w` publishes one, `f` follows
+  the tail, `y` copies the feed.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
   evicted live. Needs `notify-keyspace-events` set on the server.
@@ -301,8 +311,17 @@ Press `?` in the app for this list at any time.
 | `s` | Change what the feed is subscribed to |
 | `w` | Publish a message |
 | `f` | Follow the newest message · `↑` `↓` `PgUp` `PgDn` scroll back |
-| `c` / `y` | Clear the feed · copy it |
+| `c` / `y` | Clear the feed and its statistics · copy it |
 | `Esc` / `q` | Stop the subscription and close |
+
+To see it under load, publish some traffic from another shell:
+
+```sh
+scripts/pubsub-traffic.sh 60              # bursty JSON on four channels
+scripts/pubsub-traffic.sh --keyspace 60   # sets notify-keyspace-events, churns keys
+```
+
+Then subscribe to `*` with `P` (or press `N` for the keyspace feed).
 
 ### Consumer groups (`S`)
 | Key | Action |
@@ -498,6 +517,19 @@ has the exact `openssl` and `redis-server` invocations. Point it at them with
 `REDISCOPE_TLS_PORT`, `REDISCOPE_MTLS_PORT` and `REDISCOPE_CERTS`. Every suite
 skips itself when its environment variables are absent, so a bare `cargo test`
 always works.
+
+The landing page is `site/`: one hand-written HTML file, a stylesheet and 30
+lines of JavaScript, with no build step. `.github/workflows/pages.yml` copies
+`docs/screenshots/` in beside it, substitutes the version from `Cargo.toml`, and
+publishes to GitHub Pages on every push to `main`. Preview it locally with any
+static server, e.g. `python3 -m http.server -d site`, after copying the
+screenshots into `site/screenshots/`.
+
+The README screenshots are generated, not captured. `cargo run --example
+screenshots` seeds a synthetic keyspace into database 9 of a local server,
+drives the app through each screen, and writes `docs/screenshots/*.svg` straight
+from the render buffer. Point it elsewhere with `REDISCOPE_DEMO_URL`. Rerun it
+after any change to the layout.
 
 `src/redis_client.rs` is the only module that talks to Redis; `src/app.rs` holds
 all state and key handling; `src/ui.rs` only draws. The render tests in

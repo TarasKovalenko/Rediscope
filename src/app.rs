@@ -771,6 +771,15 @@ impl MemoryState {
 }
 
 /// The live pub/sub feed: what it is subscribed to, and what has arrived.
+/// One received message, with the moment it arrived so the feed can show how
+/// long ago that was.
+#[derive(Clone, Debug)]
+pub struct FeedMessage {
+    pub at: std::time::Instant,
+    pub channel: String,
+    pub payload: String,
+}
+
 pub struct PubSubState {
     /// The patterns passed to `PSUBSCRIBE`, as typed.
     pub patterns: Vec<String>,
@@ -778,16 +787,31 @@ pub struct PubSubState {
     /// application channels, which only changes how it is labelled.
     pub keyspace: bool,
     /// Newest last. Capped, so a busy channel cannot grow without bound.
-    pub messages: Vec<(String, String)>,
+    pub messages: Vec<FeedMessage>,
     /// Stopped when the modal closes, so no task outlives the view.
     pub task: Option<tokio::task::JoinHandle<()>>,
     pub scroll: usize,
     /// Set by `f`: keep the view pinned to the newest message.
     pub follow: bool,
+    /// When the feed started, and the origin every timestamp is measured from.
+    pub started: std::time::Instant,
+    /// One counter per second of the rate window, used as a ring buffer.
+    rate: [u32; PUBSUB_RATE_WINDOW],
+    /// Which second `rate` currently ends on, counted from `started`.
+    bucket: u64,
+    /// Every message ever received, and the busiest second so far. Both count
+    /// past what the message cap keeps.
+    pub total: u64,
+    pub peak: u32,
+    /// Messages per channel, in the order the channels first appeared.
+    pub channels: Vec<(String, u64)>,
 }
 
 /// How many messages the feed keeps.
 pub const PUBSUB_LIMIT: usize = 2_000;
+
+/// How many seconds of traffic the rate sparkline covers.
+pub const PUBSUB_RATE_WINDOW: usize = 60;
 
 impl PubSubState {
     pub fn new(patterns: Vec<String>, keyspace: bool) -> Self {
@@ -798,11 +822,34 @@ impl PubSubState {
             task: None,
             scroll: 0,
             follow: true,
+            started: std::time::Instant::now(),
+            rate: [0; PUBSUB_RATE_WINDOW],
+            bucket: 0,
+            total: 0,
+            peak: 0,
+            channels: Vec::new(),
         }
     }
 
     pub fn push(&mut self, channel: String, payload: String) {
-        self.messages.push((channel, payload));
+        self.push_at(channel, payload, std::time::Instant::now());
+    }
+
+    pub fn push_at(&mut self, channel: String, payload: String, at: std::time::Instant) {
+        self.advance_to(at);
+        self.rate[self.slot(self.bucket)] += 1;
+        self.peak = self.peak.max(self.rate[self.slot(self.bucket)]);
+        self.total += 1;
+        match self.channels.iter_mut().find(|(name, _)| *name == channel) {
+            Some((_, count)) => *count += 1,
+            None => self.channels.push((channel.clone(), 1)),
+        }
+
+        self.messages.push(FeedMessage {
+            at,
+            channel,
+            payload,
+        });
         if self.messages.len() > PUBSUB_LIMIT {
             let overflow = self.messages.len() - PUBSUB_LIMIT;
             self.messages.drain(..overflow);
@@ -811,6 +858,61 @@ impl PubSubState {
         if self.follow {
             self.scroll = self.messages.len().saturating_sub(1);
         }
+    }
+
+    /// Roll the rate window forward, so a feed that has gone quiet decays to
+    /// zero instead of freezing on its last burst.
+    pub fn tick(&mut self) {
+        self.advance_to(std::time::Instant::now());
+    }
+
+    pub fn tick_at(&mut self, now: std::time::Instant) {
+        self.advance_to(now);
+    }
+
+    /// Messages received during the current second.
+    pub fn per_second(&self) -> u32 {
+        self.rate[self.slot(self.bucket)]
+    }
+
+    /// The rate window, oldest second first, for the sparkline.
+    pub fn rate_history(&self) -> Vec<u64> {
+        (0..PUBSUB_RATE_WINDOW as u64)
+            .rev()
+            .map(|back| match self.bucket.checked_sub(back) {
+                // Seconds before the feed started never happened.
+                Some(second) => self.rate[self.slot(second)] as u64,
+                None => 0,
+            })
+            .collect()
+    }
+
+    /// Forget every message and statistic, keeping the subscription itself.
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.channels.clear();
+        self.rate = [0; PUBSUB_RATE_WINDOW];
+        self.total = 0;
+        self.peak = 0;
+        self.scroll = 0;
+    }
+
+    fn slot(&self, second: u64) -> usize {
+        (second % PUBSUB_RATE_WINDOW as u64) as usize
+    }
+
+    /// Zero every bucket between the last one written and `now`.
+    fn advance_to(&mut self, now: std::time::Instant) {
+        let second = now.saturating_duration_since(self.started).as_secs();
+        if second <= self.bucket {
+            return;
+        }
+        let stale = (second - self.bucket).min(PUBSUB_RATE_WINDOW as u64);
+        for step in 1..=stale {
+            let slot = self.slot(self.bucket + step);
+            self.rate[slot] = 0;
+        }
+        self.bucket = second;
     }
 
     pub fn title(&self) -> String {
@@ -1121,6 +1223,18 @@ impl App {
         }
         self.last_tick += std::time::Duration::from_secs(secs as u64);
         self.age_ttls(secs);
+        self.tick_feeds();
+    }
+
+    /// Move a feed's rate window on, so a quiet subscription shows a falling
+    /// rate rather than the last burst it saw.
+    pub fn tick_feeds(&mut self) {
+        if let Some(Modal::PubSub(state)) = &mut self.modal {
+            state.tick();
+        }
+        if let Some(feed) = &mut self.held_feed {
+            feed.tick();
+        }
     }
 
     /// Count the cached TTLs down and drop whatever just expired. The server
@@ -3149,10 +3263,7 @@ impl App {
                     state.stop();
                     self.modal = None;
                 }
-                KeyCode::Char('c') => {
-                    state.messages.clear();
-                    state.scroll = 0;
-                }
+                KeyCode::Char('c') => state.clear(),
                 KeyCode::Char('f') => {
                     state.follow = !state.follow;
                     if state.follow {
@@ -3175,7 +3286,7 @@ impl App {
                     let channel = state
                         .messages
                         .last()
-                        .map(|(c, _)| c.clone())
+                        .map(|m| m.channel.clone())
                         .unwrap_or_default();
                     // Set the feed aside rather than dropping it: the
                     // subscription and its history come back after publishing.
@@ -3195,7 +3306,7 @@ impl App {
                     let text = state
                         .messages
                         .iter()
-                        .map(|(c, p)| format!("{c}  {p}"))
+                        .map(|m| format!("{}  {}", m.channel, m.payload))
                         .collect::<Vec<_>>()
                         .join("\n");
                     crate::osc52::copy(&text);
@@ -4144,6 +4255,128 @@ fn move_sel<S: Selectable>(state: &mut S, len: usize, delta: isize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn feed() -> PubSubState {
+        PubSubState::new(vec!["*".into()], false)
+    }
+
+    fn secs(n: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(n)
+    }
+
+    #[test]
+    fn the_feed_counts_messages_per_second() {
+        let mut state = feed();
+        let t0 = state.started;
+        state.push_at("news".into(), "a".into(), t0);
+        state.push_at("news".into(), "b".into(), t0);
+        assert_eq!(state.per_second(), 2);
+        assert_eq!(state.total, 2);
+
+        state.push_at("news".into(), "c".into(), t0 + secs(1));
+        assert_eq!(state.per_second(), 1, "a new second starts a new bucket");
+        assert_eq!(state.peak, 2, "the busiest second is remembered");
+        assert_eq!(state.total, 3);
+    }
+
+    #[test]
+    fn an_idle_feed_decays_to_zero() {
+        let mut state = feed();
+        let t0 = state.started;
+        state.push_at("news".into(), "a".into(), t0);
+
+        state.tick_at(t0 + secs(3));
+        assert_eq!(state.per_second(), 0);
+        assert_eq!(
+            state.rate_history().iter().sum::<u64>(),
+            1,
+            "the burst is still in the window"
+        );
+
+        // Past the whole window the history empties out.
+        state.tick_at(t0 + secs(120));
+        assert_eq!(state.rate_history().iter().sum::<u64>(), 0);
+        assert_eq!(state.peak, 1, "the peak is not forgotten");
+    }
+
+    #[test]
+    fn the_rate_history_is_one_bucket_per_second_oldest_first() {
+        let mut state = feed();
+        let t0 = state.started;
+        state.push_at("a".into(), "1".into(), t0);
+        state.push_at("a".into(), "2".into(), t0 + secs(1));
+        state.push_at("a".into(), "3".into(), t0 + secs(1));
+
+        let history = state.rate_history();
+        assert_eq!(history.len(), PUBSUB_RATE_WINDOW);
+        assert_eq!(history[history.len() - 1], 2, "newest second last");
+        assert_eq!(history[history.len() - 2], 1);
+    }
+
+    #[test]
+    fn channels_are_tallied_in_the_order_they_first_appear() {
+        let mut state = feed();
+        let t0 = state.started;
+        state.push_at("news:eu".into(), "1".into(), t0);
+        state.push_at("orders".into(), "2".into(), t0);
+        state.push_at("news:eu".into(), "3".into(), t0);
+
+        assert_eq!(
+            state.channels,
+            vec![("news:eu".to_string(), 2), ("orders".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_tally_survives_the_message_cap() {
+        let mut state = feed();
+        let t0 = state.started;
+        for i in 0..PUBSUB_LIMIT + 10 {
+            state.push_at("news".into(), format!("{i}"), t0);
+        }
+        assert_eq!(state.messages.len(), PUBSUB_LIMIT, "old messages drop out");
+        assert_eq!(
+            state.channels[0].1,
+            PUBSUB_LIMIT as u64 + 10,
+            "the tally counts everything that was ever seen"
+        );
+    }
+
+    #[test]
+    fn clearing_the_feed_resets_its_statistics() {
+        let mut state = feed();
+        let t0 = state.started;
+        state.push_at("news".into(), "1".into(), t0);
+        state.clear();
+
+        assert!(state.messages.is_empty());
+        assert!(state.channels.is_empty());
+        assert_eq!(state.total, 0);
+        assert_eq!(state.peak, 0);
+        assert_eq!(state.rate_history().iter().sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn the_clock_decays_a_quiet_feed_even_with_nothing_arriving() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        let mut state = feed();
+        let t0 = state.started;
+        state.push_at("news".into(), "a".into(), t0);
+        assert_eq!(state.per_second(), 1);
+        // Pretend the feed started five seconds earlier, so "now" is already
+        // past the second that burst landed in.
+        state.started -= secs(5);
+        app.modal = Some(Modal::PubSub(state));
+
+        app.tick_feeds();
+
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            unreachable!("the feed is still open")
+        };
+        assert_eq!(state.per_second(), 0);
+        assert_eq!(state.total, 1, "the totals are untouched");
+    }
 
     #[test]
     fn bare_search_terms_become_substring_globs() {

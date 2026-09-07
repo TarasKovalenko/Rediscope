@@ -617,9 +617,9 @@ async fn the_pubsub_feed_receives_what_is_published() {
             }
         }
     };
-    let (channel, payload) = tokio::time::timeout(std::time::Duration::from_secs(10), received)
+    let message = tokio::time::timeout(std::time::Duration::from_secs(10), received)
         .await
         .expect("a message arrives");
-    assert_eq!(channel, "chat");
-    assert_eq!(payload, "hello");
+    assert_eq!(message.channel, "chat");
+    assert_eq!(message.payload, "hello");
 }

@@ -1,0 +1,284 @@
+/* Palette lifted from the Tokyo Night theme the screenshots use, so the page
+   and the pictures on it are the same colours. */
+:root {
+  --bg: #16161e;
+  --bg-raised: #1a1b26;
+  --panel: #1f2335;
+  --border: #2c3050;
+  --text: #c0caf5;
+  --dim: #7c85ad;
+  --accent: #bb9af7;
+  --blue: #7aa2f7;
+  --green: #9ece6a;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Inter, sans-serif;
+  --radius: 10px;
+  --page: 1180px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, kbd { font-family: var(--mono); }
+h1, h2, h3 { line-height: 1.2; letter-spacing: -0.02em; }
+img { max-width: 100%; height: auto; display: block; }
+
+/* ---- top bar ---------------------------------------------------------- */
+
+.bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem max(1.25rem, calc((100vw - var(--page)) / 2));
+  background: rgba(22, 22, 30, 0.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--text);
+  background: var(--accent);
+  color: #1a1b26;
+  padding: 0.15rem 0.5rem;
+  border-radius: 5px;
+}
+.brand:hover { text-decoration: none; opacity: 0.9; }
+
+.bar nav { display: flex; gap: 1.25rem; align-items: center; font-size: 0.94rem; }
+.bar nav a { color: var(--dim); }
+.bar nav a:hover { color: var(--text); text-decoration: none; }
+.bar nav a.ghost {
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.7rem;
+}
+
+/* ---- sections --------------------------------------------------------- */
+
+main { max-width: var(--page); margin: 0 auto; padding: 0 1.25rem; }
+section { padding: 4.5rem 0; border-bottom: 1px solid var(--border); }
+section:last-of-type { border-bottom: 0; }
+section > h2 { font-size: 1.9rem; margin: 0 0 0.4rem; }
+.section-lede { color: var(--dim); margin: 0 0 2rem; }
+
+/* ---- hero ------------------------------------------------------------- */
+
+.hero { padding-top: 3.5rem; text-align: center; }
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  color: var(--dim);
+  margin: 0 0 1rem;
+}
+.hero h1 {
+  font-size: clamp(2rem, 5.2vw, 3.2rem);
+  margin: 0 auto 1rem;
+  max-width: 20ch;
+}
+.lede {
+  max-width: 62ch;
+  margin: 0 auto 2rem;
+  color: var(--dim);
+  font-size: 1.08rem;
+}
+
+.install-quick, .snippet {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.55rem 0.55rem 0.9rem;
+}
+.install-quick { max-width: 760px; margin: 0 auto; }
+.install-quick code, .snippet code {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.86rem;
+  /* Long install URLs wrap rather than disappearing off the right edge. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 0.25rem 0;
+  text-align: left;
+}
+.copy {
+  flex: none;
+  font: 600 0.8rem var(--sans);
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+.copy:hover { border-color: var(--accent); color: var(--accent); }
+.copy[data-copied] { color: var(--green); border-color: var(--green); }
+
+.hero-links { display: flex; gap: 0.75rem; justify-content: center; margin: 1.5rem 0 3rem; }
+.button {
+  display: inline-block;
+  padding: 0.55rem 1.2rem;
+  border-radius: 8px;
+  font-weight: 600;
+  background: var(--accent);
+  color: #1a1b26;
+  border: 1px solid var(--accent);
+}
+.button:hover { text-decoration: none; opacity: 0.92; }
+.button.ghost { background: transparent; color: var(--text); border-color: var(--border); }
+.button.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+.hero-shot img, .shot img {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+figure { margin: 0; }
+
+/* ---- screenshot tabs -------------------------------------------------- */
+
+.tabs { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.25rem; }
+.tabs button {
+  font: 0.88rem var(--sans);
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.35rem 0.95rem;
+  cursor: pointer;
+}
+.tabs button:hover { color: var(--text); }
+.tabs button[aria-selected="true"] {
+  color: #1a1b26;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.shot figcaption { color: var(--dim); font-size: 0.92rem; margin-top: 0.9rem; max-width: 78ch; }
+.shot + .shot { margin-top: 2rem; }
+
+/* ---- feature grid ----------------------------------------------------- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(290px, 100%), 1fr));
+  gap: 1rem;
+}
+.grid article {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.4rem;
+}
+.grid h3 { margin: 0 0 0.6rem; font-size: 1.05rem; color: var(--accent); }
+.grid ul { margin: 0; padding-left: 1.1rem; color: var(--dim); font-size: 0.94rem; }
+.grid li + li { margin-top: 0.4rem; }
+.grid code { color: var(--text); font-size: 0.86em; }
+
+/* ---- keys ------------------------------------------------------------- */
+
+.key-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
+  gap: 1rem;
+}
+.key-columns table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.key-columns caption {
+  text-align: left;
+  font-weight: 600;
+  padding: 0.85rem 1rem 0.5rem;
+  color: var(--accent);
+}
+.key-columns td { padding: 0.45rem 1rem; font-size: 0.92rem; color: var(--dim); vertical-align: top; }
+.key-columns td:first-child { white-space: nowrap; width: 1%; }
+.key-columns tr + tr td { border-top: 1px solid var(--border); }
+
+kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  text-align: center;
+  font-size: 0.82em;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 0.05em 0.4em;
+}
+
+/* ---- install ---------------------------------------------------------- */
+
+.install-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+  gap: 1rem;
+}
+.card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.4rem;
+}
+.card h3 { margin: 0 0 0.8rem; font-size: 1rem; }
+.card p { color: var(--dim); font-size: 0.9rem; margin: 0.8rem 0 0; }
+.card .snippet { padding: 0.45rem 0.45rem 0.45rem 0.8rem; }
+
+.note {
+  margin: 2rem 0 0;
+  padding: 1.1rem 1.3rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--green);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  color: var(--dim);
+  font-size: 0.94rem;
+}
+.note strong { color: var(--text); }
+
+/* ---- footer ----------------------------------------------------------- */
+
+footer {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 3.5rem;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 0.9rem;
+}
+footer p { margin: 0.3rem 0; }
+.dim { color: var(--dim); opacity: 0.75; }
+
+@media (max-width: 640px) {
+  .bar nav { gap: 0.85rem; font-size: 0.85rem; }
+  .bar nav a:not(.ghost) { display: none; }
+  section { padding: 3rem 0; }
+  .install-quick code, .snippet code { font-size: 0.76rem; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
