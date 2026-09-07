@@ -5,9 +5,13 @@ every value type, watch TTLs count down, find out which prefix is eating your
 RAM, and drop into a raw command console. One static binary, no Electron and no
 Python runtime.
 
-Main view             |  Connections view | Server Info
-:-------------------------:|:-------------------------:|:-------------------------:
-<img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/17b807bb-5ae3-452b-a879-06c9b5b828d9" />  |  <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/a0e80e28-d436-4e67-a464-155dd8563b7d" /> | <img width="1721" height="1035" alt="image" src="https://github.com/user-attachments/assets/5d071494-37bc-44e5-b8d1-c32f691b2208" />
+| Key browser | Server list |
+|---|---|
+| <img src="docs/screenshots/browser.svg" alt="Browsing the keyspace as a tree, with a JSON value open"> | <img src="docs/screenshots/connections.svg" alt="The saved connection list, showing TLS, keychain, read-only and SSH profiles"> |
+| **Server info** | **Namespace memory** |
+| <img src="docs/screenshots/server-info.svg" alt="The server info dialog with its section tabs"> | <img src="docs/screenshots/memory.svg" alt="The namespace memory report, showing which prefixes hold the RAM"> |
+| **Pub/Sub feed** | **Value editor** |
+| <img src="docs/screenshots/pubsub.svg" alt="The pub/sub feed with a rate sparkline, channel breakdown and a JSON preview"> | <img src="docs/screenshots/editor.svg" alt="Editing a JSON value, checked before it is saved"> |
 
 **Contents:** [Install](#install) · [Quick start](#quick-start) ·
 [Features](#features) · [Keybindings](#keybindings) ·
@@ -511,6 +515,12 @@ has the exact `openssl` and `redis-server` invocations. Point it at them with
 `REDISCOPE_TLS_PORT`, `REDISCOPE_MTLS_PORT` and `REDISCOPE_CERTS`. Every suite
 skips itself when its environment variables are absent, so a bare `cargo test`
 always works.
+
+The README screenshots are generated, not captured. `cargo run --example
+screenshots` seeds a synthetic keyspace into database 9 of a local server,
+drives the app through each screen, and writes `docs/screenshots/*.svg` straight
+from the render buffer. Point it elsewhere with `REDISCOPE_DEMO_URL`. Rerun it
+after any change to the layout.
 
 `src/redis_client.rs` is the only module that talks to Redis; `src/app.rs` holds
 all state and key handling; `src/ui.rs` only draws. The render tests in
