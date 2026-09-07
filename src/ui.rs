@@ -855,29 +855,17 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
     );
     let inner = block.inner(rect);
     f.render_widget(block, rect);
+    // Ten tabs need more than 100 columns; rather than clipping the last of
+    // them off the edge, they wrap onto as many lines as the width demands.
+    let tab_lines = info_tab_lines(state.tab, inner.width, palette);
     let rows = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(tab_lines.len() as u16),
         Constraint::Length(1),
         Constraint::Min(1),
     ])
     .split(inner);
 
-    let mut tabs = Vec::new();
-    for (i, name) in INFO_TABS.iter().enumerate() {
-        tabs.push(Span::styled(
-            format!(" {} {name} ", i + 1),
-            if i == state.tab {
-                Style::new()
-                    .bg(palette.accent)
-                    .fg(palette.highlight_foreground)
-                    .bold()
-            } else {
-                Style::new().fg(palette.dim)
-            },
-        ));
-        tabs.push(Span::raw(" "));
-    }
-    f.render_widget(Line::from(tabs), rows[0]);
+    f.render_widget(Paragraph::new(tab_lines), rows[0]);
 
     let all = state.rows();
     let body = rows[2];
@@ -998,6 +986,42 @@ fn server_info(f: &mut Frame, area: Rect, state: &InfoState, palette: Palette) {
             &mut sb,
         );
     }
+}
+
+/// The section tabs, packed into as many lines as `width` needs. Every tab
+/// stays visible: a narrow dialog wraps rather than hiding the last ones.
+fn info_tab_lines(selected: usize, width: u16, palette: Palette) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    for (i, name) in INFO_TABS.iter().enumerate() {
+        let label = format!(" {} {name} ", i + 1);
+        let label_width = UnicodeWidthStr::width(label.as_str());
+        if used + label_width > width as usize && !spans.is_empty() {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        spans.push(Span::styled(
+            label,
+            if i == selected {
+                Style::new()
+                    .bg(palette.accent)
+                    .fg(palette.highlight_foreground)
+                    .bold()
+            } else {
+                Style::new().fg(palette.dim)
+            },
+        ));
+        used += label_width;
+        // A single space keeps neighbouring highlights apart, but only when
+        // there is room for it on this line.
+        if used < width as usize {
+            spans.push(Span::raw(" "));
+            used += 1;
+        }
+    }
+    lines.push(Line::from(spans));
+    lines
 }
 
 /// Green while a ratio is healthy, red once it is alarming. Which end is
@@ -1665,6 +1689,44 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tab_text(width: u16) -> Vec<String> {
+        info_tab_lines(0, width, Theme::Redis.palette())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_info_tab_is_visible_however_narrow_the_dialog() {
+        for width in [40u16, 60, 80, 104, 108, 200] {
+            let lines = tab_text(width);
+            let shown = lines.concat();
+            for (i, name) in INFO_TABS.iter().enumerate() {
+                assert!(
+                    shown.contains(&format!("{} {name}", i + 1)),
+                    "tab {name} missing at width {width}: {lines:?}"
+                );
+            }
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= width as usize,
+                    "line overflows width {width}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_tab_strip_stays_on_one_line_when_it_fits() {
+        assert_eq!(tab_text(200).len(), 1);
+        assert!(tab_text(108).len() > 1, "108 columns cannot hold every tab");
+    }
 
     #[test]
     fn formats_ttl_by_magnitude() {
