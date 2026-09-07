@@ -16,8 +16,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
-use rediscope::app::{App, Modal, Msg, PubSubState};
+use rediscope::app::{App, InfoState, Modal, Msg, PubSubState};
 use rediscope::config::{Connection, Store};
+use rediscope::redis_client::{ClientEntry, Diagnostics, ServerInfo, SlowEntry};
 use rediscope::theme::Theme;
 use rediscope::ui;
 
@@ -72,12 +73,14 @@ async fn main() -> anyhow::Result<()> {
     shot(&mut app, "editor")?;
     press(&mut app, KeyCode::Esc);
 
-    // 4. Server info.
-    press(&mut app, KeyCode::Char('i'));
-    pump(&mut app, &mut rx, |a| {
-        matches!(a.modal, Some(Modal::Info(_)))
-    })
-    .await;
+    // 4. Server info. The picture uses an invented INFO reply rather than the
+    //    local server's, so it shows a machine worth looking at and leaks
+    //    nothing about the one it was generated on.
+    app.modal = Some(Modal::Info(Box::new(InfoState::new(
+        ServerInfo::parse(DEMO_INFO),
+        demo_diagnostics(),
+    ))));
+    press(&mut app, KeyCode::Char('2')); // the Memory tab, with its usage bar
     shot(&mut app, "server-info")?;
     press(&mut app, KeyCode::Esc);
 
@@ -182,6 +185,121 @@ fn demo_feed() -> PubSubState {
     feed.follow = false;
     feed.scroll = feed.messages.len() - 3;
     feed
+}
+
+/// A plausible `INFO` reply for a mid-sized production cache. Invented from end
+/// to end: no field here came off a real server.
+const DEMO_INFO: &str = "# Server\r
+redis_version:7.4.2\r
+redis_mode:standalone\r
+os:Linux 6.8.0-51-generic x86_64\r
+arch_bits:64\r
+process_id:1\r
+tcp_port:6380\r
+uptime_in_seconds:1904400\r
+uptime_in_days:22\r
+executable:/usr/local/bin/redis-server\r
+config_file:/etc/redis/redis.conf\r
+\r
+# Clients\r
+connected_clients:184\r
+cluster_connections:0\r
+maxclients:10000\r
+blocked_clients:3\r
+\r
+# Memory\r
+used_memory:6871947673\r
+used_memory_human:6.40G\r
+used_memory_rss_human:6.71G\r
+used_memory_peak_human:7.02G\r
+used_memory_dataset_human:6.02G\r
+maxmemory:8589934592\r
+maxmemory_human:8.00G\r
+maxmemory_policy:allkeys-lru\r
+mem_fragmentation_ratio:1.05\r
+mem_allocator:jemalloc-5.3.0\r
+\r
+# Persistence\r
+rdb_last_bgsave_status:ok\r
+aof_enabled:1\r
+aof_last_write_status:ok\r
+\r
+# Stats\r
+total_connections_received:9482113\r
+total_commands_processed:41822904115\r
+instantaneous_ops_per_sec:38412\r
+keyspace_hits:38911204471\r
+keyspace_misses:1204118342\r
+expired_keys:882401173\r
+evicted_keys:1904822\r
+rejected_connections:0\r
+\r
+# Replication\r
+role:master\r
+connected_slaves:2\r
+slave0:ip=10.4.19.22,port=6380,state=online,offset=88213904712,lag=0\r
+slave1:ip=10.4.20.14,port=6380,state=online,offset=88213904102,lag=1\r
+master_repl_offset:88213904712\r
+\r
+# CPU\r
+used_cpu_sys:184402.19\r
+used_cpu_user:392018.44\r
+\r
+# Keyspace\r
+db0:keys=41892204,expires=41112904,avg_ttl=1794000\r
+db2:keys=180422,expires=0,avg_ttl=0\r
+";
+
+/// Slow queries, clients and running config to match, so every tab of the
+/// picture has something in it. Also invented.
+fn demo_diagnostics() -> Diagnostics {
+    Diagnostics {
+        slowlog: vec![
+            SlowEntry {
+                id: 4821,
+                at: 1_774_000_000,
+                micros: 41_902,
+                command: "KEYS session:web:*".into(),
+                client: "10.4.18.9:52114".into(),
+            },
+            SlowEntry {
+                id: 4820,
+                at: 1_773_999_400,
+                micros: 18_774,
+                command: "SMEMBERS features:beta".into(),
+                client: "10.4.18.11:41220".into(),
+            },
+        ],
+        clients: vec![
+            ClientEntry {
+                id: "91422".into(),
+                addr: "10.4.18.9:52114".into(),
+                name: "checkout-api".into(),
+                age_secs: 88_204,
+                idle_secs: 0,
+                db: "0".into(),
+                command: "hgetall".into(),
+            },
+            ClientEntry {
+                id: "91423".into(),
+                addr: "10.4.18.11:41220".into(),
+                name: "sessions-worker".into(),
+                age_secs: 41_002,
+                idle_secs: 2,
+                db: "0".into(),
+                command: "setex".into(),
+            },
+        ],
+        config: vec![
+            ("maxmemory".into(), "8589934592".into()),
+            ("maxmemory-policy".into(), "allkeys-lru".into()),
+            ("appendonly".into(), "yes".into()),
+            ("timeout".into(), "300".into()),
+        ],
+        latency: vec![("expire-cycle".into(), "14".into())],
+        cluster: vec![("cluster_enabled".into(), "0".into())],
+        modules: Vec::new(),
+    }
 }
 
 /// Write the demo keyspace. Flushed first, so a rerun cannot leave stale keys
@@ -328,6 +446,12 @@ async fn pump(
 }
 
 fn shot(app: &mut App, name: &str) -> anyhow::Result<()> {
+    // The banner in the title bar reports whichever server generated the
+    // pictures. Pin it, so a developer's local build never ends up in the
+    // README, and every screenshot agrees with the invented INFO reply.
+    if app.client.is_some() {
+        app.server_line = "redis 7.4.2 · standalone".into();
+    }
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT))?;
     terminal.draw(|f| ui::draw(f, app))?;
     let svg = svg(terminal.backend().buffer(), app.store.theme);
