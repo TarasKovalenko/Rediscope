@@ -167,7 +167,11 @@ rediscope
   switches the same scan to the biggest individual keys it measured, with the
   `OBJECT FREQ` counter beside each one where the server keeps one.
 - **Pub/Sub** (`P`). Subscribe to channel patterns and watch messages arrive,
-  `w` publishes one, `f` follows the tail, `y` copies the feed.
+  stamped with how long after subscribing they landed. A sparkline over the last
+  minute carries the message rate, peak and total; a channel breakdown shows
+  which channels the traffic is on, each in its own colour; selecting a JSON or
+  XML message pretty-prints it below the feed. `w` publishes one, `f` follows
+  the tail, `y` copies the feed.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
   evicted live. Needs `notify-keyspace-events` set on the server.
@@ -301,8 +305,17 @@ Press `?` in the app for this list at any time.
 | `s` | Change what the feed is subscribed to |
 | `w` | Publish a message |
 | `f` | Follow the newest message · `↑` `↓` `PgUp` `PgDn` scroll back |
-| `c` / `y` | Clear the feed · copy it |
+| `c` / `y` | Clear the feed and its statistics · copy it |
 | `Esc` / `q` | Stop the subscription and close |
+
+To see it under load, publish some traffic from another shell:
+
+```sh
+scripts/pubsub-traffic.sh 60              # bursty JSON on four channels
+scripts/pubsub-traffic.sh --keyspace 60   # sets notify-keyspace-events, churns keys
+```
+
+Then subscribe to `*` with `P` (or press `N` for the keyspace feed).
 
 ### Consumer groups (`S`)
 | Key | Action |

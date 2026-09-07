@@ -4,7 +4,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, Wrap,
+    ScrollbarOrientation, ScrollbarState, Sparkline, Table, Wrap,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1253,7 +1253,40 @@ fn memory_report(f: &mut Frame, area: Rect, state: &MemoryState, palette: Palett
     f.render_widget(Paragraph::new(lines), rows[2]);
 }
 
-/// The live message feed. Newest at the bottom, like a log.
+/// How long after the feed started a message arrived. Relative rather than
+/// wall-clock: the crate carries no timezone database, and "how long ago"
+/// is what a live feed is read for anyway.
+fn feed_age(since_start: std::time::Duration) -> String {
+    let secs = since_start.as_secs();
+    match secs {
+        0..=59 => format!("+{:.1}s", since_start.as_secs_f64()),
+        60..=3_599 => format!("+{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("+{}h{:02}m", secs / 3_600, (secs % 3_600) / 60),
+    }
+}
+
+/// A stable colour per channel, so one channel keeps its colour for the life
+/// of the feed and neighbouring channels stay distinguishable.
+fn channel_color(channel: &str, palette: Palette) -> Color {
+    let wheel = [
+        palette.info,
+        palette.success,
+        palette.warning,
+        palette.magenta,
+        palette.blue,
+        palette.accent,
+    ];
+    // FNV-1a: a couple of lines, and stable across runs unlike `DefaultHasher`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in channel.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    wheel[(hash % wheel.len() as u64) as usize]
+}
+
+/// The live message feed. Newest at the bottom, like a log, with a rate
+/// sparkline over the last minute and a breakdown of which channels are busy.
 fn pubsub_feed(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette) {
     let rect = centered(area, area.width.saturating_sub(6).min(110), area.height);
     clear_area(f, rect, palette);
@@ -1264,28 +1297,156 @@ fn pubsub_feed(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette)
     let block = panel(&title, true, palette);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+    // Two header lines (sparkline, counters), then the body.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
 
-    let headline = if state.messages.is_empty() {
-        if state.keyspace {
-            "waiting … keyspace events need notify-keyspace-events set on the server".to_string()
-        } else {
-            "waiting for messages …".to_string()
-        }
-    } else {
-        format!(
-            "{} message(s){}",
-            state.messages.len(),
-            if state.follow { " · following" } else { "" }
+    feed_header(f, rows[0], rows[1], state, palette);
+
+    // The selected message gets a preview pane when its payload is structured,
+    // the way the value pane previews a selected element.
+    let selected = state
+        .messages
+        .get(state.scroll.min(state.messages.len().saturating_sub(1)));
+    let preview =
+        selected.and_then(|m| structured_document(std::slice::from_ref(&m.payload), palette));
+    let panes = if preview.is_some() && rows[2].height >= 10 {
+        Some(
+            Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .split(rows[2]),
         )
+    } else {
+        None
     };
-    f.render_widget(
-        Line::from(Span::styled(headline, Style::new().fg(palette.dim))),
-        rows[0],
-    );
+    let feed_area = panes.as_ref().map_or(rows[2], |areas| areas[0]);
 
-    let body = rows[1];
-    let height = body.height as usize;
+    // A channel breakdown costs 26 columns; a narrow terminal spends them on
+    // the messages instead.
+    let (channels_area, messages_area) = if feed_area.width >= 74 && !state.channels.is_empty() {
+        let cols =
+            Layout::horizontal([Constraint::Length(26), Constraint::Min(20)]).split(feed_area);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, feed_area)
+    };
+
+    if let Some(area) = channels_area {
+        channel_breakdown(f, area, state, palette);
+    }
+    feed_messages(f, messages_area, state, palette);
+
+    if let (Some((kind, text)), Some(areas)) = (preview, panes) {
+        let title = format!("Selected {kind} — PgUp/PgDn moves the cursor");
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .block(panel(&title, false, palette)),
+            areas[1],
+        );
+    }
+}
+
+/// The rate sparkline and the counters under it.
+fn feed_header(f: &mut Frame, spark: Rect, counters: Rect, state: &PubSubState, palette: Palette) {
+    let history = state.rate_history();
+    // The sparkline is worth its line only once there is a window to show.
+    let width = spark.width.min(history.len() as u16);
+    if width > 0 {
+        let data: Vec<u64> = history[history.len() - width as usize..].to_vec();
+        f.render_widget(
+            Sparkline::default()
+                .data(&data)
+                .style(Style::new().fg(palette.accent)),
+            Rect { width, ..spark },
+        );
+    }
+
+    let line = if state.messages.is_empty() && state.total == 0 {
+        let waiting = if state.keyspace {
+            "waiting … keyspace events need notify-keyspace-events set on the server"
+        } else {
+            "waiting for messages …"
+        };
+        Line::from(Span::styled(waiting, Style::new().fg(palette.dim)))
+    } else {
+        Line::from(vec![
+            Span::styled(
+                format!("{} msg/s", state.per_second()),
+                Style::new().fg(palette.foreground).bold(),
+            ),
+            Span::styled(
+                format!(
+                    "  ·  peak {}  ·  {} total  ·  {} shown",
+                    state.peak,
+                    state.total,
+                    state.messages.len()
+                ),
+                Style::new().fg(palette.dim),
+            ),
+            Span::styled(
+                if state.follow {
+                    "  ·  following"
+                } else {
+                    "  ·  paused"
+                },
+                Style::new().fg(if state.follow {
+                    palette.success
+                } else {
+                    palette.warning
+                }),
+            ),
+        ])
+    };
+    f.render_widget(line, counters);
+}
+
+/// Which channels the traffic is on, busiest first.
+fn channel_breakdown(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette) {
+    let block = panel("Channels", false, palette);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut channels: Vec<&(String, u64)> = state.channels.iter().collect();
+    channels.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let busiest = channels.first().map_or(1, |(_, count)| (*count).max(1));
+
+    let count_width = 6usize;
+    let bar_width = 6usize;
+    let name_width = (inner.width as usize).saturating_sub(count_width + bar_width + 1);
+    let lines: Vec<Line> = channels
+        .iter()
+        .take(inner.height as usize)
+        .map(|(name, count)| {
+            let filled = ((*count as f64 / busiest as f64) * bar_width as f64).round() as usize;
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<name_width$}", truncate(name, name_width)),
+                    Style::new().fg(channel_color(name, palette)),
+                ),
+                Span::styled(
+                    format!("{count:>count_width$} "),
+                    Style::new().fg(palette.foreground),
+                ),
+                Span::styled(
+                    "\u{2588}".repeat(filled.min(bar_width)),
+                    Style::new().fg(channel_color(name, palette)),
+                ),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The messages themselves: age, channel, payload.
+fn feed_messages(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette) {
+    let height = area.height as usize;
     // Follow mode keeps the newest message in view; otherwise the cursor
     // decides which window to show.
     let last = state.messages.len().saturating_sub(1);
@@ -1293,30 +1454,44 @@ fn pubsub_feed(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette)
     let start = anchor.saturating_sub(height.saturating_sub(1));
     // A 10-column terminal leaves nothing for a channel column; clamp rather
     // than letting the arithmetic wrap.
-    let channel_width = 28.min(body.width.saturating_sub(4) as usize).max(1);
-    let payload_width = (body.width as usize).saturating_sub(channel_width + 3);
+    let age_width = 8.min(area.width.saturating_sub(2) as usize);
+    let channel_width = 24
+        .min(area.width.saturating_sub(age_width as u16 + 4) as usize)
+        .max(1);
+    let payload_width = (area.width as usize).saturating_sub(channel_width + age_width + 2);
     let lines: Vec<Line> = state
         .messages
         .iter()
+        .enumerate()
         .skip(start)
         .take(height)
-        .map(|(channel, payload)| {
-            Line::from(vec![
+        .map(|(index, message)| {
+            let age = feed_age(message.at.saturating_duration_since(state.started));
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:>age_width$} ", truncate(&age, age_width)),
+                    Style::new().fg(palette.dim),
+                ),
                 Span::styled(
                     format!(
                         "{:<channel_width$} ",
-                        truncate(channel, channel_width.saturating_sub(1))
+                        truncate(&message.channel, channel_width.saturating_sub(1))
                     ),
-                    Style::new().fg(palette.accent),
+                    Style::new().fg(channel_color(&message.channel, palette)),
                 ),
                 Span::styled(
-                    truncate(&one_line(payload), payload_width),
+                    truncate(&one_line(&message.payload), payload_width),
                     Style::new().fg(palette.foreground),
                 ),
-            ])
+            ]);
+            if index == anchor && !state.follow {
+                line.style(Style::new().bg(palette.panel))
+            } else {
+                line
+            }
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), body);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Consumer groups on the left, the selected group's consumers and unacked
@@ -1726,6 +1901,89 @@ mod tests {
     fn the_tab_strip_stays_on_one_line_when_it_fits() {
         assert_eq!(tab_text(200).len(), 1);
         assert!(tab_text(108).len() > 1, "108 columns cannot hold every tab");
+    }
+
+    fn feed_text(width: u16, height: u16, payload: &str) -> String {
+        let mut state = crate::app::PubSubState::new(vec!["*".into()], false);
+        let t0 = state.started;
+        state.push_at("news:eu".into(), payload.into(), t0);
+        state.push_at("orders".into(), "plain text".into(), t0);
+        state.scroll = 0; // the JSON message is selected
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|f| pubsub_feed(f, f.area(), &state, Theme::Redis.palette()))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_feed_header_shows_the_message_rate() {
+        let text = feed_text(120, 30, "hello");
+        assert!(text.contains("msg/s"), "{text}");
+        assert!(text.contains("2 total"), "{text}");
+    }
+
+    #[test]
+    fn a_wide_feed_breaks_the_traffic_down_by_channel() {
+        let text = feed_text(120, 30, "hello");
+        assert!(text.contains("Channels"), "{text}");
+        assert!(text.contains("orders"), "{text}");
+    }
+
+    #[test]
+    fn a_narrow_feed_drops_the_channel_pane_for_the_messages() {
+        let text = feed_text(60, 20, "hello");
+        assert!(!text.contains("Channels"), "{text}");
+        assert!(text.contains("news:eu"), "the messages stay: {text}");
+    }
+
+    #[test]
+    fn a_selected_json_payload_is_pretty_printed_below_the_feed() {
+        let text = feed_text(120, 30, r#"{"id":7,"kind":"order"}"#);
+        assert!(text.contains("Selected JSON"), "{text}");
+        assert!(text.contains("\"id\": 7"), "{text}");
+    }
+
+    #[test]
+    fn a_plain_payload_gets_no_preview_pane() {
+        let text = feed_text(120, 30, "hello");
+        assert!(!text.contains("Selected"), "{text}");
+    }
+
+    #[test]
+    fn every_message_is_stamped_with_its_age() {
+        let text = feed_text(120, 30, "hello");
+        assert!(text.contains("+0.0s"), "{text}");
+    }
+
+    #[test]
+    fn feed_ages_read_as_time_since_the_feed_started() {
+        assert_eq!(feed_age(std::time::Duration::from_millis(0)), "+0.0s");
+        assert_eq!(feed_age(std::time::Duration::from_millis(1_250)), "+1.2s");
+        assert_eq!(feed_age(std::time::Duration::from_millis(62_400)), "+1m02s");
+        assert_eq!(feed_age(std::time::Duration::from_secs(3_671)), "+1h01m");
+    }
+
+    #[test]
+    fn a_channel_keeps_the_same_colour_every_frame() {
+        let palette = Theme::Redis.palette();
+        assert_eq!(
+            channel_color("news:eu", palette),
+            channel_color("news:eu", palette)
+        );
+        assert_ne!(
+            channel_color("news:eu", palette),
+            channel_color("orders", palette),
+            "different channels should be told apart"
+        );
     }
 
     #[test]
