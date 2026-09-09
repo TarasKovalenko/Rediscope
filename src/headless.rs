@@ -25,7 +25,11 @@ pub fn resolve(profile: Option<&str>, flags: Option<Connection>) -> Result<Conne
 /// `rediscope keys` — the keyspace as one line per key.
 pub async fn keys(conn: Connection, pattern: &str, json: bool) -> Result<()> {
     let client = Client::connect(conn).await?;
-    let (keys, truncated) = client.scan_keys(pattern, KEY_LIMIT).await?;
+    let report = client.scan_report(pattern, KEY_LIMIT).await?;
+    for warning in &report.warnings {
+        eprintln!("warning: PARTIAL RESULTS: {warning}");
+    }
+    let (keys, truncated) = (report.keys, report.truncated);
     if json {
         let rows: Vec<serde_json::Value> = keys
             .iter()
@@ -51,7 +55,11 @@ pub async fn keys(conn: Connection, pattern: &str, json: bool) -> Result<()> {
 /// `rediscope export` — DUMP payloads and TTLs, as the JSON the import reads.
 pub async fn export(conn: Connection, pattern: &str, out: &str) -> Result<()> {
     let client = Client::connect(conn).await?;
-    let (keys, truncated) = client.scan_keys(pattern, KEY_LIMIT).await?;
+    let report = client.scan_report(pattern, KEY_LIMIT).await?;
+    for warning in &report.warnings {
+        eprintln!("warning: PARTIAL RESULTS: {warning}");
+    }
+    let (keys, truncated) = (report.keys, report.truncated);
     let names: Vec<String> = keys.into_iter().map(|k| k.name).collect();
     let entries = client.export_keys(&names).await?;
     let text = serde_json::to_string_pretty(&entries)?;
@@ -69,7 +77,29 @@ pub async fn export(conn: Connection, pattern: &str, out: &str) -> Result<()> {
 
 /// `rediscope import` — write an export back to a server.
 pub async fn import(conn: Connection, file: &str, replace: bool) -> Result<()> {
+    import_confirmed(conn, file, replace, None, None).await
+}
+
+pub async fn import_confirmed(
+    conn: Connection,
+    file: &str,
+    replace: bool,
+    unlock: Option<&str>,
+    confirmation: Option<&str>,
+) -> Result<()> {
     let client = Client::connect(conn).await?;
+    if client.production() {
+        anyhow::ensure!(
+            confirmation == Some(client.conn.name.as_str()),
+            "Production import requires --confirm-production with the exact profile name"
+        );
+        client.unlock_writes(unlock.unwrap_or_default())?;
+    } else {
+        anyhow::ensure!(
+            unlock.is_none() && confirmation.is_none(),
+            "Production confirmation flags require a production profile"
+        );
+    }
     if client.read_only() {
         anyhow::bail!("'{}' is a read-only profile", client.conn.name);
     }

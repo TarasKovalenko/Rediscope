@@ -16,8 +16,8 @@ use crate::input::{Completion, InputBuf, ReverseSearch, complete};
 use crate::json::{self, JsonMode};
 use crate::memory::{PrefixRow, Rollup};
 use crate::redis_client::{
-    Client, CommandTable, Diagnostics, ExportEntry, KEY_LIMIT, KeyInfo, KeyType, KeyValue,
-    ServerInfo, StreamGroup, StreamGroupDetail, is_destructive,
+    Client, CommandTable, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT, KeyInfo,
+    KeyType, KeyValue, ServerInfo, StreamGroup, StreamGroupDetail, is_destructive,
 };
 use crate::theme::Theme;
 use crate::tree::{Tree, VisibleRow};
@@ -40,6 +40,7 @@ pub enum Msg {
     Keys {
         keys: Vec<KeyInfo>,
         truncated: bool,
+        warnings: Vec<String>,
         dbsize: u64,
         pattern: String,
     },
@@ -49,6 +50,12 @@ pub enum Msg {
     },
     /// A write finished; `Ok` carries the status line to show.
     Mutated(Result<String, String>),
+    EditCompleted {
+        session: u64,
+        target: EditTarget,
+        values: Vec<String>,
+        result: Result<EditOutcome, String>,
+    },
     Console(String),
     /// The server's command names, for console completion, and which of them
     /// write — a read-only profile refuses those.
@@ -102,6 +109,17 @@ pub enum Focus {
 /// What a modal does when submitted.
 #[derive(Clone, Debug)]
 pub enum Action {
+    SafeEdit(EditTarget),
+    OverwriteEdit {
+        target: EditTarget,
+        values: Vec<String>,
+    },
+    UnlockWrites,
+    ProductionConfirm {
+        action: Box<Action>,
+        values: Vec<String>,
+        profile: String,
+    },
     SaveConnection {
         replacing: Option<String>,
     },
@@ -110,43 +128,29 @@ pub enum Action {
     DeleteKey(String),
     RenameKey(String),
     SetTtl(String),
-    EditString(String),
-    EditJson(String),
     TsAdd(String),
     TsDel {
         key: String,
         timestamp: String,
     },
-    HashSet {
-        key: String,
-        field: Option<String>,
-    },
+    /// Append a new field. Editing an existing one goes through `SafeEdit`.
+    HashAdd(String),
     HashDel {
         key: String,
         field: String,
     },
     ListAdd(String),
-    ListSet {
-        key: String,
-        index: isize,
-    },
     ListDel {
         key: String,
         index: isize,
     },
     SetAdd(String),
-    SetReplace {
-        key: String,
-        old: String,
-    },
     SetDel {
         key: String,
         member: String,
     },
-    ZsetSet {
-        key: String,
-        old: Option<String>,
-    },
+    /// Add a new member. Editing an existing one goes through `SafeEdit`.
+    ZsetAdd(String),
     ZsetDel {
         key: String,
         member: String,
@@ -993,6 +997,12 @@ pub struct ConsoleState {
 }
 
 pub enum Modal {
+    EditConflict {
+        target: EditTarget,
+        values: Vec<String>,
+        current: Option<String>,
+        error: Option<String>,
+    },
     Confirm {
         message: String,
         action: Action,
@@ -1031,7 +1041,13 @@ pub enum Modal {
     Help,
 }
 
+/// How long the cursor has to rest on a key before its value is read. Long
+/// enough to swallow held-down arrow keys and page jumps, short enough that a
+/// deliberate selection still feels immediate.
+pub const VALUE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
 pub struct App {
+    edit_session: u64,
     pub store: Store,
     pub screen: Screen,
     pub should_quit: bool,
@@ -1065,6 +1081,7 @@ pub struct App {
     pub tree_state: ListState,
     pub pattern: String,
     pub truncated: bool,
+    pub coverage_warnings: Vec<String>,
     pub dbsize: u64,
     pub key_count: usize,
     pub loading: bool,
@@ -1081,6 +1098,14 @@ pub struct App {
     /// A key named by a restored session, selected once the tree is built.
     pending_selection: Option<String>,
 
+    /// When the value of the key under the cursor is due to be fetched.
+    /// Moving the cursor pushes this out, so holding a key down or paging
+    /// through thousands of keys issues one read instead of one per row.
+    value_due: Option<std::time::Instant>,
+    /// The key a value read is in flight for. A reply for anything else has
+    /// been scrolled past and must not replace what is on screen.
+    pending_value: Option<String>,
+
     /// When the TTL clock last advanced.
     last_tick: std::time::Instant,
 }
@@ -1092,6 +1117,7 @@ impl App {
             conn_state.select(Some(0));
         }
         Self {
+            edit_session: 0,
             store,
             screen: Screen::Connections,
             should_quit: false,
@@ -1114,6 +1140,7 @@ impl App {
             tree_state: ListState::default(),
             pattern: "*".into(),
             truncated: false,
+            coverage_warnings: vec![],
             dbsize: 0,
             key_count: 0,
             loading: false,
@@ -1125,6 +1152,8 @@ impl App {
             value_scroll: 0,
             modal: None,
             pending_selection: None,
+            value_due: None,
+            pending_value: None,
             last_tick: std::time::Instant::now(),
         }
     }
@@ -1142,6 +1171,10 @@ impl App {
     }
 
     pub fn connect(&mut self, conn: Connection) {
+        self.edit_session = self.edit_session.wrapping_add(1);
+        if let Some(client) = &self.client {
+            let _ = client.lock_writes();
+        }
         self.connecting = true;
         self.status = format!("Connecting to {}:{} ...", conn.host, conn.port);
         self.spawn(async move {
@@ -1158,12 +1191,21 @@ impl App {
         let pattern = self.pattern.clone();
         self.loading = true;
         self.spawn(async move {
-            match client.scan_keys(&pattern, KEY_LIMIT).await {
-                Ok((keys, truncated)) => {
-                    let dbsize = client.dbsize().await.unwrap_or(0);
+            match client.scan_report(&pattern, KEY_LIMIT).await {
+                Ok(mut report) => {
+                    let dbsize = match client.dbsize().await {
+                        Ok(size) => size,
+                        Err(e) => {
+                            report
+                                .warnings
+                                .push(format!("Total key count unavailable: {e}"));
+                            0
+                        }
+                    };
                     Msg::Keys {
-                        keys,
-                        truncated,
+                        keys: report.keys,
+                        truncated: report.truncated,
+                        warnings: report.warnings,
                         dbsize,
                         pattern,
                     }
@@ -1174,12 +1216,15 @@ impl App {
     }
 
     pub fn reload_value(&mut self) {
+        self.value_due = None;
         let (Some(client), Some(name)) = (
             self.client.clone(),
             self.current.as_ref().map(|k| k.name.clone()),
         ) else {
+            self.pending_value = None;
             return;
         };
+        self.pending_value = Some(name.clone());
         self.spawn(async move {
             match client.key_info(&name).await {
                 Ok(info) => match client.read_value(&info.name, info.kind).await {
@@ -1200,7 +1245,7 @@ impl App {
             return;
         };
         if client.read_only() {
-            self.status = "This connection is read-only — no writes are sent".into();
+            self.status = "This connection is read-only — production profiles can request a 5-minute unlock with Ctrl+w".into();
             return;
         }
         let ok = ok_status.to_string();
@@ -1335,9 +1380,16 @@ impl App {
             Msg::Keys {
                 keys,
                 truncated,
+                warnings,
                 dbsize,
                 pattern,
             } => {
+                self.status = if warnings.is_empty() {
+                    "Keys refreshed".into()
+                } else {
+                    format!("PARTIAL RESULTS: {}", warnings.join("; "))
+                };
+                self.coverage_warnings = warnings;
                 self.loading = false;
                 self.key_count = keys.len();
                 self.truncated = truncated;
@@ -1373,6 +1425,16 @@ impl App {
                 }
             }
             Msg::Value { info, value } => {
+                // A reply for a key the cursor has already left is discarded,
+                // so a slow read can never overwrite a newer selection.
+                if self
+                    .pending_value
+                    .as_deref()
+                    .is_some_and(|pending| pending != info.name)
+                {
+                    return;
+                }
+                self.pending_value = None;
                 let same_key = self.current.as_ref().is_some_and(|c| c.name == info.name);
                 self.current = Some(info);
                 self.value = Some(value);
@@ -1383,6 +1445,39 @@ impl App {
                     let idx = self.value_state.selected().unwrap_or(0);
                     self.value_state
                         .select(Some(idx.min(rows.len().saturating_sub(1))));
+                }
+            }
+            Msg::EditCompleted {
+                session,
+                target,
+                values,
+                result,
+            } => {
+                if session != self.edit_session {
+                    return;
+                }
+                match result {
+                    Ok(EditOutcome::Saved) => {
+                        self.status = "Value saved; TTL preserved".into();
+                        self.reload_keys();
+                        self.reload_value();
+                    }
+                    Ok(EditOutcome::Conflict { current }) => {
+                        self.modal = Some(Modal::EditConflict {
+                            target,
+                            values,
+                            current,
+                            error: None,
+                        });
+                    }
+                    Err(error) => {
+                        self.modal = Some(Modal::EditConflict {
+                            target,
+                            values,
+                            current: None,
+                            error: Some(error),
+                        });
+                    }
                 }
             }
             Msg::Mutated(Ok(status)) => {
@@ -1398,7 +1493,7 @@ impl App {
                 needle,
             } => {
                 self.loading = false;
-                self.status = if keys.is_empty() {
+                let status = if keys.is_empty() {
                     format!("No values contain '{needle}'")
                 } else {
                     format!(
@@ -1409,11 +1504,17 @@ impl App {
                 };
                 let pattern = self.pattern.clone();
                 self.on_msg(Msg::Keys {
+                    warnings: if truncated {
+                        vec!["Value search is incomplete (limit or unavailable nodes)".into()]
+                    } else {
+                        vec![]
+                    },
                     keys,
                     truncated,
                     dbsize: self.dbsize,
                     pattern,
                 });
+                self.status = status;
             }
             Msg::PubSub { channel, payload } => match &mut self.modal {
                 Some(Modal::PubSub(state)) => state.push(channel, payload),
@@ -1640,7 +1741,9 @@ impl App {
                 if let Some(mut c) = self.selected_connection() {
                     // Reconnecting from the list returns to the database this
                     // profile was last browsing.
-                    if let Some(session) = self.store.sessions.get(&c.name) {
+                    if let Some(session) = self.store.sessions.get(&c.name)
+                        && c.deployment != crate::config::Deployment::Cluster
+                    {
                         c.db = session.db;
                     }
                     self.connect(c);
@@ -1855,6 +1958,36 @@ impl App {
                 Field::text("SSH user (optional)", &c.ssh_user),
                 Field::text("SSH port", &c.ssh_port.to_string()),
                 Field::text("SSH private key file (optional)", &c.ssh_key_file),
+                Field::section("Topology (Cluster/Sentinel browsing is read-only)"),
+                Field::choice(
+                    "Deployment",
+                    &["standalone", "cluster", "sentinel"],
+                    match c.deployment {
+                        crate::config::Deployment::Standalone => 0,
+                        crate::config::Deployment::Cluster => 1,
+                        crate::config::Deployment::Sentinel => 2,
+                    },
+                ),
+                Field::text(
+                    "Additional seeds (host:port, comma-separated)",
+                    &c.seeds.join(","),
+                ),
+                Field::text("Sentinel service name", &c.sentinel_master),
+                Field::text("Sentinel username", &c.sentinel_username),
+                Field::secret(
+                    "Sentinel password (${ENV_VAR} supported)",
+                    &c.sentinel_password,
+                ),
+                Field::section("Production safety"),
+                Field::choice(
+                    "Environment",
+                    &["development", "staging", "production"],
+                    match c.environment {
+                        crate::config::Environment::Development => 0,
+                        crate::config::Environment::Staging => 1,
+                        crate::config::Environment::Production => 2,
+                    },
+                ),
             ],
             focus: 1,
             error: None,
@@ -1867,6 +2000,7 @@ impl App {
     fn browser_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('w') if ctrl => self.prompt_write_unlock(),
             KeyCode::Char('d') if ctrl => self.prompt_select_db(),
             KeyCode::Char('n') if ctrl => self.back_to_connections(),
             KeyCode::Char('q') => {
@@ -1977,13 +2111,29 @@ impl App {
                 if self.current.as_ref().map(|c| &c.name) != Some(&k.name) {
                     self.current = Some(k);
                     self.value = None;
-                    self.reload_value();
+                    // Wait for the cursor to settle. A reply already on its way
+                    // for the key we just left is dropped when it arrives.
+                    self.value_due = Some(std::time::Instant::now() + VALUE_DEBOUNCE);
                 }
             }
             None => {
                 self.current = None;
                 self.value = None;
+                self.value_due = None;
+                self.pending_value = None;
             }
+        }
+    }
+
+    /// When the event loop should wake to fetch the value under the cursor.
+    pub fn value_deadline(&self) -> Option<std::time::Instant> {
+        self.value_due
+    }
+
+    /// The cursor has rested long enough: read the key it is sitting on.
+    pub fn on_value_deadline(&mut self) {
+        if self.value_due.take().is_some() {
+            self.reload_value();
         }
     }
 
@@ -2087,6 +2237,10 @@ impl App {
     }
 
     fn back_to_connections(&mut self) {
+        self.edit_session = self.edit_session.wrapping_add(1);
+        if let Some(client) = &self.client {
+            let _ = client.lock_writes();
+        }
         self.save_session();
         self.stop_feeds();
         self.client = None;
@@ -2388,10 +2542,7 @@ impl App {
                 fields: vec![Field::text("Field", ""), Field::text("Value", "")],
                 focus: 0,
                 error: None,
-                action: Action::HashSet {
-                    key: name,
-                    field: None,
-                },
+                action: Action::HashAdd(name),
             },
             KeyType::List => Modal::Form {
                 title: format!("Append to '{name}' (RPUSH)"),
@@ -2415,10 +2566,7 @@ impl App {
                 fields: vec![Field::text("Member", ""), Field::text("Score", "0")],
                 focus: 0,
                 error: None,
-                action: Action::ZsetSet {
-                    key: name,
-                    old: None,
-                },
+                action: Action::ZsetAdd(name),
             },
             KeyType::Stream => Modal::Form {
                 title: format!("Add entry to '{name}' (XADD *)"),
@@ -2455,14 +2603,17 @@ impl App {
         if matches!(k.kind, KeyType::String | KeyType::Json) {
             let current = match &self.value {
                 Some(KeyValue::Str(s)) => s.clone(),
-                _ => String::new(),
+                _ => {
+                    self.status = "Wait for the value to load before editing".into();
+                    return;
+                }
             };
             // JSON opens indented, however it was stored.
             let mode = json::mode(&current);
             let text = if mode.is_json() {
                 json::pretty(&current)
             } else {
-                current
+                current.clone()
             };
             let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
             ta.set_cursor_line_style(ratatui::style::Style::default());
@@ -2480,11 +2631,12 @@ impl App {
             } else {
                 mode
             };
-            let action = if k.kind == KeyType::Json {
-                Action::EditJson(name)
-            } else {
-                Action::EditString(name)
-            };
+            let action = Action::SafeEdit(EditTarget {
+                key: name,
+                kind: k.kind,
+                selector: String::new(),
+                original: current,
+            });
             self.modal = Some(Modal::Editor {
                 title,
                 textarea: Box::new(ta),
@@ -2505,10 +2657,7 @@ impl App {
                 fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
                 focus: 0,
                 error: None,
-                action: Action::HashSet {
-                    key: name,
-                    field: Some(row.id),
-                },
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default() }),
             },
             KeyType::List => {
                 let index: isize = row.id.parse().unwrap_or(0);
@@ -2518,7 +2667,7 @@ impl App {
                     fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
                     focus: 0,
                     error: None,
-                    action: Action::ListSet { key: name, index },
+                    action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: index.to_string(), original: row.cells.get(1).cloned().unwrap_or_default() }),
                 }
             }
             KeyType::Set => Modal::Form {
@@ -2527,10 +2676,7 @@ impl App {
                 fields: vec![Field::text("Member", &row.id)],
                 focus: 0,
                 error: None,
-                action: Action::SetReplace {
-                    key: name,
-                    old: row.id,
-                },
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id.clone(), original: row.id }),
             },
             KeyType::ZSet => Modal::Form {
                 title: "Edit sorted-set member".into(),
@@ -2541,10 +2687,7 @@ impl App {
                 ],
                 focus: 0,
                 error: None,
-                action: Action::ZsetSet {
-                    key: name,
-                    old: Some(row.id),
-                },
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default() }),
             },
             KeyType::TimeSeries => Modal::Message {
                 title: "Not editable".into(),
@@ -2557,6 +2700,47 @@ impl App {
                 scroll: 0,
             },
         });
+    }
+
+    fn reopen_edit(&mut self, target: EditTarget, values: Vec<String>) {
+        let value = values.first().cloned().unwrap_or_default();
+        if matches!(target.kind, KeyType::String | KeyType::Json) {
+            let mode = if target.kind == KeyType::Json {
+                JsonMode::Pretty
+            } else {
+                json::mode(&target.original)
+            };
+            let text = if mode.is_json() {
+                json::pretty(&value)
+            } else {
+                value
+            };
+            let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
+            ta.set_cursor_line_style(ratatui::style::Style::default());
+            self.modal = Some(Modal::Editor {
+                title: format!("Edit '{}'", target.key),
+                textarea: Box::new(ta),
+                action: Action::SafeEdit(target),
+                json: mode,
+                error: None,
+            });
+        } else {
+            let mut fields = vec![Field::text("Value / member", &value)];
+            if target.kind == KeyType::ZSet {
+                fields.push(Field::text(
+                    "Score",
+                    values.get(1).map_or("", String::as_str),
+                ));
+            }
+            self.modal = Some(Modal::Form {
+                title: format!("Edit '{}'", target.key),
+                hint: "Enter saves with conflict detection · Esc cancels".into(),
+                fields,
+                focus: 0,
+                error: None,
+                action: Action::SafeEdit(target),
+            });
+        }
     }
 
     fn confirm_delete_row(&mut self) {
@@ -2762,6 +2946,34 @@ impl App {
         self.client.as_ref().is_some_and(Client::read_only)
     }
 
+    fn prompt_write_unlock(&mut self) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        if !client.production() {
+            self.status = "Write unlock is for production profiles".into();
+            return;
+        }
+        if client.write_lease_remaining() > 0 {
+            self.status = match client.lock_writes() {
+                Ok(()) => "Production writes locked".into(),
+                Err(e) => e.to_string(),
+            };
+            return;
+        }
+        self.modal = Some(Modal::Form {
+            title: "Unlock production writes for 5 minutes".into(),
+            hint: format!(
+                "Type '{}' exactly. Ctrl+w locks again; reconnecting locks automatically.",
+                client.conn.name
+            ),
+            fields: vec![Field::text("Profile name", "")],
+            focus: 0,
+            error: None,
+            action: Action::UnlockWrites,
+        });
+    }
+
     fn refuse_write(&mut self) -> bool {
         if self.read_only() {
             self.status = "This connection is read-only — no writes are sent".into();
@@ -2924,6 +3136,38 @@ impl App {
                     _ => {}
                 }
             }
+            Modal::EditConflict {
+                target,
+                values,
+                error,
+                ..
+            } => match key.code {
+                KeyCode::Char('e') => {
+                    let (target, values) = (target.clone(), values.clone());
+                    self.reopen_edit(target, values);
+                }
+                KeyCode::Char('r') => {
+                    self.modal = None;
+                    self.reload_value();
+                    self.status = "Reloading current value; press e to start a new edit".into();
+                }
+                KeyCode::Char('o') if error.is_none() => {
+                    let (target, values) = (target.clone(), values.clone());
+                    self.modal = Some(Modal::Form {
+                        title: "Overwrite changed value".into(),
+                        hint: format!(
+                            "Type '{}' exactly to overwrite. Missing or replaced keys remain protected.",
+                            target.key
+                        ),
+                        fields: vec![Field::text("Key name", "")],
+                        focus: 0,
+                        error: None,
+                        action: Action::OverwriteEdit { target, values },
+                    });
+                }
+                KeyCode::Esc => self.modal = None,
+                _ => {}
+            },
             Modal::Confirm { action, .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     let action = action.clone();
@@ -3453,6 +3697,16 @@ impl App {
     }
 
     fn run_console(&mut self, line: String) {
+        if self.client.as_ref().is_some_and(Client::production)
+            && (!Client::command_is_read_only(&line) || is_destructive(&line))
+        {
+            self.run_action(Action::RunCommand(line), Vec::new());
+        } else {
+            self.run_console_confirmed(line);
+        }
+    }
+
+    fn run_console_confirmed(&mut self, line: String) {
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -3466,19 +3720,23 @@ impl App {
             return;
         }
         // `SELECT` through the console would desync our idea of the current db.
-        let select_target = parse_select(&line);
+        if let Some(db) = parse_select(&line) {
+            self.switch_db(db);
+            return;
+        }
         self.spawn(async move {
             match client.execute_raw(&line).await {
                 Ok(out) => Msg::Console(if out.is_empty() { "OK".into() } else { out }),
                 Err(e) => Msg::Console(format!("(error) {e}")),
             }
         });
-        if let Some(db) = select_target {
-            self.switch_db(db);
-        }
     }
 
     fn switch_db(&mut self, db: i64) {
+        self.edit_session = self.edit_session.wrapping_add(1);
+        if let Some(client) = &self.client {
+            let _ = client.lock_writes();
+        }
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -3493,9 +3751,107 @@ impl App {
         });
     }
 
+    fn submit_edit(&mut self, target: EditTarget, values: Vec<String>, overwrite: bool) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let session = self.edit_session;
+        self.status = "Saving with conflict detection ...".into();
+        self.spawn(async move {
+            let result = client
+                .save_edit(&target, &values, overwrite)
+                .await
+                .map_err(|e| e.to_string());
+            Msg::EditCompleted {
+                session,
+                target,
+                values,
+                result,
+            }
+        });
+    }
+
     fn run_action(&mut self, action: Action, values: Vec<String>) {
+        let destructive = match &action {
+            Action::NewKey
+            | Action::DeleteKey(_)
+            | Action::DeleteMarked(_)
+            | Action::RenameKey(_)
+            | Action::SetTtl(_)
+            | Action::TtlMarked(_)
+            | Action::HashDel { .. }
+            | Action::ListDel { .. }
+            | Action::SetDel { .. }
+            | Action::ZsetDel { .. }
+            | Action::StreamDel { .. }
+            | Action::TsDel { .. }
+            | Action::Import
+            | Action::SetConfig(_)
+            | Action::KillClient(_)
+            | Action::ResetSlowlog
+            | Action::DestroyGroup { .. }
+            | Action::RunLua
+            | Action::CopyKey(_) => true,
+            Action::RunCommand(line) => !Client::command_is_read_only(line) || is_destructive(line),
+            _ => false,
+        };
+        if destructive
+            && let Some(client) = &self.client
+            && client.production()
+        {
+            let profile = client.conn.name.clone();
+            self.modal = Some(Modal::Form {
+                title: "Confirm production change".into(),
+                hint: format!("Type '{profile}' exactly to execute this operation."),
+                fields: vec![Field::text("Profile name", "")],
+                focus: 0,
+                error: None,
+                action: Action::ProductionConfirm {
+                    action: Box::new(action),
+                    values,
+                    profile,
+                },
+            });
+            return;
+        }
+        self.run_action_inner(action, values);
+    }
+
+    fn run_action_inner(&mut self, action: Action, values: Vec<String>) {
         let v = |i: usize| values.get(i).cloned().unwrap_or_default();
         match action {
+            Action::SafeEdit(target) => self.submit_edit(target, values, false),
+            Action::OverwriteEdit {
+                target,
+                values: draft,
+            } => {
+                if v(0) == target.key {
+                    self.submit_edit(target, draft, true);
+                }
+            }
+            Action::UnlockWrites => {
+                if let Some(client) = &self.client {
+                    self.status = match client.unlock_writes(&v(0)) {
+                        Ok(()) => {
+                            "Production writes unlocked for 5 minutes — Ctrl+w locks now".into()
+                        }
+                        Err(e) => format!("Cannot unlock: {e}"),
+                    };
+                }
+            }
+            Action::ProductionConfirm {
+                action,
+                values: pending,
+                profile,
+            } => {
+                if v(0) != profile || !self.client.as_ref().is_some_and(|c| c.conn.name == profile)
+                {
+                    self.status =
+                        "Production confirmation does not match the current profile".into();
+                    return;
+                }
+                self.run_action_inner(*action, pending);
+            }
             Action::SaveConnection { replacing } => {
                 let previous = replacing
                     .as_deref()
@@ -3528,6 +3884,25 @@ impl App {
                     ssh_user: v(14).trim().to_string(),
                     ssh_port: v(15).trim().parse().unwrap_or(22),
                     ssh_key_file: v(16).trim().to_string(),
+                    deployment: match v(17).as_str() {
+                        "cluster" => crate::config::Deployment::Cluster,
+                        "sentinel" => crate::config::Deployment::Sentinel,
+                        _ => crate::config::Deployment::Standalone,
+                    },
+                    seeds: v(18)
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    sentinel_master: v(19).trim().to_string(),
+                    sentinel_username: v(20).trim().to_string(),
+                    sentinel_password: v(21),
+                    environment: match v(22).as_str() {
+                        "production" => crate::config::Environment::Production,
+                        "staging" => crate::config::Environment::Staging,
+                        _ => crate::config::Environment::Development,
+                    },
                 };
                 let new_name = conn.name.clone();
                 self.store.upsert(conn, replacing.as_deref());
@@ -3605,18 +3980,6 @@ impl App {
                     c.set_ttl(&name, seconds).await
                 });
             }
-            Action::EditString(name) => {
-                let value = v(0);
-                self.mutate("Value saved", move |c| async move {
-                    c.set_string(&name, &value).await
-                });
-            }
-            Action::EditJson(name) => {
-                let value = v(0);
-                self.mutate("Document saved", move |c| async move {
-                    c.json_set(&name, "$", &value).await
-                });
-            }
             Action::TsAdd(name) => {
                 let (ts, value) = (v(0), v(1));
                 self.mutate("Sample added", move |c| async move {
@@ -3628,11 +3991,8 @@ impl App {
                     c.ts_del(&key, &timestamp).await
                 });
             }
-            Action::HashSet { key, field } => {
-                let (f, val) = match field {
-                    Some(f) => (f, v(0)),
-                    None => (v(0), v(1)),
-                };
+            Action::HashAdd(key) => {
+                let (f, val) = (v(0), v(1));
                 self.mutate("Field saved", move |c| async move {
                     c.hash_set(&key, &f, &val).await
                 });
@@ -3646,12 +4006,6 @@ impl App {
                     c.list_push(&key, &val).await
                 });
             }
-            Action::ListSet { key, index } => {
-                let val = v(0);
-                self.mutate("Item saved", move |c| async move {
-                    c.list_set(&key, index, &val).await
-                });
-            }
             Action::ListDel { key, index } => self.mutate("Item deleted", move |c| async move {
                 c.list_remove_at(&key, index).await
             }),
@@ -3662,27 +4016,13 @@ impl App {
                     move |c| async move { c.set_add(&key, &m).await },
                 );
             }
-            Action::SetReplace { key, old } => {
-                let new = v(0);
-                self.mutate("Member replaced", move |c| async move {
-                    if new != old {
-                        c.set_remove(&key, &old).await?;
-                    }
-                    c.set_add(&key, &new).await
-                });
-            }
             Action::SetDel { key, member } => self.mutate("Member removed", move |c| async move {
                 c.set_remove(&key, &member).await
             }),
-            Action::ZsetSet { key, old } => {
+            Action::ZsetAdd(key) => {
                 let member = v(0);
                 let score: f64 = v(1).trim().parse().unwrap_or(0.0);
                 self.mutate("Member saved", move |c| async move {
-                    if let Some(old) = old
-                        && old != member
-                    {
-                        c.zset_remove(&key, &old).await?;
-                    }
                     c.zset_add(&key, &member, score).await
                 });
             }
@@ -4043,7 +4383,7 @@ impl App {
                 if let Some(Modal::Console(c)) = &mut self.modal {
                     c.log.push(format!("> {line}"));
                 }
-                self.run_console(line);
+                self.run_console_confirmed(line);
             }
         }
     }
@@ -4053,6 +4393,21 @@ impl App {
 fn validate(action: &Action, values: &[String]) -> Option<String> {
     let get = |i: usize| values.get(i).map(|s| s.trim()).unwrap_or("");
     match action {
+        Action::OverwriteEdit { target, .. } if values.first() != Some(&target.key) => {
+            Some("Type the exact key name".into())
+        }
+        Action::SafeEdit(target)
+            if target.kind == KeyType::ZSet
+                && values
+                    .get(1)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_none_or(f64::is_nan) =>
+        {
+            Some("Enter a valid score".into())
+        }
+        Action::ProductionConfirm { profile, .. } if values.first() != Some(profile) => {
+            Some("Type the exact profile name".into())
+        }
         Action::SaveConnection { .. } => {
             if get(0).is_empty() {
                 return Some("Name is required".into());
@@ -4062,6 +4417,22 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
             }
             if get(3).parse::<i64>().is_err() {
                 return Some("Database must be a number".into());
+            }
+            if get(17) == "cluster" && get(3) != "0" {
+                return Some("Cluster supports database 0 only".into());
+            }
+            if get(17) == "sentinel" && get(19).is_empty() {
+                return Some("Sentinel service name is required".into());
+            }
+            if matches!(get(17), "cluster" | "sentinel") && !get(13).is_empty() {
+                return Some(
+                    "Topology discovery requires direct access to advertised nodes".into(),
+                );
+            }
+            for seed in get(18).split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Err(e) = crate::config::parse_endpoint(seed) {
+                    return Some(format!("Invalid seed: {e}"));
+                }
             }
             // Opting into the keychain on a machine without one would silently
             // lose the password.
@@ -4095,18 +4466,16 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
         Action::SelectDb => {
             (get(0).parse::<i64>().is_err()).then(|| "DB index must be a number".into())
         }
-        Action::ZsetSet { .. } => {
+        Action::ZsetAdd(_) => {
             if get(0).is_empty() {
                 return Some("Member is required".into());
             }
             (get(1).parse::<f64>().is_err()).then(|| "Score must be a number".into())
         }
-        Action::HashSet { field: None, .. } | Action::StreamAdd(_) => {
+        Action::HashAdd(_) | Action::StreamAdd(_) => {
             (get(0).is_empty()).then(|| "Field is required".into())
         }
-        Action::SetAdd(_) | Action::SetReplace { .. } => {
-            (get(0).is_empty()).then(|| "Member cannot be empty".into())
-        }
+        Action::SetAdd(_) => (get(0).is_empty()).then(|| "Member cannot be empty".into()),
         _ => None,
     }
 }
@@ -4490,6 +4859,7 @@ mod tests {
         let mut app = App::new(crate::config::Store::default(), tx);
         app.screen = Screen::Browser;
         app.on_msg(Msg::Keys {
+            warnings: vec![],
             dbsize: keys.len() as u64,
             keys,
             truncated: false,

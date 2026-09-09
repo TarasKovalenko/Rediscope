@@ -57,6 +57,26 @@ fn title_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
     ];
     if let Some(client) = &app.client {
         let c = &client.conn;
+        if client.production() {
+            let lease = client.write_lease_remaining();
+            let label = if client.read_only() {
+                " PRODUCTION LOCKED ".to_string()
+            } else {
+                format!(" PRODUCTION WRITE {lease}s ")
+            };
+            spans.push(Span::styled(
+                label,
+                Style::new()
+                    .bg(palette.red)
+                    .fg(palette.highlight_foreground)
+                    .bold(),
+            ));
+        } else if c.environment == crate::config::Environment::Staging {
+            spans.push(Span::styled(
+                " STAGING ",
+                Style::new().fg(palette.warning).bold(),
+            ));
+        }
         let scheme = if c.tls { "rediss" } else { "redis" };
         spans.push(Span::styled(
             format!("{}  {scheme}://{}:{}/{}", c.name, c.host, c.port, c.db),
@@ -70,7 +90,7 @@ fn title_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
         }
         // A read-only session says so where it cannot be missed: every write
         // is refused, and that should never come as a surprise.
-        if c.read_only {
+        if client.read_only() {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
                 " READ-ONLY ",
@@ -144,6 +164,12 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                     Style::new().fg(palette.dim),
                 ),
             ];
+            if c.environment != crate::config::Environment::Development {
+                spans.push(Span::styled(
+                    format!("  {}", c.environment.name().to_uppercase()),
+                    Style::new().fg(palette.red).bold(),
+                ));
+            }
             if c.tls {
                 spans.push(Span::styled("  TLS", Style::new().fg(palette.success)));
             }
@@ -156,7 +182,13 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             if c.use_keychain {
                 spans.push(Span::styled("  keychain", Style::new().fg(palette.info)));
             }
-            if c.read_only {
+            if c.deployment != crate::config::Deployment::Standalone {
+                spans.push(Span::styled(
+                    format!("  {}", c.deployment.name()),
+                    Style::new().fg(palette.info),
+                ));
+            }
+            if c.read_only || c.deployment != crate::config::Deployment::Standalone {
                 spans.push(Span::styled(
                     "  read-only",
                     Style::new().fg(palette.warning),
@@ -286,11 +318,16 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
 
     let mut title = if app.loading {
         "Keys — scanning…".to_string()
+    } else if !app.coverage_warnings.is_empty() {
+        format!("Keys — {} shown / coverage incomplete", app.key_count)
     } else {
         format!("Keys — {} shown / {} in db", app.key_count, app.dbsize)
     };
     if app.pattern != "*" {
         title.push_str(&format!("  ·  {}", app.pattern));
+    }
+    if !app.coverage_warnings.is_empty() {
+        title.push_str(" · PARTIAL RESULTS");
     }
     if app.truncated {
         title.push_str("  ·  TRUNCATED");
@@ -313,8 +350,12 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
 
     if app.rows.is_empty() && !app.loading {
         f.render_widget(
-            Paragraph::new("No keys match. Press / to change the pattern.")
-                .style(Style::new().fg(palette.dim)),
+            Paragraph::new(if app.coverage_warnings.is_empty() {
+                "No keys match. Press / to change the pattern."
+            } else {
+                "Partial results: nodes were unavailable. Refresh to retry discovery."
+            })
+            .style(Style::new().fg(palette.dim)),
             rows[1].inner(Margin::new(2, 1)),
         );
     }
@@ -349,6 +390,19 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                     ),
                     Span::styled(json_badge(&app.value), Style::new().fg(palette.info).bold()),
                     Span::styled(format!("   ttl: {ttl}"), Style::new().fg(palette.dim)),
+                    Span::styled(
+                        if app.client.as_ref().is_some_and(|c| {
+                            c.conn.deployment == crate::config::Deployment::Cluster
+                        }) {
+                            format!(
+                                "   slot: {}",
+                                crate::redis_client::key_slot(k.name.as_bytes())
+                            )
+                        } else {
+                            String::new()
+                        },
+                        Style::new().fg(palette.info),
+                    ),
                     Span::styled(size, Style::new().fg(palette.dim)),
                 ]),
             ])
@@ -557,6 +611,39 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                     .wrap(Wrap { trim: true })
                     .scroll((*scroll, 0))
                     .block(panel(&heading, true, palette)),
+                rect,
+            );
+        }
+        Modal::EditConflict {
+            target,
+            values,
+            current,
+            error,
+        } => {
+            let rect = centered(area, 88, 22);
+            f.render_widget(Clear, rect);
+            let title = if error.is_some() {
+                "Save failed — draft retained"
+            } else {
+                "Value changed — nothing saved"
+            };
+            let body = format!(
+                "Key: {}\n\nORIGINAL\n{}\n\nCURRENT\n{}\n\nYOUR DRAFT\n{}\n\n{}\ne: edit draft · r: discard draft and reload · o: confirm overwrite · Esc: close",
+                target.key,
+                truncate(&target.original, 300),
+                current
+                    .as_deref()
+                    .map(|s| truncate(s, 300))
+                    .unwrap_or_else(|| "Unavailable, missing, or key type changed".into()),
+                truncate(&values.join("\n"), 300),
+                error
+                    .as_deref()
+                    .unwrap_or("Another writer changed this value. Compare before continuing.")
+            );
+            f.render_widget(
+                Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .block(panel(title, true, palette)),
                 rect,
             );
         }
@@ -1856,6 +1943,10 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         row("L", "run a Lua script — marked keys become KEYS[1..]"),
         row(":", "raw command console — tab completes, ctrl+r searches"),
         row("ctrl+d", "switch database (reconnects)"),
+        row(
+            "ctrl+w",
+            "production: unlock writes for 5 minutes, or lock them now",
+        ),
         row("ctrl+n", "back to the server list"),
         row("q", "quit"),
     ]

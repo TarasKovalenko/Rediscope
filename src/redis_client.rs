@@ -8,7 +8,19 @@ use redis::{
     RedisConnectionInfo, TlsCertificates,
 };
 
-use crate::config::Connection;
+use crate::config::{Connection, Deployment};
+mod edit;
+mod topology;
+pub use edit::{EditOutcome, EditTarget};
+use topology::Transport;
+pub use topology::{Node, key_slot};
+
+#[derive(Clone, Debug, Default)]
+pub struct ScanReport {
+    pub keys: Vec<KeyInfo>,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
+}
 
 /// Hard ceiling on keys pulled into one tree view.
 pub const KEY_LIMIT: usize = 5_000;
@@ -105,7 +117,7 @@ pub enum KeyValue {
 #[derive(Clone)]
 pub struct Client {
     pub conn: Connection,
-    mgr: MultiplexedConnection,
+    mgr: Transport,
     /// Kept so a feature needing a connection of its own — pub/sub, which
     /// cannot share the multiplexed one — can open it.
     raw: redis::Client,
@@ -608,6 +620,7 @@ impl Client {
     }
 
     pub async fn connect(conn: Connection) -> Result<Self> {
+        conn.validate_topology()?;
         // Opening the tunnel shells out and blocks on a TCP probe; keep both
         // off the runtime's worker threads.
         let tunnel = if conn.uses_ssh() {
@@ -620,14 +633,7 @@ impl Client {
         };
         let via = tunnel.as_ref().map(|t| t.local_port);
         let client = build_client(&conn, via).await?;
-        let mut mgr = client
-            .get_multiplexed_async_connection_with_config(
-                &redis::AsyncConnectionConfig::new()
-                    .set_connection_timeout(Some(std::time::Duration::from_secs(5)))
-                    .set_response_timeout(Some(std::time::Duration::from_secs(10))),
-            )
-            .await?;
-        redis::cmd("PING").query_async::<()>(&mut mgr).await?;
+        let mgr = Transport::new(conn.clone(), client.clone()).await?;
         Ok(Self {
             conn,
             mgr,
@@ -639,12 +645,42 @@ impl Client {
     /// True when the profile refuses writes. Checked before every mutation so
     /// a read-only server cannot be edited by any route, including the console.
     pub fn read_only(&self) -> bool {
-        self.conn.read_only
+        self.mgr.read_only()
+    }
+
+    /// Use the same conservative classification as the final dispatch guard.
+    pub fn command_is_read_only(line: &str) -> bool {
+        let Ok(args) = split_args(line) else {
+            return false;
+        };
+        let Some(head) = args.first() else {
+            return true;
+        };
+        let mut cmd = redis::cmd(head);
+        cmd.arg(&args[1..]);
+        topology::read_route(&cmd).0
+    }
+
+    pub fn production(&self) -> bool {
+        self.conn.environment == crate::config::Environment::Production
+    }
+    pub fn write_lease_remaining(&self) -> u64 {
+        self.mgr.remaining()
+    }
+    pub fn unlock_writes(&self, confirmation: &str) -> Result<()> {
+        self.mgr.unlock(confirmation)
+    }
+    pub fn lock_writes(&self) -> Result<()> {
+        self.mgr.lock()
     }
 
     /// A connection of its own, for pub/sub. The multiplexed connection cannot
     /// be put into subscriber mode without breaking every other caller.
     pub async fn pubsub(&self) -> Result<redis::aio::PubSub> {
+        anyhow::ensure!(
+            self.conn.deployment == Deployment::Standalone,
+            "Pub/sub is not supported for discovered deployments yet"
+        );
         Ok(self.raw.get_async_pubsub().await?)
     }
 
@@ -699,6 +735,10 @@ impl Client {
         stride: u64,
         rollup: &mut crate::memory::Rollup,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            self.conn.deployment != Deployment::Cluster,
+            "Cluster memory rollups are not available yet; use per-node diagnostics"
+        );
         let mut c = self.mgr.clone();
         let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(scan.cursor)
@@ -748,6 +788,15 @@ impl Client {
     }
 
     pub async fn dbsize(&self) -> Result<u64> {
+        if self.conn.deployment == Deployment::Cluster {
+            let mut total = 0;
+            for ep in self.mgr.primaries().await {
+                total += redis::from_redis_value::<u64>(
+                    self.mgr.direct(&ep, &redis::cmd("DBSIZE")).await?,
+                )?;
+            }
+            return Ok(total);
+        }
         let mut c = self.mgr.clone();
         Ok(redis::cmd("DBSIZE").query_async(&mut c).await?)
     }
@@ -755,11 +804,58 @@ impl Client {
     /// Full `INFO` for the server pane. Falls back to the default sections
     /// when a managed provider rejects `INFO all`.
     pub async fn info(&self) -> Result<ServerInfo> {
+        if self.conn.deployment == Deployment::Cluster {
+            let mut raw = String::new();
+            let mut node_sections = Vec::new();
+            for ep in self.mgr.primaries().await {
+                match self
+                    .mgr
+                    .direct(&ep, &redis::cmd("INFO"))
+                    .await
+                    .and_then(|v| redis::from_redis_value::<String>(v).map_err(Into::into))
+                {
+                    Ok(node_raw) => {
+                        if raw.is_empty() {
+                            raw = node_raw.clone();
+                        }
+                        let mut parsed = ServerInfo::parse(&node_raw);
+                        for section in &mut parsed.sections {
+                            section.name = format!("{}:{} {}", ep.0, ep.1, section.name);
+                        }
+                        node_sections.extend(parsed.sections);
+                    }
+                    Err(e) => node_sections.push(InfoSection {
+                        name: format!("{}:{} unavailable", ep.0, ep.1),
+                        fields: vec![("error".into(), e.to_string())],
+                    }),
+                }
+            }
+            let mut info = ServerInfo::parse(&raw);
+            node_sections.push(InfoSection {
+                name: "Topology".into(),
+                fields: self.topology_rows().await,
+            });
+            for section in &node_sections {
+                raw.push_str(&format!("\r\n# {}\r\n", section.name));
+                for (k, v) in &section.fields {
+                    raw.push_str(&format!("{k}:{v}\r\n"));
+                }
+            }
+            info.sections.extend(node_sections);
+            info.raw = raw;
+            return Ok(info);
+        }
         let mut c = self.mgr.clone();
-        let raw: String = match redis::cmd("INFO").arg("all").query_async(&mut c).await {
+        let mut raw: String = match redis::cmd("INFO").arg("all").query_async(&mut c).await {
             Ok(raw) => raw,
             Err(_) => redis::cmd("INFO").query_async(&mut c).await?,
         };
+        if self.conn.deployment == Deployment::Sentinel {
+            raw.push_str("\r\n# Topology\r\n");
+            for (key, value) in self.topology_rows().await {
+                raw.push_str(&format!("{key}:{value}\r\n"));
+            }
+        }
         Ok(ServerInfo::parse(&raw))
     }
 
@@ -775,7 +871,155 @@ impl Client {
 
     /// Cursor-based keyspace listing. Never issues `KEYS *`.
     /// Returns the keys plus whether the limit truncated the result.
+    /// Compatibility API: the boolean also signals incomplete node coverage.
     pub async fn scan_keys(&self, pattern: &str, limit: usize) -> Result<(Vec<KeyInfo>, bool)> {
+        let report = self.scan_report(pattern, limit).await?;
+        Ok((report.keys, report.truncated || !report.warnings.is_empty()))
+    }
+
+    pub async fn refresh_topology(&self) -> Result<Vec<Node>> {
+        self.mgr.refresh().await?;
+        Ok(self.mgr.nodes().await)
+    }
+
+    pub async fn scan_report(&self, pattern: &str, limit: usize) -> Result<ScanReport> {
+        if self.conn.deployment != Deployment::Cluster {
+            let (keys, truncated) = self.scan_standalone(pattern, limit).await?;
+            return Ok(ScanReport {
+                keys,
+                truncated,
+                warnings: vec![],
+            });
+        }
+        let mut report = ScanReport::default();
+        if let Err(e) = self.mgr.refresh().await {
+            report.warnings.push(format!("Stale topology: {e}"));
+        }
+        let primaries = self.mgr.primaries().await;
+        let nodes = self.mgr.nodes().await;
+        let mut slots = vec![false; 16384];
+        for n in &nodes {
+            for &(a, b) in &n.slots {
+                slots[a as usize..=b as usize].fill(true);
+            }
+        }
+        let missing = slots.iter().filter(|s| !**s).count();
+        if missing > 0 {
+            report
+                .warnings
+                .push(format!("{missing} slots have no known primary"));
+        }
+        use futures_util::{StreamExt, stream};
+        let batches = stream::iter(primaries.into_iter().map(|ep| async move {
+            let mut cursor = 0u64;
+            let mut names = std::collections::BTreeSet::new();
+            let mut warning = None;
+            let mut truncated = false;
+            loop {
+                let result = self
+                    .mgr
+                    .direct(
+                        &ep,
+                        redis::cmd("SCAN")
+                            .arg(cursor)
+                            .arg("MATCH")
+                            .arg(pattern)
+                            .arg("COUNT")
+                            .arg(500),
+                    )
+                    .await
+                    .and_then(|v| {
+                        redis::from_redis_value::<(u64, Vec<String>)>(v).map_err(Into::into)
+                    });
+                match result {
+                    Ok((next, batch)) => {
+                        names.extend(batch);
+                        cursor = next;
+                        if names.len() >= limit || cursor == 0 {
+                            truncated = cursor != 0 || names.len() > limit;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warning = Some(format!("{}:{} SCAN unavailable: {e}", ep.0, ep.1));
+                        break;
+                    }
+                }
+            }
+            (ep, names, truncated, warning)
+        }))
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+        let mut names = std::collections::BTreeMap::new();
+        for (ep, batch, truncated, warning) in batches {
+            for name in batch {
+                names.entry(name).or_insert_with(|| ep.clone());
+            }
+            report.truncated |= truncated;
+            if let Some(warning) = warning {
+                report.warnings.push(warning);
+            }
+        }
+        report.truncated |= names.len() > limit;
+        let mut by_node = std::collections::BTreeMap::<_, Vec<String>>::new();
+        for (name, ep) in names.into_iter().take(limit) {
+            by_node.entry(ep).or_default().push(name);
+        }
+        for (ep, names) in by_node {
+            // At most two metadata commands per retained key, in one node-local
+            // pipeline. A dead node costs one failed batch, not one timeout per key.
+            let metadata = self.mgr.metadata(&ep, &names).await;
+            let mut unknown = 0;
+            for (i, name) in names.into_iter().enumerate() {
+                let pair = metadata.as_ref().ok().and_then(|values| {
+                    Some((
+                        values.get(i * 2)?.clone().extract_error(),
+                        values.get(i * 2 + 1)?.clone().extract_error(),
+                    ))
+                });
+                let info = match pair {
+                    Some((Ok(kind), Ok(ttl))) => match (
+                        redis::from_redis_value::<String>(kind),
+                        redis::from_redis_value::<i64>(ttl),
+                    ) {
+                        (Ok(kind), Ok(ttl)) => Some(KeyInfo {
+                            name: name.clone(),
+                            kind: KeyType::parse(&kind),
+                            ttl,
+                        }),
+                        _ => None,
+                    },
+                    Some((Err(e), _)) | Some((_, Err(e))) if e.redirect_node().is_some() => {
+                        self.key_info(&name).await.ok()
+                    }
+                    _ => None,
+                };
+                match info {
+                    Some(info) if info.ttl != -2 => report.keys.push(info),
+                    Some(_) => {}
+                    None => {
+                        unknown += 1;
+                        report.keys.push(KeyInfo {
+                            name,
+                            kind: KeyType::Other,
+                            ttl: -2,
+                        });
+                    }
+                }
+            }
+            if unknown > 0 {
+                report.warnings.push(format!(
+                    "{}:{} metadata unavailable for {unknown} keys; displayed as unknown",
+                    ep.0, ep.1
+                ));
+            }
+        }
+        report.keys.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(report)
+    }
+
+    async fn scan_standalone(&self, pattern: &str, limit: usize) -> Result<(Vec<KeyInfo>, bool)> {
         let mut c = self.mgr.clone();
         let mut cursor: u64 = 0;
         let mut names: Vec<String> = Vec::new();
@@ -794,10 +1038,10 @@ impl Client {
                 break;
             }
         }
-        let truncated = names.len() > limit;
+        let truncated = cursor != 0 || names.len() > limit;
         names.truncate(limit);
         if names.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), truncated));
         }
 
         let mut type_pipe = redis::pipe();
@@ -979,22 +1223,12 @@ impl Client {
                 }
             }
             KeyType::Json => {
-                // `JSON.GET key $` always answers with a one-element array;
-                // the bare path gives the document as stored.
                 let doc: Option<String> = redis::cmd("JSON.GET")
                     .arg(name)
-                    .arg("$")
+                    .arg(".")
                     .query_async(&mut c)
                     .await?;
-                let doc = doc.unwrap_or_else(|| "null".into());
-                // Unwrap the `$` envelope so the pane shows the document.
-                let text = match serde_json::from_str::<serde_json::Value>(&doc) {
-                    Ok(serde_json::Value::Array(mut items)) if items.len() == 1 => {
-                        serde_json::to_string(&items.remove(0)).unwrap_or(doc)
-                    }
-                    _ => doc,
-                };
-                KeyValue::Str(text)
+                KeyValue::Str(doc.unwrap_or_else(|| "null".into()))
             }
             KeyType::TimeSeries => {
                 let raw: Vec<(u64, f64)> = redis::cmd("TS.RANGE")
@@ -1106,7 +1340,12 @@ impl Client {
 
     pub async fn set_string(&self, name: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: () = c.set(name, value).await?;
+        redis::cmd("SET")
+            .arg(name)
+            .arg(value)
+            .arg("KEEPTTL")
+            .query_async::<()>(&mut c)
+            .await?;
         Ok(())
     }
 
@@ -1234,6 +1473,45 @@ impl Client {
 
     // ---- diagnostics ------------------------------------------------------
 
+    async fn topology_rows(&self) -> Vec<(String, String)> {
+        let mut rows = vec![("deployment".into(), self.conn.deployment.name().into())];
+        if let Err(e) = self.mgr.refresh().await {
+            rows.push(("refresh_error".into(), e.to_string()));
+        }
+        if let Some(warning) = self.mgr.warning().await {
+            rows.push(("coverage_warning".into(), warning));
+        }
+        for (i, node) in self.mgr.nodes().await.iter().enumerate() {
+            let slots = node
+                .slots
+                .iter()
+                .map(|(a, b)| format!("{a}-{b}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let status = match self
+                .mgr
+                .direct(&(node.host.clone(), node.port), &redis::cmd("PING"))
+                .await
+            {
+                Ok(_) => "reachable".to_string(),
+                Err(e) => format!("unavailable: {e}"),
+            };
+            rows.push((
+                format!("node_{i}"),
+                format!(
+                    "{} {}:{} {} slots=[{}] {}",
+                    node.id,
+                    node.host,
+                    node.port,
+                    if node.primary { "primary" } else { "replica" },
+                    slots,
+                    status
+                ),
+            ));
+        }
+        rows
+    }
+
     /// Slow log, client list, running config, latency events and cluster state.
     /// Every part is optional: a managed provider that blocks `CONFIG` or
     /// `CLIENT LIST` still gets the tabs it is allowed to see.
@@ -1272,7 +1550,7 @@ impl Client {
             })
             .unwrap_or_default();
         let latency = self.latency_rows(&mut c).await;
-        let cluster = redis::cmd("CLUSTER")
+        let mut cluster: Vec<(String, String)> = redis::cmd("CLUSTER")
             .arg("INFO")
             .query_async::<String>(&mut c)
             .await
@@ -1283,6 +1561,9 @@ impl Client {
                     .collect()
             })
             .unwrap_or_default();
+        if self.conn.deployment != Deployment::Standalone {
+            cluster.extend(self.topology_rows().await);
+        }
         let modules = redis::cmd("MODULE")
             .arg("LIST")
             .query_async::<redis::Value>(&mut c)
@@ -1312,7 +1593,7 @@ impl Client {
 
     /// `LATENCY LATEST` plus a fresh ping sample, so the tab says something
     /// useful even on a server with latency monitoring switched off.
-    async fn latency_rows(&self, c: &mut MultiplexedConnection) -> Vec<(String, String)> {
+    async fn latency_rows(&self, c: &mut Transport) -> Vec<(String, String)> {
         let mut rows = Vec::new();
         let mut best = f64::MAX;
         let mut worst: f64 = 0.0;
@@ -1453,7 +1734,7 @@ impl Client {
         }
         cmd.query_async::<()>(&mut t)
             .await
-            .with_context(|| format!("cannot write '{target_name}' on the target server"))?;
+            .map_err(|e| anyhow!("cannot write '{target_name}' on the target server: {e}"))?;
         Ok(())
     }
 
@@ -1538,7 +1819,7 @@ impl Client {
             }
             cmd.query_async::<()>(&mut c)
                 .await
-                .with_context(|| format!("cannot restore '{}'", entry.key))?;
+                .map_err(|e| anyhow!("cannot restore '{}': {e}", entry.key))?;
             written += 1;
         }
         Ok(written)
@@ -1712,6 +1993,24 @@ impl Client {
         let Some((head, tail)) = parts.split_first() else {
             return Ok(String::new());
         };
+        anyhow::ensure!(
+            !(matches!(
+                head.to_ascii_uppercase().as_str(),
+                "SELECT"
+                    | "AUTH"
+                    | "HELLO"
+                    | "RESET"
+                    | "MULTI"
+                    | "EXEC"
+                    | "DISCARD"
+                    | "WATCH"
+                    | "UNWATCH"
+            ) || (head.eq_ignore_ascii_case("CLIENT")
+                && tail
+                    .first()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("REPLY")))),
+            "Connection state commands are not supported in the shared console; use the profile or database selector"
+        );
         let mut c = self.mgr.clone();
         let mut cmd = redis::cmd(head);
         for a in tail {

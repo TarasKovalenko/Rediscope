@@ -19,10 +19,78 @@ fn default_ssh_port() -> u16 {
     22
 }
 
+/// Discovery mode. Older profiles remain standalone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Deployment {
+    #[default]
+    Standalone,
+    Cluster,
+    Sentinel,
+}
+
+impl Deployment {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Cluster => "cluster",
+            Self::Sentinel => "sentinel",
+        }
+    }
+}
+
+pub(crate) fn parse_endpoint(text: &str) -> Result<(String, u16)> {
+    let (host, port) = text
+        .rsplit_once(':')
+        .context("endpoint must be host:port (or [IPv6]:port)")?;
+    let host = host.trim_matches(['[', ']']);
+    anyhow::ensure!(
+        !host.is_empty() && !host.contains(['/', '@', ' ']),
+        "invalid endpoint host"
+    );
+    let port = port.parse::<u16>()?;
+    anyhow::ensure!(port != 0, "endpoint port must be nonzero");
+    Ok((host.to_string(), port))
+}
+
+/// Operational environment; old profiles retain development behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Environment {
+    #[default]
+    Development,
+    Staging,
+    Production,
+}
+impl Environment {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Staging => "staging",
+            Self::Production => "production",
+        }
+    }
+}
+
 /// A single saved server profile.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
     pub name: String,
+    #[serde(default)]
+    pub environment: Environment,
+    #[serde(default)]
+    pub deployment: Deployment,
+    /// Additional cluster seeds or Sentinel endpoints, including ports.
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub sentinel_master: String,
+    #[serde(default)]
+    pub sentinel_username: String,
+    /// Separate Sentinel credentials; supports environment placeholders.
+    #[serde(default)]
+    pub sentinel_password: String,
+
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
@@ -77,6 +145,12 @@ impl Default for Connection {
     fn default() -> Self {
         Self {
             name: String::new(),
+            environment: Environment::default(),
+            deployment: Deployment::Standalone,
+            seeds: Vec::new(),
+            sentinel_master: String::new(),
+            sentinel_username: String::new(),
+            sentinel_password: String::new(),
             host: default_host(),
             port: default_port(),
             db: 0,
@@ -98,6 +172,25 @@ impl Default for Connection {
 }
 
 impl Connection {
+    pub fn validate_topology(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.deployment != Deployment::Cluster || self.db == 0,
+            "Cluster supports database 0 only"
+        );
+        anyhow::ensure!(
+            self.deployment == Deployment::Standalone || !self.uses_ssh(),
+            "Topology discovery requires direct access to advertised nodes; a single SSH forward is unsupported"
+        );
+        anyhow::ensure!(
+            self.deployment != Deployment::Sentinel || !self.sentinel_master.trim().is_empty(),
+            "Sentinel primary service name is required"
+        );
+        for seed in &self.seeds {
+            parse_endpoint(seed)?;
+        }
+        Ok(())
+    }
+
     /// True when this profile reaches the server through an SSH tunnel.
     pub fn uses_ssh(&self) -> bool {
         !self.ssh_host.trim().is_empty()

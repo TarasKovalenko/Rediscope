@@ -76,6 +76,10 @@ struct Cli {
     #[arg(long)]
     read_only: bool,
 
+    /// Operational environment; production opens with writes locked.
+    #[arg(long, value_enum)]
+    environment: Option<config::Environment>,
+
     /// Reach the server through `ssh -L` on this jump host.
     #[arg(long, value_name = "HOST")]
     ssh: Option<String>,
@@ -131,6 +135,12 @@ enum Command {
         /// Overwrite keys that already exist.
         #[arg(long)]
         replace: bool,
+        /// Unlock a production import for 5 minutes by supplying the exact profile name.
+        #[arg(long, value_name = "PROFILE_NAME")]
+        unlock_production: Option<String>,
+        /// Confirm the destructive production import with the exact profile name.
+        #[arg(long, value_name = "PROFILE_NAME")]
+        confirm_production: Option<String>,
     },
     /// Print the server's INFO reply.
     Info {
@@ -183,16 +193,21 @@ impl Cli {
             tls_insecure: self.tls_insecure,
             use_keychain: false,
             read_only: self.read_only,
+            environment: self.environment.unwrap_or_default(),
             ssh_host: self.ssh.clone().unwrap_or_default(),
             ssh_user: self.ssh_user.clone().unwrap_or_default(),
             ssh_port: self.ssh_port,
             ssh_key_file: self.ssh_key.clone().unwrap_or_default(),
+            ..Default::default()
         }))
     }
 
     /// Flags that apply whether the profile came from --url or the host flags.
     fn apply_extras(&self, conn: &mut Connection) {
-        conn.read_only = self.read_only;
+        conn.read_only |= self.read_only;
+        if let Some(env) = self.environment {
+            conn.environment = env;
+        }
         conn.ssh_host = self.ssh.clone().unwrap_or_default();
         conn.ssh_user = self.ssh_user.clone().unwrap_or_default();
         conn.ssh_port = self.ssh_port;
@@ -212,11 +227,34 @@ async fn main() -> Result<()> {
     // A subcommand is a one-shot: resolve the server, print, and exit without
     // ever touching the alternate screen.
     if let Some(command) = &cli.command {
-        let conn = headless::resolve(cli.profile.as_deref(), quick)?;
+        let mut conn = headless::resolve(cli.profile.as_deref(), quick)?;
+        conn.read_only |= cli.read_only;
+        if let Some(env) = cli.environment {
+            anyhow::ensure!(
+                conn.environment != config::Environment::Production
+                    || env == config::Environment::Production,
+                "Cannot downgrade a saved production profile using CLI flags"
+            );
+            conn.environment = env;
+        }
         return match command {
             Command::Keys { pattern, json } => headless::keys(conn, pattern, *json).await,
             Command::Export { pattern, out } => headless::export(conn, pattern, out).await,
-            Command::Import { file, replace } => headless::import(conn, file, *replace).await,
+            Command::Import {
+                file,
+                replace,
+                unlock_production,
+                confirm_production,
+            } => {
+                headless::import_confirmed(
+                    conn,
+                    file,
+                    *replace,
+                    unlock_production.as_deref(),
+                    confirm_production.as_deref(),
+                )
+                .await
+            }
             Command::Info { json } => headless::info(conn, *json).await,
             Command::MemReport { depth, json } => headless::mem_report(conn, *depth, *json).await,
         };
@@ -229,6 +267,15 @@ async fn main() -> Result<()> {
         (None, quick) => quick,
     };
 
+    let quick = quick.map(|mut conn| {
+        conn.read_only |= cli.read_only;
+        if let Some(env) = cli.environment
+            && conn.environment != config::Environment::Production
+        {
+            conn.environment = env;
+        }
+        conn
+    });
     let mut terminal = setup()?;
     let result = run(&mut terminal, quick).await;
     restore(&mut terminal)?;
@@ -275,6 +322,9 @@ async fn run(terminal: &mut Term, quick: Option<Connection>) -> Result<()> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
+        // Reading the value under the cursor waits for the cursor to stop
+        // moving; with nothing pending this branch simply never fires.
+        let value_due = app.value_deadline().map(tokio::time::Instant::from_std);
         tokio::select! {
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => app.on_key(key),
@@ -284,6 +334,12 @@ async fn run(terminal: &mut Term, quick: Option<Connection>) -> Result<()> {
             },
             Some(msg) = rx.recv() => app.on_msg(msg),
             _ = ticker.tick() => app.on_tick(),
+            () = async move {
+                match value_due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => app.on_value_deadline(),
         }
         if app.should_quit {
             break;

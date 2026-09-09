@@ -6,17 +6,59 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag to build (must already exist)
+        description: Tag to build (select this same tag in the Run workflow ref selector)
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate release ref
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+        env:
+          REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
+      - name: Generate dependency SBOM from the release lockfile
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: Cargo.lock
+          format: spdx-json
+          output-file: rediscope-dependencies.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-sbom
+          path: rediscope-dependencies.spdx.json
+          if-no-files-found: error
+
   build:
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -43,20 +85,21 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
 
       # ring assembles its x86_64 primitives with nasm on Windows.
       - name: Install nasm
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
 
       - name: Install cross
         if: matrix.cross
@@ -74,8 +117,9 @@ jobs:
       - name: Package
         id: package
         shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           DIR="target/${{ matrix.target }}/release"
           if [ "$RUNNER_OS" = "Windows" ]; then
             NAME="rediscope-${VERSION}-${{ matrix.target }}.zip"
@@ -88,32 +132,57 @@ jobs:
           fi
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - name: Sign build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.package.outputs.name }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
           path: ${{ steps.package.outputs.name }}
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Attest dependency inventory for release archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+          sbom-path: dist/rediscope-dependencies.spdx.json
+
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip *.spdx.json > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
+      - name: Sign release manifest and SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/SHA256SUMS
+            dist/*.spdx.json
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
+            dist/*.spdx.json
           generate_release_notes: true

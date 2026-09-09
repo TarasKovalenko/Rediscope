@@ -4,7 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use rediscope::app::{App, Msg};
+use rediscope::app::{App, Modal, Msg};
 use rediscope::config::{Connection, Store};
 use rediscope::redis_client::ServerInfo;
 use rediscope::redis_client::{KeyInfo, KeyType, KeyValue, Row};
@@ -60,6 +60,7 @@ fn key(name: &str, kind: KeyType, ttl: i64) -> KeyInfo {
 fn populate(app: &mut App) {
     app.screen = rediscope::app::Screen::Browser;
     app.on_msg(Msg::Keys {
+        warnings: vec![],
         keys: vec![
             key("app:user:1", KeyType::String, -1),
             key("app:user:2", KeyType::Hash, 3600),
@@ -678,4 +679,98 @@ async fn the_info_modal_reaches_the_diagnostics_tabs() {
         }
         _ => panic!("e on the config tab edits the parameter"),
     }
+}
+
+#[tokio::test]
+async fn sentinel_form_persists_discovery_fields() {
+    use rediscope::app::Modal;
+    let mut a = app();
+    press(&mut a, KeyCode::Char('n'));
+    let Some(Modal::Form { fields, .. }) = &mut a.modal else {
+        panic!("expected form")
+    };
+    let mut inputs: Vec<_> = fields.iter_mut().filter(|f| f.is_input()).collect();
+    inputs[0].input.set("sentinel-profile");
+    inputs[2].input.set("26379");
+    inputs[17].choice = 2;
+    inputs[18].input.set("[::1]:26380,redis-b:26379");
+    inputs[19].input.set("primary-service");
+    inputs[20].input.set("sentinel-reader");
+    inputs[21].input.set("${SENTINEL_PASSWORD}");
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none());
+    let saved = a
+        .store
+        .connections
+        .iter()
+        .find(|c| c.name == "sentinel-profile")
+        .unwrap();
+    assert_eq!(saved.deployment, rediscope::config::Deployment::Sentinel);
+    assert_eq!(saved.seeds, vec!["[::1]:26380", "redis-b:26379"]);
+    assert_eq!(saved.sentinel_master, "primary-service");
+    assert_eq!(saved.sentinel_username, "sentinel-reader");
+    assert_eq!(saved.sentinel_password, "${SENTINEL_PASSWORD}");
+}
+
+#[tokio::test]
+async fn partial_coverage_survives_status_changes_and_clears_on_complete_refresh() {
+    let mut a = app();
+    populate(&mut a);
+    a.on_msg(Msg::Keys {
+        keys: vec![],
+        truncated: false,
+        warnings: vec!["node unavailable".into()],
+        dbsize: 0,
+        pattern: "*".into(),
+    });
+    a.status = "another action".into();
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+    terminal.draw(|f| ui::draw(f, &mut a)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("PARTIAL RESULTS"));
+    assert!(!text.contains("No keys match"));
+    a.on_msg(Msg::Keys {
+        keys: vec![],
+        truncated: false,
+        warnings: vec![],
+        dbsize: 0,
+        pattern: "*".into(),
+    });
+    assert!(a.coverage_warnings.is_empty());
+}
+
+#[test]
+fn conflict_preview_is_readable_and_survives_small_terminals() {
+    use rediscope::redis_client::EditTarget;
+    let mut app = app();
+    populate(&mut app);
+    app.modal = Some(Modal::EditConflict {
+        target: EditTarget {
+            key: "customer:1".into(),
+            kind: KeyType::String,
+            selector: String::new(),
+            original: "original value".into(),
+        },
+        values: vec!["my unsaved draft".into()],
+        current: Some("concurrent writer".into()),
+        error: None,
+    });
+    let text = render_text(&mut app, 120, 40);
+    for expected in [
+        "ORIGINAL",
+        "CURRENT",
+        "YOUR DRAFT",
+        "original value",
+        "concurrent writer",
+        "my unsaved draft",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
+    render_all_sizes(&mut app);
 }
