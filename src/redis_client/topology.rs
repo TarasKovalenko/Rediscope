@@ -327,8 +327,8 @@ impl Transport {
     pub async fn metadata(&self, ep: &Endpoint, names: &[String]) -> RedisResult<Vec<Value>> {
         let mut pipeline = redis::pipe();
         for name in names {
-            pipeline.cmd("TYPE").arg(name);
-            pipeline.cmd("TTL").arg(name);
+            pipeline.cmd("TYPE").arg(super::decode_key(name));
+            pipeline.cmd("TTL").arg(super::decode_key(name));
         }
         // Metadata is read-only by construction; the guard keeps that true if
         // the command list ever grows.

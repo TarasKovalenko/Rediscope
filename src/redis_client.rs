@@ -742,7 +742,7 @@ impl Client {
             "Cluster memory rollups are not available yet; use per-node diagnostics"
         );
         let mut c = self.mgr.clone();
-        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+        let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
             .arg(scan.cursor)
             .arg("COUNT")
             .arg(500)
@@ -754,6 +754,7 @@ impl Client {
         let stride = stride.max(1);
         let mut sample: Vec<String> = Vec::new();
         for name in batch {
+            let name = encode_key(&name);
             if scan.seen.is_multiple_of(stride) {
                 sample.push(name.clone());
             }
@@ -764,7 +765,7 @@ impl Client {
         if !sample.is_empty() {
             let mut pipe = redis::pipe();
             for name in &sample {
-                pipe.cmd("MEMORY").arg("USAGE").arg(name);
+                pipe.cmd("MEMORY").arg("USAGE").arg(decode_key(name));
             }
             // A server with `MEMORY USAGE` disabled still gives a useful key
             // count, so a failed measurement is not a failed report.
@@ -773,7 +774,7 @@ impl Client {
                 // is best effort, and its absence just leaves the column empty.
                 let mut freq_pipe = redis::pipe();
                 for name in &sample {
-                    freq_pipe.cmd("OBJECT").arg("FREQ").arg(name);
+                    freq_pipe.cmd("OBJECT").arg("FREQ").arg(decode_key(name));
                 }
                 let freqs = freq_pipe
                     .query_async::<Vec<Option<u64>>>(&mut c)
@@ -931,11 +932,11 @@ impl Client {
                     )
                     .await
                     .and_then(|v| {
-                        redis::from_redis_value::<(u64, Vec<String>)>(v).map_err(Into::into)
+                        redis::from_redis_value::<(u64, Vec<Vec<u8>>)>(v).map_err(Into::into)
                     });
                 match result {
                     Ok((next, batch)) => {
-                        names.extend(batch);
+                        names.extend(batch.iter().map(|n| encode_key(n)));
                         cursor = next;
                         if names.len() >= limit || cursor == 0 {
                             truncated = cursor != 0 || names.len() > limit;
@@ -1026,7 +1027,7 @@ impl Client {
         let mut cursor: u64 = 0;
         let mut names: Vec<String> = Vec::new();
         loop {
-            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
                 .arg(cursor)
                 .arg("MATCH")
                 .arg(pattern)
@@ -1034,7 +1035,7 @@ impl Client {
                 .arg(500)
                 .query_async(&mut c)
                 .await?;
-            names.extend(batch);
+            names.extend(batch.iter().map(|n| encode_key(n)));
             cursor = next;
             if cursor == 0 || names.len() >= limit {
                 break;
@@ -1048,13 +1049,13 @@ impl Client {
 
         let mut type_pipe = redis::pipe();
         for n in &names {
-            type_pipe.cmd("TYPE").arg(n);
+            type_pipe.cmd("TYPE").arg(decode_key(n));
         }
         let types: Vec<String> = type_pipe.query_async(&mut c).await?;
 
         let mut ttl_pipe = redis::pipe();
         for n in &names {
-            ttl_pipe.cmd("TTL").arg(n);
+            ttl_pipe.cmd("TTL").arg(decode_key(n));
         }
         let ttls: Vec<i64> = ttl_pipe.query_async(&mut c).await?;
 
@@ -1073,8 +1074,14 @@ impl Client {
 
     pub async fn key_info(&self, name: &str) -> Result<KeyInfo> {
         let mut c = self.mgr.clone();
-        let t: String = redis::cmd("TYPE").arg(name).query_async(&mut c).await?;
-        let ttl: i64 = redis::cmd("TTL").arg(name).query_async(&mut c).await?;
+        let t: String = redis::cmd("TYPE")
+            .arg(decode_key(name))
+            .query_async(&mut c)
+            .await?;
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(decode_key(name))
+            .query_async(&mut c)
+            .await?;
         Ok(KeyInfo {
             name: name.to_string(),
             kind: KeyType::parse(&t),
@@ -1089,16 +1096,16 @@ impl Client {
         let lim = VALUE_LIMIT;
         Ok(match kind {
             KeyType::String => {
-                let v: Option<Vec<u8>> = c.get(name).await?;
+                let v: Option<Vec<u8>> = c.get(decode_key(name)).await?;
                 KeyValue::Str(v.map(decode_value).unwrap_or_default())
             }
             KeyType::Hash => {
-                let total: u64 = c.hlen(name).await?;
+                let total: u64 = c.hlen(decode_key(name)).await?;
                 let mut rows = Vec::new();
                 let mut cursor: u64 = 0;
                 loop {
                     let (next, flat): (u64, Vec<Vec<u8>>) = redis::cmd("HSCAN")
-                        .arg(name)
+                        .arg(decode_key(name))
                         .arg(cursor)
                         .arg("COUNT")
                         .arg(200)
@@ -1127,8 +1134,8 @@ impl Client {
                 }
             }
             KeyType::List => {
-                let total: u64 = c.llen(name).await?;
-                let items: Vec<Vec<u8>> = c.lrange(name, 0, lim as isize - 1).await?;
+                let total: u64 = c.llen(decode_key(name)).await?;
+                let items: Vec<Vec<u8>> = c.lrange(decode_key(name), 0, lim as isize - 1).await?;
                 let rows = items
                     .into_iter()
                     .enumerate()
@@ -1144,12 +1151,12 @@ impl Client {
                 }
             }
             KeyType::Set => {
-                let total: u64 = c.scard(name).await?;
+                let total: u64 = c.scard(decode_key(name)).await?;
                 let mut rows = Vec::new();
                 let mut cursor: u64 = 0;
                 loop {
                     let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SSCAN")
-                        .arg(name)
+                        .arg(decode_key(name))
                         .arg(cursor)
                         .arg("COUNT")
                         .arg(200)
@@ -1176,9 +1183,10 @@ impl Client {
                 }
             }
             KeyType::ZSet => {
-                let total: u64 = c.zcard(name).await?;
-                let items: Vec<(Vec<u8>, f64)> =
-                    c.zrange_withscores(name, 0, lim as isize - 1).await?;
+                let total: u64 = c.zcard(decode_key(name)).await?;
+                let items: Vec<(Vec<u8>, f64)> = c
+                    .zrange_withscores(decode_key(name), 0, lim as isize - 1)
+                    .await?;
                 let rows = items
                     .into_iter()
                     .map(|(m, s)| {
@@ -1196,9 +1204,9 @@ impl Client {
                 }
             }
             KeyType::Stream => {
-                let total: u64 = c.xlen(name).await?;
+                let total: u64 = c.xlen(decode_key(name)).await?;
                 let raw: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XREVRANGE")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg("+")
                     .arg("-")
                     .arg("COUNT")
@@ -1237,7 +1245,7 @@ impl Client {
             }
             KeyType::Json => {
                 let doc: Option<Vec<u8>> = redis::cmd("JSON.GET")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg(".")
                     .query_async(&mut c)
                     .await?;
@@ -1245,7 +1253,7 @@ impl Client {
             }
             KeyType::TimeSeries => {
                 let raw: Vec<(u64, f64)> = redis::cmd("TS.RANGE")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg("-")
                     .arg("+")
                     .arg("COUNT")
@@ -1277,15 +1285,15 @@ impl Client {
 
     pub async fn delete_key(&self, name: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.del(name).await?;
+        let _: i64 = c.del(decode_key(name)).await?;
         Ok(())
     }
 
     pub async fn rename_key(&self, old: &str, new: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("RENAME")
-            .arg(old)
-            .arg(new)
+            .arg(decode_key(old))
+            .arg(decode_key(new))
             .query_async::<()>(&mut c)
             .await?;
         Ok(())
@@ -1296,10 +1304,10 @@ impl Client {
         let mut c = self.mgr.clone();
         match seconds {
             Some(s) if s >= 0 => {
-                let _: bool = c.expire(name, s).await?;
+                let _: bool = c.expire(decode_key(name), s).await?;
             }
             _ => {
-                let _: bool = c.persist(name).await?;
+                let _: bool = c.persist(decode_key(name)).await?;
             }
         }
         Ok(())
@@ -1309,23 +1317,23 @@ impl Client {
         let mut c = self.mgr.clone();
         match kind {
             KeyType::String => {
-                let _: () = c.set(name, "").await?;
+                let _: () = c.set(decode_key(name), "").await?;
             }
             KeyType::Hash => {
-                let _: i64 = c.hset(name, "field", "value").await?;
+                let _: i64 = c.hset(decode_key(name), "field", "value").await?;
             }
             KeyType::List => {
-                let _: i64 = c.rpush(name, "item").await?;
+                let _: i64 = c.rpush(decode_key(name), "item").await?;
             }
             KeyType::Set => {
-                let _: i64 = c.sadd(name, "member").await?;
+                let _: i64 = c.sadd(decode_key(name), "member").await?;
             }
             KeyType::ZSet => {
-                let _: i64 = c.zadd(name, "member", 0.0).await?;
+                let _: i64 = c.zadd(decode_key(name), "member", 0.0).await?;
             }
             KeyType::Stream => {
                 let _: String = redis::cmd("XADD")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg("*")
                     .arg("field")
                     .arg("value")
@@ -1334,7 +1342,7 @@ impl Client {
             }
             KeyType::Json => {
                 redis::cmd("JSON.SET")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg("$")
                     .arg("{}")
                     .query_async::<()>(&mut c)
@@ -1342,7 +1350,7 @@ impl Client {
             }
             KeyType::TimeSeries => {
                 redis::cmd("TS.CREATE")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .query_async::<()>(&mut c)
                     .await?;
             }
@@ -1354,7 +1362,7 @@ impl Client {
     pub async fn set_string(&self, name: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("SET")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(value)
             .arg("KEEPTTL")
             .query_async::<()>(&mut c)
@@ -1366,25 +1374,25 @@ impl Client {
 
     pub async fn hash_set(&self, name: &str, field: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.hset(name, field, value).await?;
+        let _: i64 = c.hset(decode_key(name), field, value).await?;
         Ok(())
     }
 
     pub async fn hash_del(&self, name: &str, field: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.hdel(name, field).await?;
+        let _: i64 = c.hdel(decode_key(name), field).await?;
         Ok(())
     }
 
     pub async fn list_push(&self, name: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.rpush(name, value).await?;
+        let _: i64 = c.rpush(decode_key(name), value).await?;
         Ok(())
     }
 
     pub async fn list_set(&self, name: &str, index: isize, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: () = c.lset(name, index, value).await?;
+        let _: () = c.lset(decode_key(name), index, value).await?;
         Ok(())
     }
 
@@ -1394,39 +1402,39 @@ impl Client {
     pub async fn list_remove_at(&self, name: &str, index: isize) -> Result<()> {
         let mut c = self.mgr.clone();
         let sentinel = sentinel();
-        let _: () = c.lset(name, index, &sentinel).await?;
-        let _: i64 = c.lrem(name, 1, &sentinel).await?;
+        let _: () = c.lset(decode_key(name), index, &sentinel).await?;
+        let _: i64 = c.lrem(decode_key(name), 1, &sentinel).await?;
         Ok(())
     }
 
     pub async fn set_add(&self, name: &str, member: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.sadd(name, member).await?;
+        let _: i64 = c.sadd(decode_key(name), member).await?;
         Ok(())
     }
 
     pub async fn set_remove(&self, name: &str, member: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.srem(name, member).await?;
+        let _: i64 = c.srem(decode_key(name), member).await?;
         Ok(())
     }
 
     pub async fn zset_add(&self, name: &str, member: &str, score: f64) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.zadd(name, member, score).await?;
+        let _: i64 = c.zadd(decode_key(name), member, score).await?;
         Ok(())
     }
 
     pub async fn zset_remove(&self, name: &str, member: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.zrem(name, member).await?;
+        let _: i64 = c.zrem(decode_key(name), member).await?;
         Ok(())
     }
 
     pub async fn stream_add(&self, name: &str, field: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         let _: String = redis::cmd("XADD")
-            .arg(name)
+            .arg(decode_key(name))
             .arg("*")
             .arg(field)
             .arg(value)
@@ -1438,7 +1446,7 @@ impl Client {
     pub async fn stream_delete(&self, name: &str, id: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         let _: i64 = redis::cmd("XDEL")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(id)
             .query_async(&mut c)
             .await?;
@@ -1448,7 +1456,7 @@ impl Client {
     pub async fn json_set(&self, name: &str, path: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("JSON.SET")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(path)
             .arg(value)
             .query_async::<()>(&mut c)
@@ -1464,7 +1472,7 @@ impl Client {
             timestamp.trim()
         };
         redis::cmd("TS.ADD")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(ts)
             .arg(value.trim())
             .query_async::<i64>(&mut c)
@@ -1476,7 +1484,7 @@ impl Client {
         let mut c = self.mgr.clone();
         // TS.DEL takes a range; one sample is the range [ts, ts].
         redis::cmd("TS.DEL")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(timestamp)
             .arg(timestamp)
             .query_async::<i64>(&mut c)
@@ -1696,7 +1704,7 @@ impl Client {
         for chunk in names.chunks(256) {
             let mut pipe = redis::pipe();
             for name in chunk {
-                pipe.cmd("UNLINK").arg(name);
+                pipe.cmd("UNLINK").arg(decode_key(name));
             }
             let counts: Vec<i64> = pipe.query_async(&mut c).await?;
             removed += counts.iter().map(|n| (*n).max(0) as u64).sum::<u64>();
@@ -1712,8 +1720,8 @@ impl Client {
             let mut pipe = redis::pipe();
             for name in chunk {
                 match seconds {
-                    Some(s) if s >= 0 => pipe.cmd("EXPIRE").arg(name).arg(s),
-                    _ => pipe.cmd("PERSIST").arg(name),
+                    Some(s) if s >= 0 => pipe.cmd("EXPIRE").arg(decode_key(name)).arg(s),
+                    _ => pipe.cmd("PERSIST").arg(decode_key(name)),
                 };
             }
             let counts: Vec<i64> = pipe.query_async(&mut c).await?;
@@ -1733,15 +1741,23 @@ impl Client {
         replace: bool,
     ) -> Result<()> {
         let mut c = self.mgr.clone();
-        let payload: Option<Vec<u8>> = redis::cmd("DUMP").arg(source).query_async(&mut c).await?;
+        let payload: Option<Vec<u8>> = redis::cmd("DUMP")
+            .arg(decode_key(source))
+            .query_async(&mut c)
+            .await?;
         let Some(payload) = payload else {
             anyhow::bail!("'{source}' no longer exists");
         };
         // A negative TTL means "no expiry", which RESTORE spells as 0.
-        let ttl: i64 = redis::cmd("PTTL").arg(source).query_async(&mut c).await?;
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(decode_key(source))
+            .query_async(&mut c)
+            .await?;
         let mut t = target.mgr.clone();
         let mut cmd = redis::cmd("RESTORE");
-        cmd.arg(target_name).arg(ttl.max(0)).arg(payload);
+        cmd.arg(decode_key(target_name))
+            .arg(ttl.max(0))
+            .arg(payload);
         if replace {
             cmd.arg("REPLACE");
         }
@@ -1791,9 +1807,9 @@ impl Client {
         for chunk in names.chunks(128) {
             let mut pipe = redis::pipe();
             for name in chunk {
-                pipe.cmd("DUMP").arg(name);
-                pipe.cmd("PTTL").arg(name);
-                pipe.cmd("TYPE").arg(name);
+                pipe.cmd("DUMP").arg(decode_key(name));
+                pipe.cmd("PTTL").arg(decode_key(name));
+                pipe.cmd("TYPE").arg(decode_key(name));
             }
             let replies: Vec<redis::Value> = pipe.query_async(&mut c).await?;
             for (name, triple) in chunk.iter().zip(replies.chunks(3)) {
@@ -1826,7 +1842,9 @@ impl Client {
             let payload = hex_decode(&entry.dump)
                 .with_context(|| format!("'{}' has a corrupt payload", entry.key))?;
             let mut cmd = redis::cmd("RESTORE");
-            cmd.arg(&entry.key).arg(entry.pttl.max(0)).arg(payload);
+            cmd.arg(decode_key(&entry.key))
+                .arg(entry.pttl.max(0))
+                .arg(payload);
             if replace {
                 cmd.arg("REPLACE");
             }
@@ -1872,7 +1890,7 @@ impl Client {
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(script).arg(keys.len());
         for k in keys {
-            cmd.arg(k);
+            cmd.arg(decode_key(k));
         }
         for a in args {
             cmd.arg(a);
@@ -1888,7 +1906,7 @@ impl Client {
         let mut c = self.mgr.clone();
         let reply: redis::Value = redis::cmd("XINFO")
             .arg("GROUPS")
-            .arg(key)
+            .arg(decode_key(key))
             .query_async(&mut c)
             .await?;
         Ok(as_maps(&reply)
@@ -1908,7 +1926,7 @@ impl Client {
         let mut c = self.mgr.clone();
         let consumers: redis::Value = redis::cmd("XINFO")
             .arg("CONSUMERS")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .query_async(&mut c)
             .await?;
@@ -1923,7 +1941,7 @@ impl Client {
         // `XPENDING key group - + n` lists the entries themselves, which is
         // what makes a stuck consumer visible.
         let raw: Vec<(String, String, i64, i64)> = redis::cmd("XPENDING")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg("-")
             .arg("+")
@@ -1947,7 +1965,7 @@ impl Client {
         let mut c = self.mgr.clone();
         redis::cmd("XGROUP")
             .arg("CREATE")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg(if start.trim().is_empty() { "$" } else { start })
             .arg("MKSTREAM")
@@ -1960,7 +1978,7 @@ impl Client {
         let mut c = self.mgr.clone();
         redis::cmd("XGROUP")
             .arg("DESTROY")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .query_async::<i64>(&mut c)
             .await?;
@@ -1970,7 +1988,7 @@ impl Client {
     pub async fn stream_ack(&self, key: &str, group: &str, id: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("XACK")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg(id)
             .query_async::<i64>(&mut c)
@@ -1989,7 +2007,7 @@ impl Client {
     ) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("XCLAIM")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg(consumer)
             .arg(0)
@@ -2180,6 +2198,74 @@ fn hex_dump(bytes: &[u8]) -> String {
     out
 }
 
+/// A key name as the rest of the program carries it: text, with every byte
+/// that is not valid UTF-8 written `\xNN` and a literal backslash doubled.
+/// Redis key names are arbitrary bytes, so decoding one straight into a
+/// `String` fails the whole scan when a key holds a binary id.
+pub fn encode_key(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                push_escaped(&mut out, text);
+                return out;
+            }
+            Err(e) => {
+                let (good, bad) = rest.split_at(e.valid_up_to());
+                push_escaped(&mut out, std::str::from_utf8(good).unwrap_or_default());
+                // Without a length the rest of the input is one bad tail.
+                let skip = e.error_len().unwrap_or(bad.len());
+                for b in &bad[..skip] {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+                rest = &bad[skip..];
+            }
+        }
+    }
+}
+
+fn push_escaped(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch == '\\' {
+            out.push_str("\\\\");
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+/// The inverse of [`encode_key`]: back to the exact bytes the server stored.
+/// An escape it does not recognise stays literal, so a name a person typed by
+/// hand still addresses the key they meant.
+pub fn decode_key(name: &str) -> Vec<u8> {
+    let b = name.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            if b[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+            if b[i + 1] == b'x'
+                && i + 3 < b.len()
+                && let Ok(pair) = std::str::from_utf8(&b[i + 2..i + 4])
+                && let Ok(byte) = u8::from_str_radix(pair, 16)
+            {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut out, b| {
@@ -2350,6 +2436,32 @@ pub fn is_destructive(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_names_round_trip_through_their_escaped_form() {
+        for raw in [
+            b"bff:session:44ec".to_vec(),
+            "ключ:1".as_bytes().to_vec(),
+            vec![b'k', 0xff, 0xfe, b':', 0x00],
+            b"path\\to\\key".to_vec(),
+        ] {
+            assert_eq!(decode_key(&encode_key(&raw)), raw, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn binary_key_names_escape_only_the_bad_bytes() {
+        assert_eq!(encode_key(b"plain:key"), "plain:key");
+        assert_eq!(encode_key(&[b'a', 0xc3, 0x28, b'b']), "a\\xc3(b");
+        assert_eq!(encode_key(b"a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn an_unknown_escape_stays_literal() {
+        // Someone typing a Windows path into the key box means the backslash.
+        assert_eq!(decode_key("C:\\temp"), b"C:\\temp");
+        assert_eq!(decode_key("tail\\x"), b"tail\\x");
+    }
 
     #[test]
     fn text_values_decode_unchanged() {
