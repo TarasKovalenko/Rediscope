@@ -26,6 +26,8 @@ pub struct ScanReport {
 pub const KEY_LIMIT: usize = 5_000;
 /// Hard ceiling on elements pulled into one value pane.
 pub const VALUE_LIMIT: usize = 1_000;
+/// How much of a non-text value the hex dump shows.
+const HEX_DUMP_LIMIT: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
@@ -1087,15 +1089,15 @@ impl Client {
         let lim = VALUE_LIMIT;
         Ok(match kind {
             KeyType::String => {
-                let v: Option<String> = c.get(name).await?;
-                KeyValue::Str(v.unwrap_or_default())
+                let v: Option<Vec<u8>> = c.get(name).await?;
+                KeyValue::Str(v.map(decode_value).unwrap_or_default())
             }
             KeyType::Hash => {
                 let total: u64 = c.hlen(name).await?;
                 let mut rows = Vec::new();
                 let mut cursor: u64 = 0;
                 loop {
-                    let (next, flat): (u64, Vec<String>) = redis::cmd("HSCAN")
+                    let (next, flat): (u64, Vec<Vec<u8>>) = redis::cmd("HSCAN")
                         .arg(name)
                         .arg(cursor)
                         .arg("COUNT")
@@ -1104,9 +1106,10 @@ impl Client {
                         .await?;
                     for pair in flat.chunks(2) {
                         if let [f, v] = pair {
+                            let f = decode_value(f.clone());
                             rows.push(Row {
                                 id: f.clone(),
-                                cells: vec![f.clone(), v.clone()],
+                                cells: vec![f, decode_value(v.clone())],
                             });
                         }
                     }
@@ -1125,13 +1128,13 @@ impl Client {
             }
             KeyType::List => {
                 let total: u64 = c.llen(name).await?;
-                let items: Vec<String> = c.lrange(name, 0, lim as isize - 1).await?;
+                let items: Vec<Vec<u8>> = c.lrange(name, 0, lim as isize - 1).await?;
                 let rows = items
                     .into_iter()
                     .enumerate()
                     .map(|(i, v)| Row {
                         id: i.to_string(),
-                        cells: vec![i.to_string(), v],
+                        cells: vec![i.to_string(), decode_value(v)],
                     })
                     .collect();
                 KeyValue::Rows {
@@ -1145,7 +1148,7 @@ impl Client {
                 let mut rows = Vec::new();
                 let mut cursor: u64 = 0;
                 loop {
-                    let (next, batch): (u64, Vec<String>) = redis::cmd("SSCAN")
+                    let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SSCAN")
                         .arg(name)
                         .arg(cursor)
                         .arg("COUNT")
@@ -1153,6 +1156,7 @@ impl Client {
                         .query_async(&mut c)
                         .await?;
                     for m in batch {
+                        let m = decode_value(m);
                         rows.push(Row {
                             id: m.clone(),
                             cells: vec![m],
@@ -1173,13 +1177,16 @@ impl Client {
             }
             KeyType::ZSet => {
                 let total: u64 = c.zcard(name).await?;
-                let items: Vec<(String, f64)> =
+                let items: Vec<(Vec<u8>, f64)> =
                     c.zrange_withscores(name, 0, lim as isize - 1).await?;
                 let rows = items
                     .into_iter()
-                    .map(|(m, s)| Row {
-                        id: m.clone(),
-                        cells: vec![m, format_score(s)],
+                    .map(|(m, s)| {
+                        let m = decode_value(m);
+                        Row {
+                            id: m.clone(),
+                            cells: vec![m, format_score(s)],
+                        }
                     })
                     .collect();
                 KeyValue::Rows {
@@ -1190,7 +1197,7 @@ impl Client {
             }
             KeyType::Stream => {
                 let total: u64 = c.xlen(name).await?;
-                let raw: Vec<(String, Vec<String>)> = redis::cmd("XREVRANGE")
+                let raw: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XREVRANGE")
                     .arg(name)
                     .arg("+")
                     .arg("-")
@@ -1204,8 +1211,14 @@ impl Client {
                         let fields = flat
                             .chunks(2)
                             .map(|p| match p {
-                                [f, v] => format!("{f}={v}"),
-                                [f] => f.clone(),
+                                [f, v] => {
+                                    format!(
+                                        "{}={}",
+                                        decode_value(f.clone()),
+                                        decode_value(v.clone())
+                                    )
+                                }
+                                [f] => decode_value(f.clone()),
                                 _ => String::new(),
                             })
                             .collect::<Vec<_>>()
@@ -1223,12 +1236,12 @@ impl Client {
                 }
             }
             KeyType::Json => {
-                let doc: Option<String> = redis::cmd("JSON.GET")
+                let doc: Option<Vec<u8>> = redis::cmd("JSON.GET")
                     .arg(name)
                     .arg(".")
                     .query_async(&mut c)
                     .await?;
-                KeyValue::Str(doc.unwrap_or_else(|| "null".into()))
+                KeyValue::Str(doc.map(decode_value).unwrap_or_else(|| "null".into()))
             }
             KeyType::TimeSeries => {
                 let raw: Vec<(u64, f64)> = redis::cmd("TS.RANGE")
@@ -2128,6 +2141,45 @@ fn parse_client_list(raw: &str) -> Vec<ClientEntry> {
         .collect()
 }
 
+/// Redis values are byte strings, and plenty of them are not text: session
+/// blobs, protobuf, MessagePack and gzip all live under ordinary looking key
+/// names. Decoding those straight into a `String` fails the whole read, so a
+/// value that is not UTF-8 becomes a hex dump the viewer can still show.
+fn decode_value(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => hex_dump(e.as_bytes()),
+    }
+}
+
+/// The first `HEX_DUMP_LIMIT` bytes as offset / hex / ASCII columns.
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let shown = bytes.len().min(HEX_DUMP_LIMIT);
+    let mut out = format!("<binary, {} bytes>\n", bytes.len());
+    for (i, chunk) in bytes[..shown].chunks(16).enumerate() {
+        let hex = chunk.iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x} ");
+            acc
+        });
+        let ascii: String = chunk
+            .iter()
+            .map(|b| {
+                if b.is_ascii_graphic() || *b == b' ' {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "{:08x}  {hex:<48} |{ascii}|", i * 16);
+    }
+    if bytes.len() > shown {
+        let _ = writeln!(out, "… {} more bytes", bytes.len() - shown);
+    }
+    out
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut out, b| {
@@ -2298,6 +2350,27 @@ pub fn is_destructive(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_values_decode_unchanged() {
+        assert_eq!(decode_value(b"hello".to_vec()), "hello");
+        assert_eq!(decode_value("héllo".as_bytes().to_vec()), "héllo");
+    }
+
+    #[test]
+    fn binary_values_become_a_hex_dump() {
+        // A session blob: the byte at index 1 is what the UTF-8 decoder chokes on.
+        let dump = decode_value(vec![0x1f, 0x8b, 0x08, 0x00, b'i', b'd']);
+        assert!(dump.starts_with("<binary, 6 bytes>"), "{dump}");
+        assert!(dump.contains("1f 8b 08 00 69 64"), "{dump}");
+        assert!(dump.contains("|....id|"), "{dump}");
+    }
+
+    #[test]
+    fn hex_dump_stops_at_the_limit() {
+        let dump = decode_value(vec![0xff; HEX_DUMP_LIMIT + 10]);
+        assert!(dump.contains("… 10 more bytes"), "{dump}");
+    }
 
     const SAMPLE: &str = "# Server\r\nredis_version:7.2.4\r\nredis_mode:standalone\r\n\r\n# Memory\r\nused_memory_human:1.20M\r\n\r\n# Keyspace\r\ndb0:keys=12,expires=3,avg_ttl=0\r\ndb1:keys=5,expires=0,avg_ttl=0\r\n";
 
