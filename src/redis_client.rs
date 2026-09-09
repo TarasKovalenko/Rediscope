@@ -2170,11 +2170,21 @@ fn decode_value(bytes: Vec<u8>) -> String {
     }
 }
 
+/// Opens every hex dump, so a dump can be recognised again and never written
+/// back to the server as if it were the value it describes.
+pub const BINARY_MARKER: &str = "<binary, ";
+
+/// True when this text is a rendering of bytes rather than the bytes
+/// themselves. Saving one would replace a value with its own description.
+pub fn is_hex_dump(text: &str) -> bool {
+    text.starts_with(BINARY_MARKER) && text.split_once(" bytes>\n").is_some()
+}
+
 /// The first `HEX_DUMP_LIMIT` bytes as offset / hex / ASCII columns.
 fn hex_dump(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let shown = bytes.len().min(HEX_DUMP_LIMIT);
-    let mut out = format!("<binary, {} bytes>\n", bytes.len());
+    let mut out = format!("{BINARY_MARKER}{} bytes>\n", bytes.len());
     for (i, chunk) in bytes[..shown].chunks(16).enumerate() {
         let hex = chunk.iter().fold(String::new(), |mut acc, b| {
             let _ = write!(acc, "{b:02x} ");

@@ -84,6 +84,16 @@ jobs:
           REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
         run: cargo test --all-targets
 
+      # The cluster and Sentinel suite starts its own disposable servers, so it
+      # only needs redis-server and redis-cli on the PATH. It is opt-in locally
+      # because it binds ports and forks children; in CI it is the only thing
+      # that exercises real topology discovery.
+      - name: cargo test (cluster and sentinel)
+        if: runner.os != 'Windows'
+        env:
+          REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
+        run: cargo test --test live_topology -- --ignored --nocapture
+
       # No Redis server on the Windows runner: the integration and TLS suites
       # skip themselves when their port variables are unset.
       - name: cargo test (no server)

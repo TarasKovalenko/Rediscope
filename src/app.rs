@@ -2608,6 +2608,13 @@ impl App {
                     return;
                 }
             };
+            // The pane is showing a hex dump of bytes that are not text.
+            // Opening the editor on it would offer to save the dump.
+            if crate::redis_client::is_hex_dump(&current) {
+                self.status =
+                    "This value is binary and shown as a hex dump; it cannot be edited here".into();
+                return;
+            }
             // JSON opens indented, however it was stored.
             let mode = json::mode(&current);
             let text = if mode.is_json() {
@@ -2650,6 +2657,18 @@ impl App {
             self.status = "No element selected".into();
             return;
         };
+        // Same for a row: a binary member name or value reaches the pane as a
+        // hex dump, and saving it would write the dump back.
+        if row
+            .cells
+            .iter()
+            .chain(std::iter::once(&row.id))
+            .any(|cell| crate::redis_client::is_hex_dump(cell))
+        {
+            self.status =
+                "This element is binary and shown as a hex dump; it cannot be edited here".into();
+            return;
+        }
         self.modal = Some(match k.kind {
             KeyType::Hash => Modal::Form {
                 title: format!("Edit field '{}'", row.id),

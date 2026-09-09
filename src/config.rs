@@ -841,5 +841,23 @@ mod tests {
         );
         assert!(store.connections[1].tls);
         assert!(!store.connections[1].use_keychain);
+        // Fields added after this file was written must default to the old
+        // behaviour: a plain standalone server with no production locking.
+        for c in &store.connections {
+            assert_eq!(c.environment, Environment::Development);
+            assert_eq!(c.deployment, Deployment::Standalone);
+            assert!(c.seeds.is_empty());
+            assert!(c.sentinel_master.is_empty());
+            assert!(c.validate_topology().is_ok());
+        }
+        // And writing the file back keeps them loadable by this version.
+        store.save().unwrap();
+        let (reloaded, notice) = Store::load();
+        assert!(notice.is_none());
+        assert_eq!(reloaded.connections.len(), 2);
+        assert_eq!(
+            reloaded.connections[1].environment,
+            Environment::Development
+        );
     }
 }

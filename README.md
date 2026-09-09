@@ -147,6 +147,12 @@ rediscope
   sorted-set member or stream entry opens a form; `x` deletes the selected one.
 - **Rename, delete, TTL.** `R` renames, `D` deletes after a confirmation, `t`
   sets an expiry in seconds or clears it when left blank.
+- **Binary values and key names.** Not every value is text. A value that is not
+  UTF-8 is shown as a hex dump with offset, hex and ASCII columns instead of
+  taking the read down, and a key whose name holds raw bytes appears with those
+  bytes escaped as `\xNN`, so one binary key can no longer break the whole scan.
+  Editing is refused on anything shown as a dump, because saving it would store
+  the description over the bytes it describes.
 - **JSON values.** A string holding JSON is shown indented and syntax-coloured
   with a `json` badge. The editor opens it pretty-printed, `Ctrl+F` reformats,
   and `Ctrl+S` refuses to save a document that no longer parses. Key order is
@@ -777,6 +783,13 @@ reporting process and the security boundaries.
 - Switching database reconnects rather than issuing a bare `SELECT`: the
   connection is multiplexed, and a `SELECT` on it would affect commands that are
   already in flight.
+- Key names travel as escaped text: valid UTF-8 as it is, any other byte as
+  `\xNN`, and a real backslash doubled. Every command that names a key sends the
+  bytes back, so the escaped name in the tree addresses exactly the key the
+  server handed over. Hash fields, set and sorted-set members and stream ids are
+  still handled as text; a binary one shows as a hex dump and cannot be edited.
+- The hex dump stops at 4 KiB and says how many bytes it left out. It is a
+  viewer, not an editor: rediscope will not write a dump back to a key.
 
 ## License
 

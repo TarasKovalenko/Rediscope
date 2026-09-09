@@ -1,4 +1,6 @@
 //! Deterministic RESP peers exercise redirects and failures without a Redis daemon.
+
+mod common;
 use rediscope::{
     config::{Connection, Deployment},
     redis_client::{Client, KeyType, key_slot},
@@ -43,6 +45,7 @@ impl Peer {
         Self { port, stopped }
     }
     fn profile(&self, deployment: Deployment) -> Connection {
+        common::isolate_config();
         Connection {
             name: "protocol-test".into(),
             host: "127.0.0.1".into(),

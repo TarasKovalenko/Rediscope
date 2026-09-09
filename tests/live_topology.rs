@@ -1,5 +1,7 @@
 //! Opt-in real Redis smoke test: cargo test --test live_topology -- --ignored
 //! Starts only disposable local redis-server children and removes their files.
+
+mod common;
 use rediscope::{
     config::{Connection, Deployment},
     redis_client::{Client, KeyType, key_slot},
@@ -80,6 +82,7 @@ impl Server {
             .unwrap()
     }
     fn profile(&self, deployment: Deployment) -> Connection {
+        common::isolate_config();
         Connection {
             name: "live topology".into(),
             host: "127.0.0.1".into(),

@@ -71,6 +71,16 @@ impl Client {
             !self.read_only(),
             "Read-only profile or production write lease expired"
         );
+        // A binary value is shown as a hex dump. Saving one would store the
+        // dump text over the bytes it describes, so the edit stops here.
+        anyhow::ensure!(
+            !crate::redis_client::is_hex_dump(&target.original),
+            "This value is binary and is shown as a hex dump. Editing it would overwrite the bytes with their own description."
+        );
+        anyhow::ensure!(
+            !crate::redis_client::is_hex_dump(&target.selector),
+            "This element's name is binary and is shown as a hex dump; it cannot be edited by name."
+        );
         let value = values.first().context("Missing edit value")?;
         let score = values.get(1).map(String::as_str).unwrap_or("");
         if target.kind == KeyType::ZSet {

@@ -4,6 +4,8 @@
 //!   REDISCOPE_TLS_PORT=7800 REDISCOPE_MTLS_PORT=7801 \
 //!   REDISCOPE_CERTS=/path/to/certs cargo test --test tls
 
+mod common;
+
 use rediscope::config::Connection;
 use rediscope::redis_client::Client;
 
@@ -16,6 +18,7 @@ fn port(var: &str) -> Option<u16> {
 }
 
 fn base(port: u16, db: i64) -> Connection {
+    common::isolate_config();
     Connection {
         name: "tls-test".into(),
         host: "127.0.0.1".into(),

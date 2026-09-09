@@ -1,4 +1,6 @@
 //! P0 safety checks. CI supplies a disposable standalone Redis via REDISCOPE_TEST_PORT.
+mod common;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rediscope::{
     app::{App, Modal, Msg, Screen},
@@ -7,6 +9,7 @@ use rediscope::{
 };
 
 fn profile() -> Option<Connection> {
+    common::isolate_config();
     Some(Connection {
         name: "p0-production".into(),
         host: "127.0.0.1".into(),

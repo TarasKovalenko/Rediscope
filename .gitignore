@@ -6,3 +6,8 @@ dump.rdb
 # Assembled by the pages workflow.
 _site/
 site/screenshots/
+
+# Working notes kept beside a task, never part of the repository.
+/findings.md
+/progress.md
+/task_plan.md
