@@ -4,6 +4,8 @@
 //!   redis-server --port 7799 --daemonize yes
 //!   REDISCOPE_TEST_PORT=7799 cargo test --test integration
 
+mod common;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rediscope::app::{App, Modal, Msg};
 use rediscope::config::Connection;
@@ -13,6 +15,7 @@ use rediscope::redis_client::{Client, KeyType, KeyValue, MemoryScan};
 
 /// Each test owns a database index so the suite can run in parallel.
 fn conn(db: i64) -> Option<Connection> {
+    common::isolate_config();
     let port: u16 = std::env::var("REDISCOPE_TEST_PORT").ok()?.parse().ok()?;
     Some(Connection {
         name: "test".into(),
@@ -622,4 +625,76 @@ async fn the_pubsub_feed_receives_what_is_published() {
         .expect("a message arrives");
     assert_eq!(message.channel, "chat");
     assert_eq!(message.payload, "hello");
+}
+
+/// A key whose name or value is not UTF-8 must still scan, read, export and
+/// import, and must never be edited through its hex dump.
+#[tokio::test]
+async fn binary_key_names_and_values_survive_the_whole_round_trip() {
+    let c = client!(0);
+    clear_prefix(&c, "binary:").await;
+    let name = r"binary:\x80bad";
+    // string.char builds bytes Lua can carry that no String argument could.
+    c.eval(
+        "redis.call('SET', KEYS[1], string.char(0x80, 0xfe, 0x00, 65))",
+        &[name.to_string()],
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let (keys, _) = c.scan_keys("binary:*", 5000).await.unwrap();
+    assert_eq!(
+        keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(),
+        [name],
+        "an unreadable byte in a key name must not take the scan down"
+    );
+    assert_eq!(c.key_info(name).await.unwrap().kind, KeyType::String);
+
+    let value = c.read_value(name, KeyType::String).await.unwrap();
+    let KeyValue::Str(shown) = value else {
+        panic!("expected a string value");
+    };
+    assert!(
+        rediscope::redis_client::is_hex_dump(&shown),
+        "a non-UTF-8 value should be shown as a hex dump, got {shown:?}"
+    );
+    assert!(shown.contains("80 fe 00 41"), "{shown}");
+
+    // Saving that dump would store the description over the bytes.
+    let target = rediscope::redis_client::EditTarget {
+        key: name.into(),
+        kind: KeyType::String,
+        selector: String::new(),
+        original: shown.clone(),
+    };
+    assert!(
+        c.save_edit(&target, &["anything".into()], false)
+            .await
+            .is_err()
+    );
+    assert!(
+        c.save_edit(&target, &["anything".into()], true)
+            .await
+            .is_err()
+    );
+
+    // Export, delete, import: the bytes come back exactly as they went in.
+    let entries = c.export_keys(&[name.to_string()]).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(c.delete_keys(&[name.to_string()]).await.unwrap(), 1);
+    assert_eq!(c.import_entries(&entries, false).await.unwrap(), 1);
+    let bytes = c
+        .eval(
+            "local v = redis.call('GET', KEYS[1]) return {#v, string.byte(v, 1), string.byte(v, 3)}",
+            &[name.to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes, "1) (integer) 4\n2) (integer) 128\n3) (integer) 0",
+        "the restored value must be the same four bytes"
+    );
+    clear_prefix(&c, "binary:").await;
 }

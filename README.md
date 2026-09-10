@@ -36,9 +36,26 @@ irm https://raw.githubusercontent.com/TarasKovalenko/Rediscope/main/install.ps1 
 ```
 
 Either script detects your platform, downloads the matching prebuilt binary from
-GitHub Releases, verifies its SHA-256 against the published `SHA256SUMS`, and
-installs to `~/.local/bin` (`/usr/local/bin` when run as root), or on Windows to
+GitHub Releases, verifies its SHA-256 against the published `SHA256SUMS`, verifies
+the release's signed build provenance with the GitHub CLI, and installs to
+`~/.local/bin` (`/usr/local/bin` when run as root), or on Windows to
 `%LOCALAPPDATA%\Programs\rediscope\bin`, adding it to your user `PATH`.
+
+Verification needs `gh` on your `PATH`, and only releases built after provenance
+existed carry an attestation. The default, `REDISCOPE_VERIFY_PROVENANCE=auto`,
+tells those cases apart so nothing has to be configured:
+
+| Situation | What happens |
+|---|---|
+| Release is signed and verifies | Installs |
+| Release is signed and does **not** verify | Refuses, always — in every mode |
+| Release predates provenance (v0.9.0 and earlier) | Warns, asks at the terminal, installs on `y` |
+| `gh` missing, or GitHub unreachable | Warns, asks at the terminal, installs on `y` |
+
+With no terminal to ask on — a CI job, a Dockerfile — the last two cases warn and
+continue on the checksum alone. Set `REDISCOPE_VERIFY_PROVENANCE=1` to make them
+fatal instead and require a verified attestation, or `0` to skip the check.
+A signature that fails to verify is never waved through by any setting.
 
 Pin a version or change the location:
 
@@ -130,6 +147,12 @@ rediscope
   sorted-set member or stream entry opens a form; `x` deletes the selected one.
 - **Rename, delete, TTL.** `R` renames, `D` deletes after a confirmation, `t`
   sets an expiry in seconds or clears it when left blank.
+- **Binary values and key names.** Not every value is text. A value that is not
+  UTF-8 is shown as a hex dump with offset, hex and ASCII columns instead of
+  taking the read down, and a key whose name holds raw bytes appears with those
+  bytes escaped as `\xNN`, so one binary key can no longer break the whole scan.
+  Editing is refused on anything shown as a dump, because saving it would store
+  the description over the bytes it describes.
 - **JSON values.** A string holding JSON is shown indented and syntax-coloured
   with a `json` badge. The editor opens it pretty-printed, `Ctrl+F` reformats,
   and `Ctrl+S` refuses to save a document that no longer parses. Key order is
@@ -158,8 +181,8 @@ rediscope
   **Slowlog** (slowest first, `x` resets it), **Clients** (`CLIENT LIST` sorted
   by idle time, `x` disconnects the selected one), **Config** (every running
   parameter, `e` edits one through `CONFIG SET`), **Latency** (a live ping
-  sample plus `LATENCY LATEST`), **Cluster** (`CLUSTER INFO` and the loaded
-  modules), and the full raw reply. `/` filters the open section, `y` copies
+  sample plus `LATENCY LATEST`), **Cluster** (`CLUSTER INFO`, loaded modules,
+  and node/slot reachability for discovered profiles), and the full raw reply. `/` filters the open section, `y` copies
   it, `r` re-reads. Anything a managed provider refuses simply says so in its
   tab.
 - **Namespace memory** (`M`). Which key prefix is holding the RAM. A background
@@ -220,6 +243,37 @@ rediscope
 - **ACL usernames.** Redis 6+ `user` / `password` pairs, per profile or via
   `-u`.
 
+### Working safely in production
+
+- **Environment labels.** A profile is `development`, `staging` or `production`.
+  The list marks anything that is not development, and a production session
+  wears a red `PRODUCTION LOCKED` badge in the title bar. Old profiles stay
+  `development`, so nothing changes until you say so.
+- **Production opens locked.** A production connection refuses every write until
+  you unlock it with `Ctrl+W` and type the profile's exact name. The lease lasts
+  five minutes and the badge counts it down. `Ctrl+W` again locks immediately;
+  so does switching database, and reconnecting always starts locked.
+- **Typed confirmation for destructive work.** With the lease open, deletes,
+  bulk actions, TTL changes, imports, `CONFIG SET`, `CLIENT KILL`, Lua, copies
+  and writing console commands each ask for the profile name once more before
+  they run.
+- **One enforcement point.** The lease, the read-only switch and the
+  Cluster/Sentinel restriction are all checked at the moment a command is
+  dispatched, so no route — form, bulk action, console, script or import — can
+  get around them. Commands are classified from an allowlist: anything the
+  client does not recognise counts as a write and is refused.
+- **Conflict-safe edits.** Saving a string, JSON document, hash field, list
+  item or set/sorted-set member compares what you were shown against what is
+  stored, inside one Redis operation. If someone changed it first you get a
+  three-way view — original, current, your draft — and can re-edit, reload, or
+  overwrite after typing the key name. String saves keep the TTL (`KEEPTTL`),
+  and a missing or retyped key is never recreated.
+- **A local audit trail.** Every connect, unlock, write and pipeline appends a
+  JSON line to `audit.jsonl` next to your config (mode `0600`). Events carry the
+  action, outcome and target count only — never keys, arguments, values, scripts
+  or credentials. A write is refused outright if its intent cannot be recorded
+  first, so the log cannot silently miss an operation.
+
 ### Comfort
 
 - **Colour themes** (`p`). Preview and choose Redis, Dracula, Catppuccin Mocha,
@@ -230,6 +284,11 @@ rediscope
   installed.
 - **Non-blocking.** Every Redis call runs off the render loop, so the interface
   stays responsive against slow or distant servers.
+- **Scrolling costs nothing.** Moving through the key tree does not read a value
+  per row: the read waits for the cursor to rest, so holding a key down or
+  paging through thousands of keys issues one request instead of hundreds. A
+  reply for a key you have already scrolled past is discarded rather than drawn,
+  so a slow server can never flash the wrong value into the pane.
 - **Tiny terminals.** The layout is tested down to 10×5, so a split pane still
   renders something usable.
 
@@ -280,6 +339,7 @@ Press `?` in the app for this list at any time.
 | `p` | Colour theme picker |
 | `:` | Raw command console |
 | `Ctrl+D` | Switch database (reconnects) |
+| `Ctrl+W` | Unlock production writes for five minutes, or lock them again now |
 | `Ctrl+N` | Back to the server list |
 | `?` / `q` | Help / quit |
 
@@ -381,6 +441,7 @@ rediscope -H cache.internal --tls-cert ~/certs/client.crt --tls-key ~/certs/clie
 | `--tls-insecure` | Accept any server certificate. Dev servers only |
 | `--profile NAME` | Open a saved profile directly, by name |
 | `--read-only` | Refuse every write for this session |
+| `--environment` | `development`, `staging` or `production`. A production session opens with writes locked, and a saved production profile cannot be downgraded from the command line |
 | `--ssh HOST` | Reach the server through `ssh -L` on this jump host |
 | `--ssh-user`, `--ssh-port`, `--ssh-key` | Details for `--ssh` |
 | `--config-path` | Print the connections file path and exit |
@@ -412,10 +473,21 @@ rediscope -H localhost import --file users.json --replace
 
 A read-only profile refuses `import`, the same as it does in the UI.
 
+Importing into a production profile needs both halves of the interactive flow
+spelled out, each with the profile's exact name — one unlocks the five-minute
+lease, the other confirms the destructive write. Neither flag is accepted on a
+non-production profile:
+
+```sh
+rediscope --profile prod import --file users.json \
+  --unlock-production prod --confirm-production prod
+```
+
 | Environment variable | Meaning |
 |---|---|
 | `REDISCOPE_PASSWORD` | Password, instead of `-a`. A flag is visible to anyone who can run `ps` |
 | `REDISCOPE_HOME` | Config directory, overriding the platform default |
+| `REDISCOPE_AUDIT_FILE` | Where to append audit events, instead of `audit.jsonl` in the config directory |
 
 ## Connections and secrets
 
@@ -441,6 +513,62 @@ password silently.
 
 ## Configuration
 
+Cluster and Sentinel profiles can be created in the connection editor's
+**Topology** section, or in the saved configuration. `host` and `port` identify
+one cluster seed or Sentinel; `seeds` lists additional `host:port` endpoints
+(use `[IPv6]:port` for IPv6). Existing profiles default to `standalone`.
+
+```json
+{
+  "name": "production-cluster",
+  "deployment": "cluster",
+  "host": "redis-a.internal",
+  "port": 6379,
+  "db": 0,
+  "seeds": ["redis-b.internal:6379", "redis-c.internal:6379"],
+  "username": "browser",
+  "password": "${REDIS_PASSWORD}",
+  "tls": true
+}
+```
+
+For Sentinel, set `deployment` to `sentinel`, use a Sentinel port (usually
+26379), and set `sentinel_master` to its monitored service name. Optional
+`sentinel_username` and `sentinel_password` authenticate to Sentinel separately;
+`username`/`password` still authenticate to the discovered Redis primary.
+Both passwords accept environment placeholders. Data-node credentials also
+support the existing OS keychain setting. TLS trust/client certificates apply
+to both discovery endpoints and data nodes; all advertised addresses must be
+reachable and valid for those certificates. A single SSH forward is rejected
+for discovered deployments.
+
+Cluster browsing scans each discovered primary, deduplicates keys, and applies
+the view limit to the combined results. The tree displays **PARTIAL RESULTS**
+when a node or key's metadata is unavailable; command-line `keys`/`export` warn
+on stderr. These are best-effort scans, not snapshots or complete backups.
+Refresh the browser to rediscover topology and retry unavailable nodes. The
+Cluster diagnostics tab lists node IDs, roles, slot ranges, and reachability;
+the selected key shows its hash slot. The INFO All view and headless `info`
+include labelled per-primary sections. Ordinary diagnostic tabs and raw
+node-local commands such as `SCAN`, `INFO`, and `DBSIZE` describe the selected
+diagnostic endpoint; the browser's total key count sums all primaries.
+
+Topology also refreshes on redirects, recoverable connection failures, and the
+next command after 30 seconds. Sentinel discovery verifies `ROLE master` and
+repeats discovery after connection loss. Reads use bounded retries and backoff;
+writes whose replies are lost report an unknown outcome and are never replayed.
+The shared console refuses connection-state commands such as `AUTH` and `MULTI`;
+use profile settings for authentication and the database selector (or `SELECT`
+in the TUI) to open a fresh database connection.
+
+This first release enables **read-only browsing and diagnostics** for both
+Cluster and Sentinel. Writes, imports, transactions, and unknown raw/module
+commands are refused centrally, even if the profile's read-only switch is off.
+Cluster permits database 0 only. Cluster memory rollups and discovered-profile
+pub/sub are explicitly unavailable. Slot-aware writes and multi-key restrictions
+are deferred to the next release. Managed services exposing a single proxy
+endpoint can keep a standalone profile.
+
 Saved connections live in `connections.json` under your platform config dir, and
 the console keeps its history beside it in `history` (mode `0600`, 500 commands).
 That's `~/.config/rediscope` on Linux, `~/Library/Application Support/rediscope`
@@ -461,6 +589,53 @@ cannot truncate it. A file that exists but does not parse is moved aside as
 `connections.json.bad-<timestamp>` rather than replaced, and a file that cannot
 be read at all disables saving for the session instead of overwriting profiles
 that are still on disk.
+
+### Environments and the production lease
+
+A profile's `environment` is `development` (the default for anything already
+saved), `staging` or `production`. Pick it in the connection editor's
+**Production safety** section, in the file, or with `--environment`:
+
+```json
+{
+  "name": "prod",
+  "environment": "production",
+  "host": "cache.internal",
+  "port": 6379,
+  "tls": true
+}
+```
+
+Production only changes when writes are allowed, never who is allowed to write:
+Redis ACLs remain the authorization boundary, and the lease is a guard against
+mistakes made on the wrong window. It lives in memory for one connection, so it
+is never persisted, never shared with another process, and never survives a
+reconnect or a database switch. It also never widens anything: a profile with
+the read-only switch on, or a Cluster/Sentinel profile, stays read-only and
+cannot be unlocked at all.
+
+### The audit log
+
+Writes append JSON lines to `audit.jsonl` beside `connections.json`, or to
+`REDISCOPE_AUDIT_FILE`. The file is created `0600`, opened in append mode, and
+refused if the path is not a regular file:
+
+```json
+{"schema":1,"timestamp_ms":1717171717171,"session":"4821-1717171717171-1","operation_id":42,"profile":"prod","db":0,"action":"DEL","outcome":"success","target_key_count":3}
+```
+
+`action` is a fixed label taken from an allowlist of command names — anything
+unrecognised is logged as `OTHER_COMMAND`, so user input can never become a log
+field. `target_key_count` is how many keys the command was aimed at, not a claim
+that they all changed, and is absent when that cannot be known (`FLUSHDB`, an
+arbitrary script). Every operation writes an intent line before it is dispatched
+and a completion line afterwards, sharing one `operation_id`; `outcome` is
+`success`, `failure`, `denied`, or `unknown` when the reply was lost and the
+operation must not be retried blindly.
+
+This is a local file owned by the same OS user as the app, so it is evidence,
+not proof — ship it to your logging service if you need independent retention.
+Nothing is uploaded anywhere by rediscope itself.
 
 ## Troubleshooting
 
@@ -485,7 +660,29 @@ numbers as the ranking they are.
 
 **Writes are refused with "this connection is read-only".** The profile has its
 read-only switch on (the title bar says `READ-ONLY`). Turn it off in the profile
-editor, or connect without `--read-only`.
+editor, or connect without `--read-only`. Cluster and Sentinel profiles always
+remain read-only in this first release, regardless of that switch.
+
+**A production profile refuses writes even though it isn't read-only.** That is
+the lease, not the switch: the title bar says `PRODUCTION LOCKED`. Press `Ctrl+W`
+and type the profile name to open a five-minute window. Cluster and Sentinel
+profiles cannot be unlocked at all in this release.
+
+**Saving a value says the stored value changed.** Someone wrote to that key
+between the moment you opened the editor and the moment you saved. Compare the
+three columns, then `e` to re-edit your draft against the current value, `r` to
+reload, or `o` to overwrite after typing the key name. If the key was deleted or
+is now a different type, no overwrite recreates it — create it again explicitly.
+
+**A write failed with "audit completion failed. Do not automatically retry."**
+The command may have reached Redis; only its outcome could not be recorded. Fix
+the audit path (a full disk, wrong permissions, a path that is not a regular
+file), check the key's actual state, and only then decide whether to repeat it.
+
+**`install.sh` stops at provenance verification.** Either `gh` is missing, or
+the release predates build attestations. Install `gh` and authenticate it, or
+set `REDISCOPE_VERIFY_PROVENANCE=0` for that older release — the SHA-256 check
+still runs either way.
 
 **The SSH tunnel times out.** rediscope runs the system `ssh` in batch mode, so
 it never waits at a password prompt. Check that `ssh <host>` works on its own,
@@ -495,10 +692,10 @@ with a key your agent already holds.
 `notify-keyspace-events` is configured — `CONFIG SET notify-keyspace-events KEA`
 turns everything on for a test.
 
-**Keys on a cluster come back as `MOVED` errors.** rediscope talks to the node
-you point it at; it does not follow slot redirects yet. Point it at the node
-that owns the keys, or use the Cluster tab of the info pane (`i`) to see the
-topology.
+**Keys on a cluster come back as `MOVED` errors.** Select `cluster` in the
+profile's Deployment field. Standalone profiles intentionally treat the host
+as one endpoint (including managed proxy endpoints). Cluster profiles discover
+slot owners and follow both `MOVED` and `ASK` redirects.
 
 **The keychain switch refuses to turn on.** No Secret Service is running, which
 is normal on a headless Linux box. Use `${SOME_ENV_VAR}` for that profile.
@@ -506,11 +703,18 @@ is normal on a headless Linux box. Use `${SOME_ENV_VAR}` for that profile.
 ## Development
 
 ```sh
-cargo test                                    # unit + render tests
+cargo test                                    # unit, render, and topology protocol tests
+cargo test --test live_topology -- --ignored   # disposable real Cluster/Sentinel smoke test
 redis-server --port 7799 --daemonize yes      # for the integration suite
-REDISCOPE_TEST_PORT=7799 cargo test           # exercises a real server
+REDISCOPE_TEST_PORT=7799 cargo test           # exercises a real server, including tests/production.rs
 cargo clippy --all-targets -- -D warnings
 ```
+
+`tests/production.rs` drives the whole safety path against that server: a locked
+production transport, the `Ctrl+W` unlock, typed confirmations, the headless
+import flags, conflict-safe edits, and the audit file's contents. Point
+`REDISCOPE_AUDIT_FILE` at a scratch path when you run it, or it appends to your
+own log.
 
 The TLS suite needs two more instances and a certificate set; `.github/workflows/ci.yml`
 has the exact `openssl` and `redis-server` invocations. Point it at them with
@@ -538,13 +742,33 @@ down to 10×5, which is what keeps the layout arithmetic honest.
 
 ## Releasing
 
-Tag and push. `.github/workflows/release.yml` cross-builds every target,
-publishes the tarballs and Windows zips plus `SHA256SUMS`, and that is what
+Tag and push. `.github/workflows/release.yml` first re-runs `fmt`, `clippy`, the
+test suite and `cargo audit` against the tag, then cross-builds every target and
+publishes the tarballs and Windows zips plus `SHA256SUMS`, which is what
 `install.sh` and `install.ps1` read.
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
+
+Each archive gets a signed GitHub build provenance attestation, and the run
+publishes `rediscope-dependencies.spdx.json`, an SPDX inventory of the locked
+Cargo dependencies. That inventory covers every crate in `Cargo.lock`, including
+ones only used on other platforms; it is not a per-binary bill of materials and
+does not inventory system libraries or the toolchain. Verify a download yourself
+with:
+
+```sh
+gh attestation verify rediscope-v0.1.0-aarch64-apple-darwin.tar.gz \
+  --repo TarasKovalenko/Rediscope \
+  --signer-workflow TarasKovalenko/Rediscope/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
+```
+
+Every GitHub Action is pinned to a commit SHA, Dependabot proposes action and
+crate updates weekly, and `.github/workflows/security.yml` runs `cargo audit`
+against RustSec on pull requests, on `main`, and weekly. `SECURITY.md` has the
+reporting process and the security boundaries.
 
 ## Notes
 
@@ -559,6 +783,13 @@ git tag v0.1.0 && git push origin v0.1.0
 - Switching database reconnects rather than issuing a bare `SELECT`: the
   connection is multiplexed, and a `SELECT` on it would affect commands that are
   already in flight.
+- Key names travel as escaped text: valid UTF-8 as it is, any other byte as
+  `\xNN`, and a real backslash doubled. Every command that names a key sends the
+  bytes back, so the escaped name in the tree addresses exactly the key the
+  server handed over. Hash fields, set and sorted-set members and stream ids are
+  still handled as text; a binary one shows as a hex dump and cannot be edited.
+- The hex dump stops at 4 KiB and says how many bytes it left out. It is a
+  viewer, not an editor: rediscope will not write a dump back to a key.
 
 ## License
 

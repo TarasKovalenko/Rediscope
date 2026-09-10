@@ -89,6 +89,7 @@
         <li><kbd>/</kbd> searches by pattern, <kbd>F</kbd> searches inside values.</li>
         <li>Live TTLs: keys leave the tree as they expire.</li>
         <li>Scans, never <code>KEYS</code>, so a big keyspace stays responsive.</li>
+        <li>Scrolling reads nothing until the cursor stops, so a thousand keys cost one request.</li>
       </ul>
     </article>
 
@@ -97,6 +98,7 @@
       <ul>
         <li>Every type: strings, hashes, lists, sets, sorted sets, streams, JSON.</li>
         <li>JSON is checked before it is saved, and reformatted on request.</li>
+        <li>Values that are not text show as a hex dump instead of failing the read, and binary key names scan as escaped bytes.</li>
         <li>Rename, re-TTL, copy and delete, one key or a marked batch.</li>
         <li>Export and import keys with their TTLs, as <code>DUMP</code> payloads.</li>
       </ul>
@@ -125,10 +127,21 @@
     <article>
       <h3>Connect</h3>
       <ul>
+        <li>Cluster and Sentinel profiles that discover their own topology, follow <code>MOVED</code> and <code>ASK</code>, and browse every primary at once.</li>
         <li>TLS and mutual TLS, with your own CA.</li>
         <li>SSH tunnels, for a cache behind a bastion.</li>
         <li>Passwords in the OS keychain, or from <code>${VAR}</code> at connect time.</li>
         <li>A read-only flag per profile that refuses every write.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Work in production</h3>
+      <ul>
+        <li>Production profiles open locked. <kbd>Ctrl</kbd>+<kbd>W</kbd> and the profile name typed in full buys five minutes.</li>
+        <li>Deletes, bulk actions and imports ask for the name again before they run.</li>
+        <li>Saving compares the value you were shown against what is stored, and shows you both if someone got there first.</li>
+        <li>Every write appends to a local audit log: what, when, how many keys. Never the keys or the values.</li>
       </ul>
     </article>
 
@@ -221,7 +234,7 @@
         <code id="i-run">rediscope</code>
         <button class="copy" data-copy="#i-run" type="button">Copy</button>
       </div>
-      <p>Or go straight at a server: <code>rediscope redis://cache:6379/0</code>. Prebuilt binaries and checksums are on the <a href="https://github.com/TarasKovalenko/Rediscope/releases">releases page</a>.</p>
+      <p>Or go straight at a server: <code>rediscope redis://cache:6379/0</code>. Prebuilt binaries, checksums and signed build provenance are on the <a href="https://github.com/TarasKovalenko/Rediscope/releases">releases page</a>; the installers check both before they write anything.</p>
     </div>
   </div>
 

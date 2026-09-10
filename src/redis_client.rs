@@ -8,12 +8,26 @@ use redis::{
     RedisConnectionInfo, TlsCertificates,
 };
 
-use crate::config::Connection;
+use crate::config::{Connection, Deployment};
+mod edit;
+mod topology;
+pub use edit::{EditOutcome, EditTarget};
+use topology::Transport;
+pub use topology::{Node, key_slot};
+
+#[derive(Clone, Debug, Default)]
+pub struct ScanReport {
+    pub keys: Vec<KeyInfo>,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
+}
 
 /// Hard ceiling on keys pulled into one tree view.
 pub const KEY_LIMIT: usize = 5_000;
 /// Hard ceiling on elements pulled into one value pane.
 pub const VALUE_LIMIT: usize = 1_000;
+/// How much of a non-text value the hex dump shows.
+const HEX_DUMP_LIMIT: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
@@ -105,7 +119,7 @@ pub enum KeyValue {
 #[derive(Clone)]
 pub struct Client {
     pub conn: Connection,
-    mgr: MultiplexedConnection,
+    mgr: Transport,
     /// Kept so a feature needing a connection of its own — pub/sub, which
     /// cannot share the multiplexed one — can open it.
     raw: redis::Client,
@@ -608,6 +622,7 @@ impl Client {
     }
 
     pub async fn connect(conn: Connection) -> Result<Self> {
+        conn.validate_topology()?;
         // Opening the tunnel shells out and blocks on a TCP probe; keep both
         // off the runtime's worker threads.
         let tunnel = if conn.uses_ssh() {
@@ -620,14 +635,7 @@ impl Client {
         };
         let via = tunnel.as_ref().map(|t| t.local_port);
         let client = build_client(&conn, via).await?;
-        let mut mgr = client
-            .get_multiplexed_async_connection_with_config(
-                &redis::AsyncConnectionConfig::new()
-                    .set_connection_timeout(Some(std::time::Duration::from_secs(5)))
-                    .set_response_timeout(Some(std::time::Duration::from_secs(10))),
-            )
-            .await?;
-        redis::cmd("PING").query_async::<()>(&mut mgr).await?;
+        let mgr = Transport::new(conn.clone(), client.clone()).await?;
         Ok(Self {
             conn,
             mgr,
@@ -639,12 +647,42 @@ impl Client {
     /// True when the profile refuses writes. Checked before every mutation so
     /// a read-only server cannot be edited by any route, including the console.
     pub fn read_only(&self) -> bool {
-        self.conn.read_only
+        self.mgr.read_only()
+    }
+
+    /// Use the same conservative classification as the final dispatch guard.
+    pub fn command_is_read_only(line: &str) -> bool {
+        let Ok(args) = split_args(line) else {
+            return false;
+        };
+        let Some(head) = args.first() else {
+            return true;
+        };
+        let mut cmd = redis::cmd(head);
+        cmd.arg(&args[1..]);
+        topology::read_route(&cmd).0
+    }
+
+    pub fn production(&self) -> bool {
+        self.conn.environment == crate::config::Environment::Production
+    }
+    pub fn write_lease_remaining(&self) -> u64 {
+        self.mgr.remaining()
+    }
+    pub fn unlock_writes(&self, confirmation: &str) -> Result<()> {
+        self.mgr.unlock(confirmation)
+    }
+    pub fn lock_writes(&self) -> Result<()> {
+        self.mgr.lock()
     }
 
     /// A connection of its own, for pub/sub. The multiplexed connection cannot
     /// be put into subscriber mode without breaking every other caller.
     pub async fn pubsub(&self) -> Result<redis::aio::PubSub> {
+        anyhow::ensure!(
+            self.conn.deployment == Deployment::Standalone,
+            "Pub/sub is not supported for discovered deployments yet"
+        );
         Ok(self.raw.get_async_pubsub().await?)
     }
 
@@ -699,8 +737,12 @@ impl Client {
         stride: u64,
         rollup: &mut crate::memory::Rollup,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            self.conn.deployment != Deployment::Cluster,
+            "Cluster memory rollups are not available yet; use per-node diagnostics"
+        );
         let mut c = self.mgr.clone();
-        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+        let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
             .arg(scan.cursor)
             .arg("COUNT")
             .arg(500)
@@ -712,6 +754,7 @@ impl Client {
         let stride = stride.max(1);
         let mut sample: Vec<String> = Vec::new();
         for name in batch {
+            let name = encode_key(&name);
             if scan.seen.is_multiple_of(stride) {
                 sample.push(name.clone());
             }
@@ -722,7 +765,7 @@ impl Client {
         if !sample.is_empty() {
             let mut pipe = redis::pipe();
             for name in &sample {
-                pipe.cmd("MEMORY").arg("USAGE").arg(name);
+                pipe.cmd("MEMORY").arg("USAGE").arg(decode_key(name));
             }
             // A server with `MEMORY USAGE` disabled still gives a useful key
             // count, so a failed measurement is not a failed report.
@@ -731,7 +774,7 @@ impl Client {
                 // is best effort, and its absence just leaves the column empty.
                 let mut freq_pipe = redis::pipe();
                 for name in &sample {
-                    freq_pipe.cmd("OBJECT").arg("FREQ").arg(name);
+                    freq_pipe.cmd("OBJECT").arg("FREQ").arg(decode_key(name));
                 }
                 let freqs = freq_pipe
                     .query_async::<Vec<Option<u64>>>(&mut c)
@@ -748,6 +791,15 @@ impl Client {
     }
 
     pub async fn dbsize(&self) -> Result<u64> {
+        if self.conn.deployment == Deployment::Cluster {
+            let mut total = 0;
+            for ep in self.mgr.primaries().await {
+                total += redis::from_redis_value::<u64>(
+                    self.mgr.direct(&ep, &redis::cmd("DBSIZE")).await?,
+                )?;
+            }
+            return Ok(total);
+        }
         let mut c = self.mgr.clone();
         Ok(redis::cmd("DBSIZE").query_async(&mut c).await?)
     }
@@ -755,11 +807,58 @@ impl Client {
     /// Full `INFO` for the server pane. Falls back to the default sections
     /// when a managed provider rejects `INFO all`.
     pub async fn info(&self) -> Result<ServerInfo> {
+        if self.conn.deployment == Deployment::Cluster {
+            let mut raw = String::new();
+            let mut node_sections = Vec::new();
+            for ep in self.mgr.primaries().await {
+                match self
+                    .mgr
+                    .direct(&ep, &redis::cmd("INFO"))
+                    .await
+                    .and_then(|v| redis::from_redis_value::<String>(v).map_err(Into::into))
+                {
+                    Ok(node_raw) => {
+                        if raw.is_empty() {
+                            raw = node_raw.clone();
+                        }
+                        let mut parsed = ServerInfo::parse(&node_raw);
+                        for section in &mut parsed.sections {
+                            section.name = format!("{}:{} {}", ep.0, ep.1, section.name);
+                        }
+                        node_sections.extend(parsed.sections);
+                    }
+                    Err(e) => node_sections.push(InfoSection {
+                        name: format!("{}:{} unavailable", ep.0, ep.1),
+                        fields: vec![("error".into(), e.to_string())],
+                    }),
+                }
+            }
+            let mut info = ServerInfo::parse(&raw);
+            node_sections.push(InfoSection {
+                name: "Topology".into(),
+                fields: self.topology_rows().await,
+            });
+            for section in &node_sections {
+                raw.push_str(&format!("\r\n# {}\r\n", section.name));
+                for (k, v) in &section.fields {
+                    raw.push_str(&format!("{k}:{v}\r\n"));
+                }
+            }
+            info.sections.extend(node_sections);
+            info.raw = raw;
+            return Ok(info);
+        }
         let mut c = self.mgr.clone();
-        let raw: String = match redis::cmd("INFO").arg("all").query_async(&mut c).await {
+        let mut raw: String = match redis::cmd("INFO").arg("all").query_async(&mut c).await {
             Ok(raw) => raw,
             Err(_) => redis::cmd("INFO").query_async(&mut c).await?,
         };
+        if self.conn.deployment == Deployment::Sentinel {
+            raw.push_str("\r\n# Topology\r\n");
+            for (key, value) in self.topology_rows().await {
+                raw.push_str(&format!("{key}:{value}\r\n"));
+            }
+        }
         Ok(ServerInfo::parse(&raw))
     }
 
@@ -775,12 +874,160 @@ impl Client {
 
     /// Cursor-based keyspace listing. Never issues `KEYS *`.
     /// Returns the keys plus whether the limit truncated the result.
+    /// Compatibility API: the boolean also signals incomplete node coverage.
     pub async fn scan_keys(&self, pattern: &str, limit: usize) -> Result<(Vec<KeyInfo>, bool)> {
+        let report = self.scan_report(pattern, limit).await?;
+        Ok((report.keys, report.truncated || !report.warnings.is_empty()))
+    }
+
+    pub async fn refresh_topology(&self) -> Result<Vec<Node>> {
+        self.mgr.refresh().await?;
+        Ok(self.mgr.nodes().await)
+    }
+
+    pub async fn scan_report(&self, pattern: &str, limit: usize) -> Result<ScanReport> {
+        if self.conn.deployment != Deployment::Cluster {
+            let (keys, truncated) = self.scan_standalone(pattern, limit).await?;
+            return Ok(ScanReport {
+                keys,
+                truncated,
+                warnings: vec![],
+            });
+        }
+        let mut report = ScanReport::default();
+        if let Err(e) = self.mgr.refresh().await {
+            report.warnings.push(format!("Stale topology: {e}"));
+        }
+        let primaries = self.mgr.primaries().await;
+        let nodes = self.mgr.nodes().await;
+        let mut slots = vec![false; 16384];
+        for n in &nodes {
+            for &(a, b) in &n.slots {
+                slots[a as usize..=b as usize].fill(true);
+            }
+        }
+        let missing = slots.iter().filter(|s| !**s).count();
+        if missing > 0 {
+            report
+                .warnings
+                .push(format!("{missing} slots have no known primary"));
+        }
+        use futures_util::{StreamExt, stream};
+        let batches = stream::iter(primaries.into_iter().map(|ep| async move {
+            let mut cursor = 0u64;
+            let mut names = std::collections::BTreeSet::new();
+            let mut warning = None;
+            let mut truncated = false;
+            loop {
+                let result = self
+                    .mgr
+                    .direct(
+                        &ep,
+                        redis::cmd("SCAN")
+                            .arg(cursor)
+                            .arg("MATCH")
+                            .arg(pattern)
+                            .arg("COUNT")
+                            .arg(500),
+                    )
+                    .await
+                    .and_then(|v| {
+                        redis::from_redis_value::<(u64, Vec<Vec<u8>>)>(v).map_err(Into::into)
+                    });
+                match result {
+                    Ok((next, batch)) => {
+                        names.extend(batch.iter().map(|n| encode_key(n)));
+                        cursor = next;
+                        if names.len() >= limit || cursor == 0 {
+                            truncated = cursor != 0 || names.len() > limit;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warning = Some(format!("{}:{} SCAN unavailable: {e}", ep.0, ep.1));
+                        break;
+                    }
+                }
+            }
+            (ep, names, truncated, warning)
+        }))
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+        let mut names = std::collections::BTreeMap::new();
+        for (ep, batch, truncated, warning) in batches {
+            for name in batch {
+                names.entry(name).or_insert_with(|| ep.clone());
+            }
+            report.truncated |= truncated;
+            if let Some(warning) = warning {
+                report.warnings.push(warning);
+            }
+        }
+        report.truncated |= names.len() > limit;
+        let mut by_node = std::collections::BTreeMap::<_, Vec<String>>::new();
+        for (name, ep) in names.into_iter().take(limit) {
+            by_node.entry(ep).or_default().push(name);
+        }
+        for (ep, names) in by_node {
+            // At most two metadata commands per retained key, in one node-local
+            // pipeline. A dead node costs one failed batch, not one timeout per key.
+            let metadata = self.mgr.metadata(&ep, &names).await;
+            let mut unknown = 0;
+            for (i, name) in names.into_iter().enumerate() {
+                let pair = metadata.as_ref().ok().and_then(|values| {
+                    Some((
+                        values.get(i * 2)?.clone().extract_error(),
+                        values.get(i * 2 + 1)?.clone().extract_error(),
+                    ))
+                });
+                let info = match pair {
+                    Some((Ok(kind), Ok(ttl))) => match (
+                        redis::from_redis_value::<String>(kind),
+                        redis::from_redis_value::<i64>(ttl),
+                    ) {
+                        (Ok(kind), Ok(ttl)) => Some(KeyInfo {
+                            name: name.clone(),
+                            kind: KeyType::parse(&kind),
+                            ttl,
+                        }),
+                        _ => None,
+                    },
+                    Some((Err(e), _)) | Some((_, Err(e))) if e.redirect_node().is_some() => {
+                        self.key_info(&name).await.ok()
+                    }
+                    _ => None,
+                };
+                match info {
+                    Some(info) if info.ttl != -2 => report.keys.push(info),
+                    Some(_) => {}
+                    None => {
+                        unknown += 1;
+                        report.keys.push(KeyInfo {
+                            name,
+                            kind: KeyType::Other,
+                            ttl: -2,
+                        });
+                    }
+                }
+            }
+            if unknown > 0 {
+                report.warnings.push(format!(
+                    "{}:{} metadata unavailable for {unknown} keys; displayed as unknown",
+                    ep.0, ep.1
+                ));
+            }
+        }
+        report.keys.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(report)
+    }
+
+    async fn scan_standalone(&self, pattern: &str, limit: usize) -> Result<(Vec<KeyInfo>, bool)> {
         let mut c = self.mgr.clone();
         let mut cursor: u64 = 0;
         let mut names: Vec<String> = Vec::new();
         loop {
-            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
                 .arg(cursor)
                 .arg("MATCH")
                 .arg(pattern)
@@ -788,27 +1035,27 @@ impl Client {
                 .arg(500)
                 .query_async(&mut c)
                 .await?;
-            names.extend(batch);
+            names.extend(batch.iter().map(|n| encode_key(n)));
             cursor = next;
             if cursor == 0 || names.len() >= limit {
                 break;
             }
         }
-        let truncated = names.len() > limit;
+        let truncated = cursor != 0 || names.len() > limit;
         names.truncate(limit);
         if names.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), truncated));
         }
 
         let mut type_pipe = redis::pipe();
         for n in &names {
-            type_pipe.cmd("TYPE").arg(n);
+            type_pipe.cmd("TYPE").arg(decode_key(n));
         }
         let types: Vec<String> = type_pipe.query_async(&mut c).await?;
 
         let mut ttl_pipe = redis::pipe();
         for n in &names {
-            ttl_pipe.cmd("TTL").arg(n);
+            ttl_pipe.cmd("TTL").arg(decode_key(n));
         }
         let ttls: Vec<i64> = ttl_pipe.query_async(&mut c).await?;
 
@@ -827,8 +1074,14 @@ impl Client {
 
     pub async fn key_info(&self, name: &str) -> Result<KeyInfo> {
         let mut c = self.mgr.clone();
-        let t: String = redis::cmd("TYPE").arg(name).query_async(&mut c).await?;
-        let ttl: i64 = redis::cmd("TTL").arg(name).query_async(&mut c).await?;
+        let t: String = redis::cmd("TYPE")
+            .arg(decode_key(name))
+            .query_async(&mut c)
+            .await?;
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(decode_key(name))
+            .query_async(&mut c)
+            .await?;
         Ok(KeyInfo {
             name: name.to_string(),
             kind: KeyType::parse(&t),
@@ -843,16 +1096,16 @@ impl Client {
         let lim = VALUE_LIMIT;
         Ok(match kind {
             KeyType::String => {
-                let v: Option<String> = c.get(name).await?;
-                KeyValue::Str(v.unwrap_or_default())
+                let v: Option<Vec<u8>> = c.get(decode_key(name)).await?;
+                KeyValue::Str(v.map(decode_value).unwrap_or_default())
             }
             KeyType::Hash => {
-                let total: u64 = c.hlen(name).await?;
+                let total: u64 = c.hlen(decode_key(name)).await?;
                 let mut rows = Vec::new();
                 let mut cursor: u64 = 0;
                 loop {
-                    let (next, flat): (u64, Vec<String>) = redis::cmd("HSCAN")
-                        .arg(name)
+                    let (next, flat): (u64, Vec<Vec<u8>>) = redis::cmd("HSCAN")
+                        .arg(decode_key(name))
                         .arg(cursor)
                         .arg("COUNT")
                         .arg(200)
@@ -860,9 +1113,10 @@ impl Client {
                         .await?;
                     for pair in flat.chunks(2) {
                         if let [f, v] = pair {
+                            let f = decode_value(f.clone());
                             rows.push(Row {
                                 id: f.clone(),
-                                cells: vec![f.clone(), v.clone()],
+                                cells: vec![f, decode_value(v.clone())],
                             });
                         }
                     }
@@ -880,14 +1134,14 @@ impl Client {
                 }
             }
             KeyType::List => {
-                let total: u64 = c.llen(name).await?;
-                let items: Vec<String> = c.lrange(name, 0, lim as isize - 1).await?;
+                let total: u64 = c.llen(decode_key(name)).await?;
+                let items: Vec<Vec<u8>> = c.lrange(decode_key(name), 0, lim as isize - 1).await?;
                 let rows = items
                     .into_iter()
                     .enumerate()
                     .map(|(i, v)| Row {
                         id: i.to_string(),
-                        cells: vec![i.to_string(), v],
+                        cells: vec![i.to_string(), decode_value(v)],
                     })
                     .collect();
                 KeyValue::Rows {
@@ -897,18 +1151,19 @@ impl Client {
                 }
             }
             KeyType::Set => {
-                let total: u64 = c.scard(name).await?;
+                let total: u64 = c.scard(decode_key(name)).await?;
                 let mut rows = Vec::new();
                 let mut cursor: u64 = 0;
                 loop {
-                    let (next, batch): (u64, Vec<String>) = redis::cmd("SSCAN")
-                        .arg(name)
+                    let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SSCAN")
+                        .arg(decode_key(name))
                         .arg(cursor)
                         .arg("COUNT")
                         .arg(200)
                         .query_async(&mut c)
                         .await?;
                     for m in batch {
+                        let m = decode_value(m);
                         rows.push(Row {
                             id: m.clone(),
                             cells: vec![m],
@@ -928,14 +1183,18 @@ impl Client {
                 }
             }
             KeyType::ZSet => {
-                let total: u64 = c.zcard(name).await?;
-                let items: Vec<(String, f64)> =
-                    c.zrange_withscores(name, 0, lim as isize - 1).await?;
+                let total: u64 = c.zcard(decode_key(name)).await?;
+                let items: Vec<(Vec<u8>, f64)> = c
+                    .zrange_withscores(decode_key(name), 0, lim as isize - 1)
+                    .await?;
                 let rows = items
                     .into_iter()
-                    .map(|(m, s)| Row {
-                        id: m.clone(),
-                        cells: vec![m, format_score(s)],
+                    .map(|(m, s)| {
+                        let m = decode_value(m);
+                        Row {
+                            id: m.clone(),
+                            cells: vec![m, format_score(s)],
+                        }
                     })
                     .collect();
                 KeyValue::Rows {
@@ -945,9 +1204,9 @@ impl Client {
                 }
             }
             KeyType::Stream => {
-                let total: u64 = c.xlen(name).await?;
-                let raw: Vec<(String, Vec<String>)> = redis::cmd("XREVRANGE")
-                    .arg(name)
+                let total: u64 = c.xlen(decode_key(name)).await?;
+                let raw: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XREVRANGE")
+                    .arg(decode_key(name))
                     .arg("+")
                     .arg("-")
                     .arg("COUNT")
@@ -960,8 +1219,14 @@ impl Client {
                         let fields = flat
                             .chunks(2)
                             .map(|p| match p {
-                                [f, v] => format!("{f}={v}"),
-                                [f] => f.clone(),
+                                [f, v] => {
+                                    format!(
+                                        "{}={}",
+                                        decode_value(f.clone()),
+                                        decode_value(v.clone())
+                                    )
+                                }
+                                [f] => decode_value(f.clone()),
                                 _ => String::new(),
                             })
                             .collect::<Vec<_>>()
@@ -979,26 +1244,16 @@ impl Client {
                 }
             }
             KeyType::Json => {
-                // `JSON.GET key $` always answers with a one-element array;
-                // the bare path gives the document as stored.
-                let doc: Option<String> = redis::cmd("JSON.GET")
-                    .arg(name)
-                    .arg("$")
+                let doc: Option<Vec<u8>> = redis::cmd("JSON.GET")
+                    .arg(decode_key(name))
+                    .arg(".")
                     .query_async(&mut c)
                     .await?;
-                let doc = doc.unwrap_or_else(|| "null".into());
-                // Unwrap the `$` envelope so the pane shows the document.
-                let text = match serde_json::from_str::<serde_json::Value>(&doc) {
-                    Ok(serde_json::Value::Array(mut items)) if items.len() == 1 => {
-                        serde_json::to_string(&items.remove(0)).unwrap_or(doc)
-                    }
-                    _ => doc,
-                };
-                KeyValue::Str(text)
+                KeyValue::Str(doc.map(decode_value).unwrap_or_else(|| "null".into()))
             }
             KeyType::TimeSeries => {
                 let raw: Vec<(u64, f64)> = redis::cmd("TS.RANGE")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg("-")
                     .arg("+")
                     .arg("COUNT")
@@ -1030,15 +1285,15 @@ impl Client {
 
     pub async fn delete_key(&self, name: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.del(name).await?;
+        let _: i64 = c.del(decode_key(name)).await?;
         Ok(())
     }
 
     pub async fn rename_key(&self, old: &str, new: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("RENAME")
-            .arg(old)
-            .arg(new)
+            .arg(decode_key(old))
+            .arg(decode_key(new))
             .query_async::<()>(&mut c)
             .await?;
         Ok(())
@@ -1049,10 +1304,10 @@ impl Client {
         let mut c = self.mgr.clone();
         match seconds {
             Some(s) if s >= 0 => {
-                let _: bool = c.expire(name, s).await?;
+                let _: bool = c.expire(decode_key(name), s).await?;
             }
             _ => {
-                let _: bool = c.persist(name).await?;
+                let _: bool = c.persist(decode_key(name)).await?;
             }
         }
         Ok(())
@@ -1062,23 +1317,23 @@ impl Client {
         let mut c = self.mgr.clone();
         match kind {
             KeyType::String => {
-                let _: () = c.set(name, "").await?;
+                let _: () = c.set(decode_key(name), "").await?;
             }
             KeyType::Hash => {
-                let _: i64 = c.hset(name, "field", "value").await?;
+                let _: i64 = c.hset(decode_key(name), "field", "value").await?;
             }
             KeyType::List => {
-                let _: i64 = c.rpush(name, "item").await?;
+                let _: i64 = c.rpush(decode_key(name), "item").await?;
             }
             KeyType::Set => {
-                let _: i64 = c.sadd(name, "member").await?;
+                let _: i64 = c.sadd(decode_key(name), "member").await?;
             }
             KeyType::ZSet => {
-                let _: i64 = c.zadd(name, "member", 0.0).await?;
+                let _: i64 = c.zadd(decode_key(name), "member", 0.0).await?;
             }
             KeyType::Stream => {
                 let _: String = redis::cmd("XADD")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg("*")
                     .arg("field")
                     .arg("value")
@@ -1087,7 +1342,7 @@ impl Client {
             }
             KeyType::Json => {
                 redis::cmd("JSON.SET")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .arg("$")
                     .arg("{}")
                     .query_async::<()>(&mut c)
@@ -1095,7 +1350,7 @@ impl Client {
             }
             KeyType::TimeSeries => {
                 redis::cmd("TS.CREATE")
-                    .arg(name)
+                    .arg(decode_key(name))
                     .query_async::<()>(&mut c)
                     .await?;
             }
@@ -1106,7 +1361,12 @@ impl Client {
 
     pub async fn set_string(&self, name: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: () = c.set(name, value).await?;
+        redis::cmd("SET")
+            .arg(decode_key(name))
+            .arg(value)
+            .arg("KEEPTTL")
+            .query_async::<()>(&mut c)
+            .await?;
         Ok(())
     }
 
@@ -1114,25 +1374,25 @@ impl Client {
 
     pub async fn hash_set(&self, name: &str, field: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.hset(name, field, value).await?;
+        let _: i64 = c.hset(decode_key(name), field, value).await?;
         Ok(())
     }
 
     pub async fn hash_del(&self, name: &str, field: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.hdel(name, field).await?;
+        let _: i64 = c.hdel(decode_key(name), field).await?;
         Ok(())
     }
 
     pub async fn list_push(&self, name: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.rpush(name, value).await?;
+        let _: i64 = c.rpush(decode_key(name), value).await?;
         Ok(())
     }
 
     pub async fn list_set(&self, name: &str, index: isize, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: () = c.lset(name, index, value).await?;
+        let _: () = c.lset(decode_key(name), index, value).await?;
         Ok(())
     }
 
@@ -1142,39 +1402,39 @@ impl Client {
     pub async fn list_remove_at(&self, name: &str, index: isize) -> Result<()> {
         let mut c = self.mgr.clone();
         let sentinel = sentinel();
-        let _: () = c.lset(name, index, &sentinel).await?;
-        let _: i64 = c.lrem(name, 1, &sentinel).await?;
+        let _: () = c.lset(decode_key(name), index, &sentinel).await?;
+        let _: i64 = c.lrem(decode_key(name), 1, &sentinel).await?;
         Ok(())
     }
 
     pub async fn set_add(&self, name: &str, member: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.sadd(name, member).await?;
+        let _: i64 = c.sadd(decode_key(name), member).await?;
         Ok(())
     }
 
     pub async fn set_remove(&self, name: &str, member: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.srem(name, member).await?;
+        let _: i64 = c.srem(decode_key(name), member).await?;
         Ok(())
     }
 
     pub async fn zset_add(&self, name: &str, member: &str, score: f64) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.zadd(name, member, score).await?;
+        let _: i64 = c.zadd(decode_key(name), member, score).await?;
         Ok(())
     }
 
     pub async fn zset_remove(&self, name: &str, member: &str) -> Result<()> {
         let mut c = self.mgr.clone();
-        let _: i64 = c.zrem(name, member).await?;
+        let _: i64 = c.zrem(decode_key(name), member).await?;
         Ok(())
     }
 
     pub async fn stream_add(&self, name: &str, field: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         let _: String = redis::cmd("XADD")
-            .arg(name)
+            .arg(decode_key(name))
             .arg("*")
             .arg(field)
             .arg(value)
@@ -1186,7 +1446,7 @@ impl Client {
     pub async fn stream_delete(&self, name: &str, id: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         let _: i64 = redis::cmd("XDEL")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(id)
             .query_async(&mut c)
             .await?;
@@ -1196,7 +1456,7 @@ impl Client {
     pub async fn json_set(&self, name: &str, path: &str, value: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("JSON.SET")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(path)
             .arg(value)
             .query_async::<()>(&mut c)
@@ -1212,7 +1472,7 @@ impl Client {
             timestamp.trim()
         };
         redis::cmd("TS.ADD")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(ts)
             .arg(value.trim())
             .query_async::<i64>(&mut c)
@@ -1224,7 +1484,7 @@ impl Client {
         let mut c = self.mgr.clone();
         // TS.DEL takes a range; one sample is the range [ts, ts].
         redis::cmd("TS.DEL")
-            .arg(name)
+            .arg(decode_key(name))
             .arg(timestamp)
             .arg(timestamp)
             .query_async::<i64>(&mut c)
@@ -1233,6 +1493,45 @@ impl Client {
     }
 
     // ---- diagnostics ------------------------------------------------------
+
+    async fn topology_rows(&self) -> Vec<(String, String)> {
+        let mut rows = vec![("deployment".into(), self.conn.deployment.name().into())];
+        if let Err(e) = self.mgr.refresh().await {
+            rows.push(("refresh_error".into(), e.to_string()));
+        }
+        if let Some(warning) = self.mgr.warning().await {
+            rows.push(("coverage_warning".into(), warning));
+        }
+        for (i, node) in self.mgr.nodes().await.iter().enumerate() {
+            let slots = node
+                .slots
+                .iter()
+                .map(|(a, b)| format!("{a}-{b}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let status = match self
+                .mgr
+                .direct(&(node.host.clone(), node.port), &redis::cmd("PING"))
+                .await
+            {
+                Ok(_) => "reachable".to_string(),
+                Err(e) => format!("unavailable: {e}"),
+            };
+            rows.push((
+                format!("node_{i}"),
+                format!(
+                    "{} {}:{} {} slots=[{}] {}",
+                    node.id,
+                    node.host,
+                    node.port,
+                    if node.primary { "primary" } else { "replica" },
+                    slots,
+                    status
+                ),
+            ));
+        }
+        rows
+    }
 
     /// Slow log, client list, running config, latency events and cluster state.
     /// Every part is optional: a managed provider that blocks `CONFIG` or
@@ -1272,7 +1571,7 @@ impl Client {
             })
             .unwrap_or_default();
         let latency = self.latency_rows(&mut c).await;
-        let cluster = redis::cmd("CLUSTER")
+        let mut cluster: Vec<(String, String)> = redis::cmd("CLUSTER")
             .arg("INFO")
             .query_async::<String>(&mut c)
             .await
@@ -1283,6 +1582,9 @@ impl Client {
                     .collect()
             })
             .unwrap_or_default();
+        if self.conn.deployment != Deployment::Standalone {
+            cluster.extend(self.topology_rows().await);
+        }
         let modules = redis::cmd("MODULE")
             .arg("LIST")
             .query_async::<redis::Value>(&mut c)
@@ -1312,7 +1614,7 @@ impl Client {
 
     /// `LATENCY LATEST` plus a fresh ping sample, so the tab says something
     /// useful even on a server with latency monitoring switched off.
-    async fn latency_rows(&self, c: &mut MultiplexedConnection) -> Vec<(String, String)> {
+    async fn latency_rows(&self, c: &mut Transport) -> Vec<(String, String)> {
         let mut rows = Vec::new();
         let mut best = f64::MAX;
         let mut worst: f64 = 0.0;
@@ -1402,7 +1704,7 @@ impl Client {
         for chunk in names.chunks(256) {
             let mut pipe = redis::pipe();
             for name in chunk {
-                pipe.cmd("UNLINK").arg(name);
+                pipe.cmd("UNLINK").arg(decode_key(name));
             }
             let counts: Vec<i64> = pipe.query_async(&mut c).await?;
             removed += counts.iter().map(|n| (*n).max(0) as u64).sum::<u64>();
@@ -1418,8 +1720,8 @@ impl Client {
             let mut pipe = redis::pipe();
             for name in chunk {
                 match seconds {
-                    Some(s) if s >= 0 => pipe.cmd("EXPIRE").arg(name).arg(s),
-                    _ => pipe.cmd("PERSIST").arg(name),
+                    Some(s) if s >= 0 => pipe.cmd("EXPIRE").arg(decode_key(name)).arg(s),
+                    _ => pipe.cmd("PERSIST").arg(decode_key(name)),
                 };
             }
             let counts: Vec<i64> = pipe.query_async(&mut c).await?;
@@ -1439,21 +1741,29 @@ impl Client {
         replace: bool,
     ) -> Result<()> {
         let mut c = self.mgr.clone();
-        let payload: Option<Vec<u8>> = redis::cmd("DUMP").arg(source).query_async(&mut c).await?;
+        let payload: Option<Vec<u8>> = redis::cmd("DUMP")
+            .arg(decode_key(source))
+            .query_async(&mut c)
+            .await?;
         let Some(payload) = payload else {
             anyhow::bail!("'{source}' no longer exists");
         };
         // A negative TTL means "no expiry", which RESTORE spells as 0.
-        let ttl: i64 = redis::cmd("PTTL").arg(source).query_async(&mut c).await?;
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(decode_key(source))
+            .query_async(&mut c)
+            .await?;
         let mut t = target.mgr.clone();
         let mut cmd = redis::cmd("RESTORE");
-        cmd.arg(target_name).arg(ttl.max(0)).arg(payload);
+        cmd.arg(decode_key(target_name))
+            .arg(ttl.max(0))
+            .arg(payload);
         if replace {
             cmd.arg("REPLACE");
         }
         cmd.query_async::<()>(&mut t)
             .await
-            .with_context(|| format!("cannot write '{target_name}' on the target server"))?;
+            .map_err(|e| anyhow!("cannot write '{target_name}' on the target server: {e}"))?;
         Ok(())
     }
 
@@ -1497,9 +1807,9 @@ impl Client {
         for chunk in names.chunks(128) {
             let mut pipe = redis::pipe();
             for name in chunk {
-                pipe.cmd("DUMP").arg(name);
-                pipe.cmd("PTTL").arg(name);
-                pipe.cmd("TYPE").arg(name);
+                pipe.cmd("DUMP").arg(decode_key(name));
+                pipe.cmd("PTTL").arg(decode_key(name));
+                pipe.cmd("TYPE").arg(decode_key(name));
             }
             let replies: Vec<redis::Value> = pipe.query_async(&mut c).await?;
             for (name, triple) in chunk.iter().zip(replies.chunks(3)) {
@@ -1532,13 +1842,15 @@ impl Client {
             let payload = hex_decode(&entry.dump)
                 .with_context(|| format!("'{}' has a corrupt payload", entry.key))?;
             let mut cmd = redis::cmd("RESTORE");
-            cmd.arg(&entry.key).arg(entry.pttl.max(0)).arg(payload);
+            cmd.arg(decode_key(&entry.key))
+                .arg(entry.pttl.max(0))
+                .arg(payload);
             if replace {
                 cmd.arg("REPLACE");
             }
             cmd.query_async::<()>(&mut c)
                 .await
-                .with_context(|| format!("cannot restore '{}'", entry.key))?;
+                .map_err(|e| anyhow!("cannot restore '{}': {e}", entry.key))?;
             written += 1;
         }
         Ok(written)
@@ -1578,7 +1890,7 @@ impl Client {
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(script).arg(keys.len());
         for k in keys {
-            cmd.arg(k);
+            cmd.arg(decode_key(k));
         }
         for a in args {
             cmd.arg(a);
@@ -1594,7 +1906,7 @@ impl Client {
         let mut c = self.mgr.clone();
         let reply: redis::Value = redis::cmd("XINFO")
             .arg("GROUPS")
-            .arg(key)
+            .arg(decode_key(key))
             .query_async(&mut c)
             .await?;
         Ok(as_maps(&reply)
@@ -1614,7 +1926,7 @@ impl Client {
         let mut c = self.mgr.clone();
         let consumers: redis::Value = redis::cmd("XINFO")
             .arg("CONSUMERS")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .query_async(&mut c)
             .await?;
@@ -1629,7 +1941,7 @@ impl Client {
         // `XPENDING key group - + n` lists the entries themselves, which is
         // what makes a stuck consumer visible.
         let raw: Vec<(String, String, i64, i64)> = redis::cmd("XPENDING")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg("-")
             .arg("+")
@@ -1653,7 +1965,7 @@ impl Client {
         let mut c = self.mgr.clone();
         redis::cmd("XGROUP")
             .arg("CREATE")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg(if start.trim().is_empty() { "$" } else { start })
             .arg("MKSTREAM")
@@ -1666,7 +1978,7 @@ impl Client {
         let mut c = self.mgr.clone();
         redis::cmd("XGROUP")
             .arg("DESTROY")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .query_async::<i64>(&mut c)
             .await?;
@@ -1676,7 +1988,7 @@ impl Client {
     pub async fn stream_ack(&self, key: &str, group: &str, id: &str) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("XACK")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg(id)
             .query_async::<i64>(&mut c)
@@ -1695,7 +2007,7 @@ impl Client {
     ) -> Result<()> {
         let mut c = self.mgr.clone();
         redis::cmd("XCLAIM")
-            .arg(key)
+            .arg(decode_key(key))
             .arg(group)
             .arg(consumer)
             .arg(0)
@@ -1712,6 +2024,24 @@ impl Client {
         let Some((head, tail)) = parts.split_first() else {
             return Ok(String::new());
         };
+        anyhow::ensure!(
+            !(matches!(
+                head.to_ascii_uppercase().as_str(),
+                "SELECT"
+                    | "AUTH"
+                    | "HELLO"
+                    | "RESET"
+                    | "MULTI"
+                    | "EXEC"
+                    | "DISCARD"
+                    | "WATCH"
+                    | "UNWATCH"
+            ) || (head.eq_ignore_ascii_case("CLIENT")
+                && tail
+                    .first()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("REPLY")))),
+            "Connection state commands are not supported in the shared console; use the profile or database selector"
+        );
         let mut c = self.mgr.clone();
         let mut cmd = redis::cmd(head);
         for a in tail {
@@ -1827,6 +2157,123 @@ fn parse_client_list(raw: &str) -> Vec<ClientEntry> {
             entry
         })
         .collect()
+}
+
+/// Redis values are byte strings, and plenty of them are not text: session
+/// blobs, protobuf, MessagePack and gzip all live under ordinary looking key
+/// names. Decoding those straight into a `String` fails the whole read, so a
+/// value that is not UTF-8 becomes a hex dump the viewer can still show.
+fn decode_value(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => hex_dump(e.as_bytes()),
+    }
+}
+
+/// Opens every hex dump, so a dump can be recognised again and never written
+/// back to the server as if it were the value it describes.
+pub const BINARY_MARKER: &str = "<binary, ";
+
+/// True when this text is a rendering of bytes rather than the bytes
+/// themselves. Saving one would replace a value with its own description.
+pub fn is_hex_dump(text: &str) -> bool {
+    text.starts_with(BINARY_MARKER) && text.split_once(" bytes>\n").is_some()
+}
+
+/// The first `HEX_DUMP_LIMIT` bytes as offset / hex / ASCII columns.
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let shown = bytes.len().min(HEX_DUMP_LIMIT);
+    let mut out = format!("{BINARY_MARKER}{} bytes>\n", bytes.len());
+    for (i, chunk) in bytes[..shown].chunks(16).enumerate() {
+        let hex = chunk.iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x} ");
+            acc
+        });
+        let ascii: String = chunk
+            .iter()
+            .map(|b| {
+                if b.is_ascii_graphic() || *b == b' ' {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "{:08x}  {hex:<48} |{ascii}|", i * 16);
+    }
+    if bytes.len() > shown {
+        let _ = writeln!(out, "… {} more bytes", bytes.len() - shown);
+    }
+    out
+}
+
+/// A key name as the rest of the program carries it: text, with every byte
+/// that is not valid UTF-8 written `\xNN` and a literal backslash doubled.
+/// Redis key names are arbitrary bytes, so decoding one straight into a
+/// `String` fails the whole scan when a key holds a binary id.
+pub fn encode_key(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                push_escaped(&mut out, text);
+                return out;
+            }
+            Err(e) => {
+                let (good, bad) = rest.split_at(e.valid_up_to());
+                push_escaped(&mut out, std::str::from_utf8(good).unwrap_or_default());
+                // Without a length the rest of the input is one bad tail.
+                let skip = e.error_len().unwrap_or(bad.len());
+                for b in &bad[..skip] {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+                rest = &bad[skip..];
+            }
+        }
+    }
+}
+
+fn push_escaped(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch == '\\' {
+            out.push_str("\\\\");
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+/// The inverse of [`encode_key`]: back to the exact bytes the server stored.
+/// An escape it does not recognise stays literal, so a name a person typed by
+/// hand still addresses the key they meant.
+pub fn decode_key(name: &str) -> Vec<u8> {
+    let b = name.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            if b[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+            if b[i + 1] == b'x'
+                && i + 3 < b.len()
+                && let Ok(pair) = std::str::from_utf8(&b[i + 2..i + 4])
+                && let Ok(byte) = u8::from_str_radix(pair, 16)
+            {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1999,6 +2446,53 @@ pub fn is_destructive(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_names_round_trip_through_their_escaped_form() {
+        for raw in [
+            b"bff:session:44ec".to_vec(),
+            "ключ:1".as_bytes().to_vec(),
+            vec![b'k', 0xff, 0xfe, b':', 0x00],
+            b"path\\to\\key".to_vec(),
+        ] {
+            assert_eq!(decode_key(&encode_key(&raw)), raw, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn binary_key_names_escape_only_the_bad_bytes() {
+        assert_eq!(encode_key(b"plain:key"), "plain:key");
+        assert_eq!(encode_key(&[b'a', 0xc3, 0x28, b'b']), "a\\xc3(b");
+        assert_eq!(encode_key(b"a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn an_unknown_escape_stays_literal() {
+        // Someone typing a Windows path into the key box means the backslash.
+        assert_eq!(decode_key("C:\\temp"), b"C:\\temp");
+        assert_eq!(decode_key("tail\\x"), b"tail\\x");
+    }
+
+    #[test]
+    fn text_values_decode_unchanged() {
+        assert_eq!(decode_value(b"hello".to_vec()), "hello");
+        assert_eq!(decode_value("héllo".as_bytes().to_vec()), "héllo");
+    }
+
+    #[test]
+    fn binary_values_become_a_hex_dump() {
+        // A session blob: the byte at index 1 is what the UTF-8 decoder chokes on.
+        let dump = decode_value(vec![0x1f, 0x8b, 0x08, 0x00, b'i', b'd']);
+        assert!(dump.starts_with("<binary, 6 bytes>"), "{dump}");
+        assert!(dump.contains("1f 8b 08 00 69 64"), "{dump}");
+        assert!(dump.contains("|....id|"), "{dump}");
+    }
+
+    #[test]
+    fn hex_dump_stops_at_the_limit() {
+        let dump = decode_value(vec![0xff; HEX_DUMP_LIMIT + 10]);
+        assert!(dump.contains("… 10 more bytes"), "{dump}");
+    }
 
     const SAMPLE: &str = "# Server\r\nredis_version:7.2.4\r\nredis_mode:standalone\r\n\r\n# Memory\r\nused_memory_human:1.20M\r\n\r\n# Keyspace\r\ndb0:keys=12,expires=3,avg_ttl=0\r\ndb1:keys=5,expires=0,avg_ttl=0\r\n";
 

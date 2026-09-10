@@ -44,19 +44,19 @@ async fn main() -> anyhow::Result<()> {
     seed(&url).await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
-    let mut app = App::new(demo_store(), tx);
+    let mut app = App::new(demo_store(&url), tx);
 
     // 1. The server list, before anything is connected.
     shot(&mut app, "connections")?;
 
-    app.connect(demo_connection());
+    app.connect(demo_connection(&url));
     pump(&mut app, &mut rx, |a| a.client.is_some()).await;
     app.reload_keys();
     pump(&mut app, &mut rx, |a| !a.rows.is_empty()).await;
 
-    // 2. The browser, on a JSON string value. Walking the tree fires a read
-    //    per row, so the replies for the rows passed on the way are drained
-    //    before the key is selected again and its own value awaited.
+    // 2. The browser, on a JSON string value. Walking the tree only schedules
+    //    a read, so anything already in flight is drained before the key is
+    //    selected again and its own value awaited.
     collapse_all(&mut app);
     open_path(&mut app, &["user", "1042"]);
     drain(&mut app, &mut rx);
@@ -104,11 +104,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn demo_store() -> Store {
+fn demo_store(url: &str) -> Store {
     Store {
         theme: Theme::TokyoNight,
         connections: vec![
-            demo_connection(),
+            demo_connection(url),
             Connection {
                 name: "staging".into(),
                 host: "cache-01.staging.example".into(),
@@ -150,13 +150,12 @@ fn demo_store() -> Store {
     }
 }
 
-fn demo_connection() -> Connection {
+/// The same server `seed` filled. `REDISCOPE_DEMO_URL` has to steer both, or
+/// the pictures come out of an empty database.
+fn demo_connection(url: &str) -> Connection {
     Connection {
         name: "local-dev".into(),
-        host: "127.0.0.1".into(),
-        port: 6379,
-        db: DEMO_DB,
-        ..Default::default()
+        ..Connection::from_url(url).expect("REDISCOPE_DEMO_URL is not a redis url")
     }
 }
 
@@ -430,7 +429,8 @@ fn drain(app: &mut App, rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>) {
 }
 
 /// Drive the message loop until `done`, or until the server has clearly
-/// answered everything it is going to.
+/// answered everything it is going to. Mirrors the real event loop, including
+/// the timer that reads the value once the cursor has stopped moving.
 async fn pump(
     app: &mut App,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
@@ -438,9 +438,19 @@ async fn pump(
 ) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while !done(app) {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(msg)) => app.on_msg(msg),
-            _ => break,
+        let value_due = app.value_deadline().map(tokio::time::Instant::from_std);
+        tokio::select! {
+            biased;
+            () = async move {
+                match value_due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => app.on_value_deadline(),
+            msg = tokio::time::timeout_at(deadline, rx.recv()) => match msg {
+                Ok(Some(msg)) => app.on_msg(msg),
+                _ => break,
+            },
         }
     }
 }
