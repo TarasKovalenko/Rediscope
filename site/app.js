@@ -36,6 +36,8 @@ const captions = {
     "A live feed with a rate sparkline over the last minute, a per-channel breakdown, and the selected message pretty-printed.",
   editor:
     "Editing a value. JSON is checked before it is saved, so a typo is refused rather than stored.",
+  codecs:
+    "A gzipped JSON document, recognised by its header and shown decoded. Edits are compressed again on save, and v picks another view.",
 };
 
 if (panel) {

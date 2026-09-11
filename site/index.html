@@ -31,9 +31,10 @@
   <p class="eyebrow">v__VERSION__ · MIT · macOS, Linux, Windows</p>
   <h1>A Redis client that lives in your terminal.</h1>
   <p class="lede">
-    Browse the keyspace as a folder tree, read and edit every value type, watch
-    TTLs count down, find out which prefix is eating your RAM, and drop into a
-    raw command console. One static binary. No Electron, no Python runtime.
+    Browse the keyspace as a folder tree, read and edit every value type
+    (gzipped and MessagePack ones too), watch TTLs count down, find out which
+    prefix is eating your RAM, and drop into a raw command console. One static
+    binary. No Electron, no Python runtime.
   </p>
 
   <div class="install-quick">
@@ -62,6 +63,7 @@
     <button role="tab" aria-selected="false" data-shot="memory">Memory report</button>
     <button role="tab" aria-selected="false" data-shot="pubsub">Pub/Sub feed</button>
     <button role="tab" aria-selected="false" data-shot="editor">Value editor</button>
+    <button role="tab" aria-selected="false" data-shot="codecs">Compressed values</button>
   </div>
 
   <figure class="shot" data-shot-panel>
@@ -75,6 +77,7 @@
     <figure class="shot"><img src="screenshots/memory.svg" alt="The namespace memory report." loading="lazy"><figcaption>Which prefix holds the RAM.</figcaption></figure>
     <figure class="shot"><img src="screenshots/pubsub.svg" alt="The pub/sub feed." loading="lazy"><figcaption>The pub/sub feed.</figcaption></figure>
     <figure class="shot"><img src="screenshots/editor.svg" alt="The JSON value editor." loading="lazy"><figcaption>Editing a JSON value.</figcaption></figure>
+    <figure class="shot"><img src="screenshots/codecs.svg" alt="A gzipped JSON value, decoded and formatted." loading="lazy"><figcaption>A gzipped value, decoded on sight.</figcaption></figure>
   </noscript>
 </section>
 
@@ -98,9 +101,20 @@
       <ul>
         <li>Every type: strings, hashes, lists, sets, sorted sets, streams, JSON.</li>
         <li>JSON is checked before it is saved, and reformatted on request.</li>
-        <li>Values that are not text show as a hex dump instead of failing the read, and binary key names scan as escaped bytes.</li>
+        <li>Binary that no codec recognises shows as a hex dump instead of failing the read, and binary key names scan as escaped bytes.</li>
         <li>Rename, re-TTL, copy and delete, one key or a marked batch.</li>
         <li>Export and import keys with their TTLs, as <code>DUMP</code> payloads.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Decode</h3>
+      <ul>
+        <li>gzip, zlib, zstd and LZ4 streams and MessagePack are recognised by their header and shown decoded, JSON formatted. Text is never second-guessed.</li>
+        <li><kbd>v</kbd> picks the view for a key: as stored, brotli, raw deflate, base64, hex, or a codec of your own.</li>
+        <li>Edits are encoded back the same way, with the TTL kept and the conflict check still comparing the stored bytes.</li>
+        <li>Plug in your own decoder, like <code>protoc</code> or a script: a program that reads the value on stdin.</li>
+        <li>Anything that can't make the round trip exactly is shown read-only rather than saved wrong, and a compression bomb stops at 32 MiB.</li>
       </ul>
     </article>
 
@@ -190,6 +204,7 @@
         <tr><td><kbd>M</kbd></td><td>Namespace memory report</td></tr>
         <tr><td><kbd>P</kbd> <kbd>N</kbd></td><td>Pub/sub feed · keyspace events</td></tr>
         <tr><td><kbd>S</kbd></td><td>Consumer groups of a stream</td></tr>
+        <tr><td><kbd>v</kbd></td><td>View a value as gzip, MessagePack, hex…</td></tr>
         <tr><td><kbd>:</kbd></td><td>Raw command console</td></tr>
         <tr><td><kbd>?</kbd></td><td>Every other key</td></tr>
       </tbody>
