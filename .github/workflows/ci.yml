@@ -101,3 +101,74 @@ jobs:
         env:
           REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
         run: cargo test --all-targets
+
+  # The suites that talk to a live server, run against each server Rediscope
+  # claims to work with. REDISCOPE_TEST_FLAVOR lets a test skip the one part a
+  # server does not do, and the info test checks the flavor matches the server.
+  compat:
+    name: compat (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: redis
+            image: redis:8
+            args: --save '' --appendonly no
+          # 8.0 has vector sets but no VRANGE: the sampled listing path.
+          - flavor: redis
+            image: redis:8.0
+            args: --save '' --appendonly no
+          - flavor: valkey
+            image: valkey/valkey:8
+            args: --save '' --appendonly no
+          - flavor: valkey
+            image: valkey/valkey:9
+            args: --save '' --appendonly no
+          - flavor: keydb
+            image: eqalpha/keydb:latest
+            args: keydb-server --save '' --appendonly no
+          - flavor: dragonfly
+            image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+            args: --proactor_threads=2
+            docker_flags: --ulimit memlock=-1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # Wait for PING from the runner itself: the images ship different CLIs
+      # (redis-cli, valkey-cli, keydb-cli), so bash's /dev/tcp is the common one.
+      - name: Start ${{ matrix.image }}
+        run: |
+          docker run -d --name server -p 7799:6379 ${{ matrix.docker_flags }} \
+            ${{ matrix.image }} ${{ matrix.args }}
+          for _ in $(seq 1 60); do
+            if { exec 3<>/dev/tcp/127.0.0.1/7799; } 2>/dev/null; then
+              printf 'PING\r\n' >&3
+              reply=""
+              read -r -t 2 reply <&3 || true
+              exec 3<&-
+              if [ "${reply%$'\r'}" = "+PONG" ]; then
+                echo "server is up"
+                exit 0
+              fi
+            fi
+            sleep 1
+          done
+          docker logs server
+          exit 1
+
+      - name: cargo test
+        env:
+          REDISCOPE_TEST_PORT: 7799
+          REDISCOPE_TEST_FLAVOR: ${{ matrix.flavor }}
+          REDISCOPE_HOME: ${{ runner.temp }}/rediscope-config
+        run: >-
+          cargo test --no-fail-fast
+          --test integration --test codecs --test monitor --test production --test windows
+          --test modern_types
+
+      - name: Server log
+        if: always()
+        run: docker logs server 2>&1 | tail -n 50

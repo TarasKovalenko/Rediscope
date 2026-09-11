@@ -6,6 +6,7 @@
 
 mod common;
 
+use common::Flavor;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rediscope::app::{App, Modal, Msg};
 use rediscope::config::Connection;
@@ -200,6 +201,18 @@ async fn info_reports_sections_and_key_counts() {
         .find(|(db, ..)| db == "db14")
         .expect("db14 in the keyspace section");
     assert!(keys >= 1);
+
+    // The compat job names the server it started. Make sure it is that one,
+    // so a mixed-up matrix entry cannot pass on the wrong server.
+    let (valkey, dragonfly) = (
+        info.field("valkey_version").is_some(),
+        info.field("dragonfly_version").is_some(),
+    );
+    match common::flavor() {
+        Flavor::Valkey => assert!(valkey, "REDISCOPE_TEST_FLAVOR=valkey"),
+        Flavor::Dragonfly => assert!(dragonfly, "REDISCOPE_TEST_FLAVOR=dragonfly"),
+        Flavor::Redis | Flavor::KeyDb => assert!(!valkey && !dragonfly),
+    }
 }
 
 #[tokio::test]
@@ -276,7 +289,14 @@ async fn the_memory_scan_finds_the_prefix_holding_the_most() {
     assert_eq!(rows[0].prefix, "big:");
     assert_eq!(rows[0].keys, 50);
     assert!(rows[0].share > 90.0, "{:?}", rows[0]);
-    assert!(rows[0].est_bytes > 50 * 400, "{:?}", rows[0]);
+    // Redis-style servers report the payload plus overhead. Dragonfly packs
+    // ASCII strings into 7 bits a character, so a 400-byte value can report
+    // less than 400 bytes (it says 384).
+    let floor = match common::flavor() {
+        Flavor::Dragonfly => 50 * 400 * 7 / 8,
+        _ => 50 * 400,
+    };
+    assert!(rows[0].est_bytes > floor, "{:?}", rows[0]);
 }
 
 #[tokio::test]
@@ -501,6 +521,8 @@ async fn consumer_groups_are_listed_acked_and_destroyed() {
 async fn diagnostics_read_the_slow_log_clients_and_config() {
     let c = client!(6);
     let diag = c.diagnostics().await.unwrap();
+    // KeyDB answers one value (tls-allowlist) with an empty array, which must
+    // not cost the rest of the config.
     assert!(
         diag.config.iter().any(|(k, _)| k == "maxmemory"),
         "CONFIG GET * reaches the running config"

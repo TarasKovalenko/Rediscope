@@ -58,6 +58,8 @@ pub enum KeyType {
     Json,
     /// RedisTimeSeries key (`TSDB-TYPE`).
     TimeSeries,
+    /// Redis 8 vector set (`VADD`, `VSIM`).
+    VectorSet,
     Other,
 }
 
@@ -72,6 +74,7 @@ impl KeyType {
             "stream" => Self::Stream,
             "ReJSON-RL" => Self::Json,
             "TSDB-TYPE" => Self::TimeSeries,
+            "vectorset" => Self::VectorSet,
             _ => Self::Other,
         }
     }
@@ -86,6 +89,7 @@ impl KeyType {
             Self::Stream => "stream",
             Self::Json => "json",
             Self::TimeSeries => "timeseries",
+            Self::VectorSet => "vectorset",
             Self::Other => "unknown",
         }
     }
@@ -101,6 +105,7 @@ impl KeyType {
             Self::Stream => "X",
             Self::Json => "J",
             Self::TimeSeries => "T",
+            Self::VectorSet => "V",
             Self::Other => "?",
         }
     }
@@ -123,6 +128,9 @@ pub struct Row {
     /// Set when the row's element value is shown decoded by a codec: how it
     /// was decoded and the bytes it came from. The id is never decoded.
     pub decoding: Option<Decoding>,
+    /// Seconds until a hash field expires (Redis 7.4+ `HEXPIRE`). `None` for
+    /// anything without its own expiry.
+    pub ttl: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +160,9 @@ pub struct Client {
     /// The `ssh -L` process this connection rides on, dropped (and killed)
     /// with the last clone of the client.
     _tunnel: Option<std::sync::Arc<Tunnel>>,
+    /// Set once the server has said it has no `HTTL` (before Redis 7.4 and
+    /// Valkey 9), so hash reads stop asking for field TTLs.
+    no_field_ttl: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A local port forwarded to the Redis server by an `ssh -L` child process.
@@ -551,6 +562,10 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "HSCAN",
     "HEXISTS",
     "HRANDFIELD",
+    "HTTL",
+    "HPTTL",
+    "HEXPIRETIME",
+    "HPEXPIRETIME",
     "LRANGE",
     "LLEN",
     "LINDEX",
@@ -578,6 +593,16 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "XRANGE",
     "XREVRANGE",
     "XLEN",
+    "VCARD",
+    "VDIM",
+    "VINFO",
+    "VRANGE",
+    "VRANDMEMBER",
+    "VEMB",
+    "VGETATTR",
+    "VSIM",
+    "VLINKS",
+    "VISMEMBER",
     "XINFO",
     "XPENDING",
     "BITCOUNT",
@@ -667,6 +692,7 @@ impl Client {
             mgr,
             raw: client,
             _tunnel: tunnel,
+            no_field_ttl: Default::default(),
         })
     }
 
@@ -1131,7 +1157,7 @@ impl Client {
     /// Values are shown exactly as stored: text, or a hex dump of bytes that
     /// are not text. [`Client::read_value_as`] reads through a codec instead.
     pub async fn read_value(&self, name: &str, kind: KeyType) -> Result<KeyValue> {
-        let (raw, _) = self.read_raw(name, kind, &Window::default()).await?;
+        let (raw, _, _) = self.read_raw(name, kind, &Window::default()).await?;
         Ok(materialize(raw, &View::Plain).0)
     }
 
@@ -1161,7 +1187,7 @@ impl Client {
         view: &View,
         window: &Window,
     ) -> Result<Read> {
-        let (raw, coverage) = self.read_raw(name, kind, window).await?;
+        let (raw, coverage, detail) = self.read_raw(name, kind, window).await?;
         let (value, notice) = if *view == View::Plain {
             materialize(raw, view)
         } else {
@@ -1176,6 +1202,7 @@ impl Client {
             value,
             notice,
             coverage,
+            detail,
         })
     }
 
@@ -1184,9 +1211,12 @@ impl Client {
         name: &str,
         kind: KeyType,
         window: &Window,
-    ) -> Result<(RawValue, Coverage)> {
+    ) -> Result<(RawValue, Coverage, Option<String>)> {
         let mut c = self.mgr.clone();
         let lim = window.limit.clamp(1, VALUE_LIMIT_MAX);
+        // A line about the value itself for the pane header, where the type
+        // has one worth giving (a vector set's dimension and quantization).
+        let mut detail = None;
         let filter = window.filter.as_deref().filter(|f| !f.is_empty());
         // How many elements a filtered read may look at, and how many bytes
         // a locally matched walk may pull. Loading more widens both in step
@@ -1199,7 +1229,7 @@ impl Client {
             complete: true,
             examined: total,
         };
-        Ok(match kind {
+        let (raw, coverage) = match kind {
             KeyType::String => {
                 let v: Option<Vec<u8>> = c.get(decode_key(name)).await?;
                 (RawValue::Str(v.unwrap_or_default()), whole(1))
@@ -1212,14 +1242,21 @@ impl Client {
                 let coverage = scan.coverage(scan.items.len() / 2, lim, total, filter.is_some());
                 let mut items = scan.items.into_iter();
                 let mut rows = Vec::new();
+                let mut fields = Vec::new();
                 while let (Some(f), Some(v)) = (items.next(), items.next()) {
-                    let f = decode_value(f);
+                    let text = decode_value(f.clone());
+                    fields.push(f);
                     rows.push(RawRow {
-                        id: f.clone(),
-                        cells: vec![RawCell::Text(f), RawCell::Bytes(v)],
+                        id: text.clone(),
+                        cells: vec![RawCell::Text(text), RawCell::Bytes(v)],
+                        ttl: None,
                     });
                 }
                 rows.truncate(lim);
+                fields.truncate(lim);
+                for (row, ttl) in rows.iter_mut().zip(self.field_ttls(name, &fields).await) {
+                    row.ttl = ttl;
+                }
                 rows.sort_by(|a, b| a.id.cmp(&b.id));
                 (
                     RawValue::Rows {
@@ -1241,6 +1278,7 @@ impl Client {
                         .map(|(i, v)| RawRow {
                             id: i.to_string(),
                             cells: vec![RawCell::Text(i.to_string()), RawCell::Bytes(v)],
+                            ttl: None,
                         })
                         .collect();
                     let coverage = Coverage {
@@ -1255,6 +1293,7 @@ impl Client {
                             total,
                         },
                         coverage,
+                        None,
                     ));
                 };
                 // Lists have no MATCH: walk them in chunks and keep the
@@ -1281,6 +1320,7 @@ impl Client {
                             rows.push(RawRow {
                                 id: index.clone(),
                                 cells: vec![RawCell::Text(index), RawCell::Bytes(v.clone())],
+                                ttl: None,
                             });
                         }
                     }
@@ -1312,6 +1352,7 @@ impl Client {
                     .map(|m| RawRow {
                         id: decode_value(m.clone()),
                         cells: vec![RawCell::Bytes(m.clone())],
+                        ttl: None,
                     })
                     .collect();
                 let coverage = scan.coverage(rows.len(), lim, total, filter.is_some());
@@ -1369,6 +1410,7 @@ impl Client {
                     .map(|(m, s)| RawRow {
                         id: decode_value(m.clone()),
                         cells: vec![RawCell::Bytes(m), RawCell::Text(format_score(s))],
+                        ttl: None,
                     })
                     .collect();
                 (
@@ -1385,6 +1427,7 @@ impl Client {
                 let entry = |(id, flat): (String, Vec<Vec<u8>>)| RawRow {
                     id: id.clone(),
                     cells: vec![RawCell::Text(id), RawCell::Fields(flat)],
+                    ttl: None,
                 };
                 let Some(pattern) = filter else {
                     let raw: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XREVRANGE")
@@ -1408,6 +1451,7 @@ impl Client {
                             total,
                         },
                         coverage,
+                        None,
                     ));
                 };
                 // Newest first, a chunk at a time, keeping entries where any
@@ -1503,6 +1547,7 @@ impl Client {
                             RawCell::Text(ts.to_string()),
                             RawCell::Text(format_score(v)),
                         ],
+                        ttl: None,
                     })
                     .collect();
                 (
@@ -1514,6 +1559,89 @@ impl Client {
                     coverage,
                 )
             }
+            KeyType::VectorSet => {
+                let total: u64 = redis::cmd("VCARD")
+                    .arg(decode_key(name))
+                    .query_async(&mut c)
+                    .await?;
+                let mut summary = self.vset_summary(name).await;
+                if let Some(query) = &window.similar {
+                    let hits = self.vset_similar(name, query).await?;
+                    let attrs = self
+                        .vset_attributes(name, hits.iter().map(|(m, _)| m.as_slice()))
+                        .await?;
+                    let examined = hits.len() as u64;
+                    let rows = hits
+                        .into_iter()
+                        .zip(attrs)
+                        .map(|((member, score), attr)| {
+                            let member = decode_value(member);
+                            RawRow {
+                                id: member.clone(),
+                                cells: vec![
+                                    RawCell::Text(member),
+                                    // Cosine similarity through quantized
+                                    // vectors: digits past the fourth are noise.
+                                    RawCell::Text(format!("{score:.4}")),
+                                    RawCell::Text(attr),
+                                ],
+                                ttl: None,
+                            }
+                        })
+                        .collect();
+                    detail = summary;
+                    (
+                        RawValue::Rows {
+                            headers: vec!["element", "similarity", "attributes"],
+                            rows,
+                            total,
+                        },
+                        Coverage {
+                            filtered: true,
+                            complete: true,
+                            examined,
+                        },
+                    )
+                } else {
+                    let (members, sampled) = self.vset_members(name, lim).await?;
+                    let attrs = self
+                        .vset_attributes(name, members.iter().map(Vec::as_slice))
+                        .await?;
+                    if sampled && (members.len() as u64) < total {
+                        let note = "a random sample: listing in order needs Redis 8.2+";
+                        summary = Some(match summary {
+                            Some(s) => format!("{s} · {note}"),
+                            None => note.to_string(),
+                        });
+                    }
+                    detail = summary;
+                    let examined = members.len() as u64;
+                    let rows = members
+                        .into_iter()
+                        .zip(attrs)
+                        .map(|(member, attr)| {
+                            let member = decode_value(member);
+                            RawRow {
+                                id: member.clone(),
+                                cells: vec![RawCell::Text(member), RawCell::Text(attr)],
+                                ttl: None,
+                            }
+                        })
+                        .collect();
+                    (
+                        RawValue::Rows {
+                            headers: vec!["element", "attributes"],
+                            rows,
+                            total,
+                        },
+                        Coverage {
+                            filtered: false,
+                            complete: examined >= total,
+                            examined,
+                        },
+                    )
+                }
+            }
             KeyType::Other => (
                 RawValue::Unsupported(
                     "This key's type has no viewer yet. Use the command console (:) to inspect it."
@@ -1521,7 +1649,229 @@ impl Client {
                 ),
                 whole(0),
             ),
-        })
+        };
+        Ok((raw, coverage, detail))
+    }
+
+    /// Up to `limit` elements of a vector set, in order where the server can
+    /// list them (`VRANGE`, Redis 8.2+). Older servers only hand out a random
+    /// sample (`VRANDMEMBER`), which is sorted here and flagged as such.
+    async fn vset_members(&self, name: &str, limit: usize) -> Result<(Vec<Vec<u8>>, bool)> {
+        let mut c = self.mgr.clone();
+        let ranged: redis::RedisResult<Vec<Vec<u8>>> = redis::cmd("VRANGE")
+            .arg(decode_key(name))
+            .arg("-")
+            .arg("+")
+            .arg(limit)
+            .query_async(&mut c)
+            .await;
+        match ranged {
+            Ok(members) => Ok((members, false)),
+            Err(e) if is_unknown_command(&e) => {
+                let mut members: Vec<Vec<u8>> = redis::cmd("VRANDMEMBER")
+                    .arg(decode_key(name))
+                    .arg(limit)
+                    .query_async(&mut c)
+                    .await?;
+                members.sort();
+                Ok((members, true))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The JSON attributes of each of `members`, empty where one has none.
+    async fn vset_attributes<'a>(
+        &self,
+        name: &str,
+        members: impl Iterator<Item = &'a [u8]>,
+    ) -> Result<Vec<String>> {
+        let mut c = self.mgr.clone();
+        let members: Vec<&[u8]> = members.collect();
+        let mut out = Vec::with_capacity(members.len());
+        for chunk in members.chunks(500) {
+            let mut pipe = redis::pipe();
+            for member in chunk {
+                pipe.cmd("VGETATTR").arg(decode_key(name)).arg(*member);
+            }
+            let attrs: Vec<Option<Vec<u8>>> = pipe.query_async(&mut c).await?;
+            out.extend(
+                attrs
+                    .into_iter()
+                    .map(|a| a.map(decode_value).unwrap_or_default()),
+            );
+        }
+        Ok(out)
+    }
+
+    /// `dim 768 · int8 · M 16` from `VINFO`, or nothing if the server will
+    /// not say.
+    async fn vset_summary(&self, name: &str) -> Option<String> {
+        let mut c = self.mgr.clone();
+        let reply: redis::Value = redis::cmd("VINFO")
+            .arg(decode_key(name))
+            .query_async(&mut c)
+            .await
+            .ok()?;
+        let info = flat_map(&reply);
+        let mut parts = Vec::new();
+        if let Some(dim) = info.get("vector-dim") {
+            parts.push(format!("dim {dim}"));
+        }
+        if let Some(quant) = info.get("quant-type") {
+            parts.push(quant.clone());
+        }
+        if let Some(m) = info.get("hnsw-m") {
+            parts.push(format!("M {m}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// The elements most similar to `query`, best first, with their scores.
+    async fn vset_similar(&self, name: &str, query: &Similar) -> Result<Vec<(Vec<u8>, f64)>> {
+        let mut c = self.mgr.clone();
+        let mut cmd = redis::cmd("VSIM");
+        cmd.arg(decode_key(name));
+        match &query.to {
+            SimilarTo::Element(element) => {
+                cmd.arg("ELE").arg(element);
+            }
+            SimilarTo::Vector(values) => {
+                cmd.arg("VALUES").arg(values.len());
+                for v in values {
+                    cmd.arg(*v);
+                }
+            }
+        }
+        cmd.arg("WITHSCORES")
+            .arg("COUNT")
+            .arg(query.count.clamp(1, VALUE_LIMIT_MAX));
+        if let Some(filter) = query.filter.as_deref().filter(|f| !f.trim().is_empty()) {
+            cmd.arg("FILTER").arg(filter);
+        }
+        let reply: redis::Value = cmd.query_async(&mut c).await?;
+        Ok(scored_pairs(&reply))
+    }
+
+    /// Add an element to a vector set, or replace the vector of one already
+    /// in it. Creates the set if it is missing.
+    pub async fn vset_add(
+        &self,
+        name: &str,
+        element: &str,
+        vector: &[f64],
+        attributes: Option<&str>,
+    ) -> Result<()> {
+        let mut c = self.mgr.clone();
+        let mut cmd = redis::cmd("VADD");
+        cmd.arg(decode_key(name)).arg("VALUES").arg(vector.len());
+        for v in vector {
+            cmd.arg(*v);
+        }
+        cmd.arg(element);
+        if let Some(attrs) = attributes.filter(|a| !a.trim().is_empty()) {
+            cmd.arg("SETATTR").arg(attrs);
+        }
+        let _: i64 = cmd.query_async(&mut c).await?;
+        Ok(())
+    }
+
+    pub async fn vset_remove(&self, name: &str, element: &str) -> Result<()> {
+        let mut c = self.mgr.clone();
+        let removed: i64 = redis::cmd("VREM")
+            .arg(decode_key(name))
+            .arg(element)
+            .query_async(&mut c)
+            .await?;
+        anyhow::ensure!(removed == 1, "'{element}' is no longer in '{name}'");
+        Ok(())
+    }
+
+    /// One element in full: its vector (`VEMB`) and attributes, for the
+    /// details view. `None` when the element has gone.
+    pub async fn vset_element(&self, name: &str, element: &str) -> Result<Option<VsetElement>> {
+        let mut c = self.mgr.clone();
+        let vector: Option<Vec<f64>> = redis::cmd("VEMB")
+            .arg(decode_key(name))
+            .arg(element)
+            .query_async(&mut c)
+            .await?;
+        let Some(vector) = vector else {
+            return Ok(None);
+        };
+        let attributes: Option<Vec<u8>> = redis::cmd("VGETATTR")
+            .arg(decode_key(name))
+            .arg(element)
+            .query_async(&mut c)
+            .await?;
+        Ok(Some(VsetElement {
+            vector,
+            attributes: attributes.map(decode_value),
+        }))
+    }
+
+    /// Seconds left on each of `fields` of a hash, `None` where a field has no
+    /// expiry. Empty when the server has no field expiry at all, or refuses
+    /// to say: the TTL column is a bonus, never a reason for a read to fail.
+    async fn field_ttls(&self, name: &str, fields: &[Vec<u8>]) -> Vec<Option<i64>> {
+        use std::sync::atomic::Ordering;
+        if fields.is_empty() || self.no_field_ttl.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let mut c = self.mgr.clone();
+        let mut out = Vec::with_capacity(fields.len());
+        for chunk in fields.chunks(1_000) {
+            let reply: redis::RedisResult<Vec<i64>> = redis::cmd("HTTL")
+                .arg(decode_key(name))
+                .arg("FIELDS")
+                .arg(chunk.len())
+                .arg(chunk)
+                .query_async(&mut c)
+                .await;
+            match reply {
+                // -1: no expiry, -2: the field went away since the scan.
+                Ok(ttls) => out.extend(ttls.into_iter().map(|t| (t >= 0).then_some(t))),
+                Err(e) => {
+                    let text = e.to_string().to_ascii_lowercase();
+                    if text.contains("unknown command") || text.contains("unknown subcommand") {
+                        self.no_field_ttl.store(true, Ordering::Relaxed);
+                    }
+                    return Vec::new();
+                }
+            }
+        }
+        out
+    }
+
+    /// Set or clear the expiry of one hash field (`HEXPIRE` / `HPERSIST`,
+    /// Redis 7.4+). Zero seconds deletes the field, as it does in Redis.
+    pub async fn set_field_ttl(&self, name: &str, field: &str, seconds: Option<i64>) -> Result<()> {
+        let mut c = self.mgr.clone();
+        let mut cmd = match seconds {
+            Some(s) if s >= 0 => {
+                let mut cmd = redis::cmd("HEXPIRE");
+                cmd.arg(decode_key(name)).arg(s);
+                cmd
+            }
+            _ => {
+                let mut cmd = redis::cmd("HPERSIST");
+                cmd.arg(decode_key(name));
+                cmd
+            }
+        };
+        cmd.arg("FIELDS").arg(1).arg(field);
+        let codes: Vec<i64> = match cmd.query_async(&mut c).await {
+            Ok(codes) => codes,
+            // Dragonfly expires hash fields but has no HPERSIST.
+            Err(e) if is_unknown_command(&e) && seconds.is_none_or(|s| s < 0) => {
+                anyhow::bail!("this server cannot remove a field's expiry (it has no HPERSIST)")
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match codes.first() {
+            Some(-2) => Err(anyhow!("the field '{field}' is no longer in '{name}'")),
+            _ => Ok(()),
+        }
     }
 
     /// Walk a hash, set or sorted set with its `*SCAN` command until `want`
@@ -1651,7 +2001,9 @@ impl Client {
                     .query_async::<()>(&mut c)
                     .await?;
             }
-            KeyType::Other => return Err(anyhow!("unsupported key type")),
+            // A vector set cannot exist empty, and its first element fixes
+            // the dimension: it starts with that element, added with `a`.
+            KeyType::VectorSet | KeyType::Other => return Err(anyhow!("unsupported key type")),
         }
         Ok(())
     }
@@ -1880,22 +2232,14 @@ return 1
             .await
             .map(|raw| parse_client_list(&raw))
             .unwrap_or_default();
+        // Read loosely: KeyDB answers one parameter (`tls-allowlist`) with a
+        // list, which a strict read of strings would reject in full.
         let config: Vec<(String, String)> = redis::cmd("CONFIG")
             .arg("GET")
             .arg("*")
-            .query_async::<Vec<String>>(&mut c)
+            .query_async::<redis::Value>(&mut c)
             .await
-            .map(|flat| {
-                let mut pairs: Vec<(String, String)> = flat
-                    .chunks(2)
-                    .filter_map(|p| match p {
-                        [k, v] => Some((k.clone(), v.clone())),
-                        _ => None,
-                    })
-                    .collect();
-                pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                pairs
-            })
+            .map(|reply| config_pairs(&reply))
             .unwrap_or_default();
         let latency = self.latency_rows(&mut c).await;
         let mut cluster: Vec<(String, String)> = redis::cmd("CLUSTER")
@@ -2382,6 +2726,61 @@ return 1
     }
 }
 
+/// A server error saying the command does not exist: an older server, or a
+/// module that is not loaded.
+fn is_unknown_command(e: &redis::RedisError) -> bool {
+    let text = e.to_string().to_ascii_lowercase();
+    text.contains("unknown command") || text.contains("unknown subcommand")
+}
+
+/// `CONFIG GET` as sorted parameter and value pairs. A value that is not a
+/// string (KeyDB's `tls-allowlist` is a list) is shown as text rather than
+/// failing the whole reply.
+fn config_pairs(reply: &redis::Value) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = flat_map(reply).into_iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+/// A reply that is one map (`VINFO`): a RESP3 map or a flat RESP2 array.
+fn flat_map(v: &redis::Value) -> std::collections::HashMap<String, String> {
+    match v {
+        redis::Value::Map(pairs) => pairs.iter().map(|(k, v)| (scalar(k), scalar(v))).collect(),
+        redis::Value::Array(items) => items
+            .chunks(2)
+            .filter_map(|p| match p {
+                [k, v] => Some((scalar(k), scalar(v))),
+                _ => None,
+            })
+            .collect(),
+        _ => Default::default(),
+    }
+}
+
+/// Member and score pairs (`VSIM ... WITHSCORES`): a RESP3 map or a flat
+/// RESP2 array, with the score as a double or as text.
+fn scored_pairs(v: &redis::Value) -> Vec<(Vec<u8>, f64)> {
+    let bytes = |v: &redis::Value| match v {
+        redis::Value::BulkString(b) => b.clone(),
+        other => scalar(other).into_bytes(),
+    };
+    let score = |v: &redis::Value| match v {
+        redis::Value::Double(d) => *d,
+        other => scalar(other).parse().unwrap_or(f64::NAN),
+    };
+    match v {
+        redis::Value::Map(pairs) => pairs.iter().map(|(m, s)| (bytes(m), score(s))).collect(),
+        redis::Value::Array(items) => items
+            .chunks(2)
+            .filter_map(|p| match p {
+                [m, s] => Some((bytes(m), score(s))),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Flatten a RESP reply that is a list of maps (`XINFO`, `MODULE LIST`) into
 /// string pairs. Redis answers with a map in RESP3 and a flat array in RESP2,
 /// so both shapes are accepted.
@@ -2558,7 +2957,7 @@ pub fn text_or_dump(bytes: Vec<u8>) -> String {
 }
 
 /// Which part of a collection a read covers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Window {
     /// Most elements to return.
     pub limit: usize,
@@ -2566,6 +2965,9 @@ pub struct Window {
     /// set and sorted-set members are matched by the server; list items and
     /// stream field names and values are matched here. Always the stored bytes.
     pub filter: Option<String>,
+    /// For a vector set: the elements most similar to this, instead of a
+    /// listing.
+    pub similar: Option<Similar>,
 }
 
 impl Default for Window {
@@ -2573,8 +2975,67 @@ impl Default for Window {
         Self {
             limit: VALUE_LIMIT,
             filter: None,
+            similar: None,
         }
     }
+}
+
+/// A vector set similarity query (`VSIM`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Similar {
+    pub to: SimilarTo,
+    /// A `FILTER` expression over the elements' JSON attributes, such as
+    /// `.year > 2000 and .genre == "noir"`.
+    pub filter: Option<String>,
+    /// Most results to return.
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SimilarTo {
+    /// An element already in the set.
+    Element(String),
+    /// A vector typed in, with as many values as the set has dimensions.
+    Vector(Vec<f64>),
+}
+
+impl Similar {
+    /// How the pane header names the query.
+    pub fn describe(&self) -> String {
+        let to = match &self.to {
+            SimilarTo::Element(e) => format!("'{e}'"),
+            SimilarTo::Vector(v) => format!("a {}-value vector", v.len()),
+        };
+        match self.filter.as_deref().filter(|f| !f.trim().is_empty()) {
+            Some(f) => format!("similar to {to} where {f}"),
+            None => format!("similar to {to}"),
+        }
+    }
+}
+
+/// Read a typed vector: numbers separated by commas and/or spaces, with or
+/// without surrounding brackets.
+pub fn parse_vector(text: &str) -> std::result::Result<Vec<f64>, String> {
+    let inner = text.trim().trim_start_matches('[').trim_end_matches(']');
+    let values = inner
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok(v),
+            _ => Err(format!("'{p}' is not a number")),
+        })
+        .collect::<std::result::Result<Vec<f64>, String>>()?;
+    if values.is_empty() {
+        return Err("Type the vector's values, separated by commas or spaces".into());
+    }
+    Ok(values)
+}
+
+/// One vector set element in full.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VsetElement {
+    pub vector: Vec<f64>,
+    pub attributes: Option<String>,
 }
 
 /// How much of a collection a read covered, for the value pane header.
@@ -2614,6 +3075,8 @@ pub struct Read {
     /// Why part of the value could not be shown through the chosen view.
     pub notice: Option<String>,
     pub coverage: Coverage,
+    /// A line about the value for the pane header, where the type has one.
+    pub detail: Option<String>,
 }
 
 /// What a `*SCAN` walk collected.
@@ -2703,9 +3166,11 @@ enum RawValue {
     Unsupported(String),
 }
 
+#[derive(Default)]
 struct RawRow {
     id: String,
     cells: Vec<RawCell>,
+    ttl: Option<i64>,
 }
 
 enum RawCell {
@@ -2784,6 +3249,7 @@ fn materialize(raw: RawValue, view: &View) -> (KeyValue, Option<String>) {
                         id: row.id,
                         cells,
                         decoding: decoded,
+                        ttl: row.ttl,
                     }
                 })
                 .collect();
@@ -3084,6 +3550,55 @@ pub fn is_destructive(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bulk(s: &str) -> redis::Value {
+        redis::Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn a_config_value_that_is_a_list_does_not_lose_the_rest() {
+        // KeyDB 6.3 answers `tls-allowlist` with an empty array.
+        let reply = redis::Value::Array(vec![
+            bulk("maxmemory"),
+            bulk("0"),
+            bulk("tls-allowlist"),
+            redis::Value::Array(vec![]),
+            bulk("appendonly"),
+            bulk("no"),
+        ]);
+        let pairs = config_pairs(&reply);
+        let names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["appendonly", "maxmemory", "tls-allowlist"]);
+        assert_eq!(pairs[1].1, "0");
+        // RESP3 answers with a map.
+        let map = redis::Value::Map(vec![(bulk("b"), bulk("2")), (bulk("a"), bulk("1"))]);
+        assert_eq!(
+            config_pairs(&map),
+            vec![("a".into(), "1".into()), ("b".into(), "2".into())]
+        );
+    }
+
+    #[test]
+    fn similarity_scores_are_read_in_either_protocol() {
+        let resp2 = redis::Value::Array(vec![bulk("heat"), bulk("1"), bulk("ronin"), bulk("0.5")]);
+        let resp3 = redis::Value::Map(vec![
+            (bulk("heat"), redis::Value::Double(1.0)),
+            (bulk("ronin"), redis::Value::Double(0.5)),
+        ]);
+        let want = vec![(b"heat".to_vec(), 1.0), (b"ronin".to_vec(), 0.5)];
+        assert_eq!(scored_pairs(&resp2), want);
+        assert_eq!(scored_pairs(&resp3), want);
+    }
+
+    #[test]
+    fn typed_vectors_take_commas_spaces_and_brackets() {
+        assert_eq!(parse_vector("[0.1, 0.2 0.3]"), Ok(vec![0.1, 0.2, 0.3]));
+        assert_eq!(parse_vector("1,2,,3"), Ok(vec![1.0, 2.0, 3.0]));
+        assert!(parse_vector("").is_err());
+        assert_eq!(parse_vector("1 x"), Err("'x' is not a number".into()));
+        assert!(parse_vector("1 NaN").is_err());
+        assert!(parse_vector("inf").is_err());
+    }
 
     #[test]
     fn monitor_lines_split_into_command_and_detail() {

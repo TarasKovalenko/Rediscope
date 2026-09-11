@@ -616,9 +616,11 @@ pub(super) fn read_route(cmd: &Cmd) -> (bool, Option<Vec<u8>>) {
         .unwrap_or_default();
     let index = match head.as_str() {
         "GET" | "TYPE" | "TTL" | "PTTL" | "DUMP" | "STRLEN" | "GETRANGE" | "HLEN" | "HSCAN"
-        | "HGET" | "HGETALL" | "LLEN" | "LRANGE" | "SCARD" | "SSCAN" | "SMEMBERS" | "ZCARD"
-        | "ZRANGE" | "ZSCAN" | "XLEN" | "XRANGE" | "XREVRANGE" | "XPENDING" | "JSON.GET"
-        | "JSON.TYPE" | "TS.GET" | "TS.RANGE" | "TS.INFO" => Some(1),
+        | "HTTL" | "HGET" | "HGETALL" | "LLEN" | "LRANGE" | "SCARD" | "SSCAN" | "SMEMBERS"
+        | "ZCARD" | "ZRANGE" | "ZSCAN" | "XLEN" | "XRANGE" | "XREVRANGE" | "XPENDING"
+        | "JSON.GET" | "JSON.TYPE" | "TS.GET" | "TS.RANGE" | "TS.INFO" | "VCARD" | "VDIM"
+        | "VINFO" | "VRANGE" | "VRANDMEMBER" | "VEMB" | "VGETATTR" | "VSIM" | "VLINKS"
+        | "VISMEMBER" => Some(1),
         "MEMORY" if sub == "USAGE" => Some(2),
         "OBJECT" if matches!(sub.as_str(), "FREQ" | "IDLETIME" | "ENCODING" | "REFCOUNT") => {
             Some(2)
