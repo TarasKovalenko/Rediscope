@@ -12,6 +12,8 @@ Python runtime.
 | <img src="docs/screenshots/server-info.svg" alt="The server info dialog with its section tabs"> | <img src="docs/screenshots/memory.svg" alt="The namespace memory report, showing which prefixes hold the RAM"> |
 | **Pub/Sub feed** | **Value editor** |
 | <img src="docs/screenshots/pubsub.svg" alt="The pub/sub feed with a rate sparkline, channel breakdown and a JSON preview"> | <img src="docs/screenshots/editor.svg" alt="Editing a JSON value, checked before it is saved"> |
+| **Compressed values** | **Command monitor** |
+| <img src="docs/screenshots/codecs.svg" alt="A gzipped JSON value, recognised by its header and shown decoded and formatted"> | <img src="docs/screenshots/monitor.svg" alt="The MONITOR feed, grouped by command, with the rate and the traffic too fast to show"> |
 
 **[taraskovalenko.github.io/Rediscope](https://taraskovalenko.github.io/Rediscope/)** — install commands, every screen, and the keys worth knowing.
 

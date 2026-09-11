@@ -100,7 +100,11 @@ async fn main() -> anyhow::Result<()> {
     app.modal = Some(Modal::PubSub(demo_feed()));
     shot(&mut app, "pubsub")?;
 
-    // 7. A gzipped JSON document, recognised by its header and decoded on the
+    // 7. The command monitor, fabricated the same way.
+    app.modal = Some(Modal::PubSub(demo_monitor()));
+    shot(&mut app, "monitor")?;
+
+    // 8. A gzipped JSON document, recognised by its header and decoded on the
     //    way to the screen. Taken last, so the folders it opens never show
     //    behind the dialogs above.
     app.modal = None;
@@ -118,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     .await;
     shot(&mut app, "codecs")?;
 
-    println!("wrote {} screenshots to {OUT}/", 7);
+    println!("wrote {} screenshots to {OUT}/", 8);
     Ok(())
 }
 
@@ -200,6 +204,47 @@ fn demo_feed() -> PubSubState {
                 start + std::time::Duration::from_secs(second),
             );
         }
+    }
+    feed.follow = false;
+    feed.scroll = feed.messages.len() - 3;
+    feed
+}
+
+/// A `MONITOR` feed as a busy cache would fill it: the commands, the rate, and
+/// the share it could not keep up with. Fabricated like the pub/sub feed, so
+/// the picture never changes between runs and shows no real client.
+fn demo_monitor() -> PubSubState {
+    let mut feed = PubSubState::monitor(Vec::new());
+    let start = feed.started;
+    let clients = ["10.4.19.31:52110", "10.4.19.44:40912", "10.4.20.7:61208"];
+    for second in 0..40u64 {
+        let burst = 2.0 + (second as f64 * 0.3).cos().abs() * 7.0;
+        for n in 0..burst as usize {
+            let id = 1042 + (second * 7 + n as u64) % 400;
+            let client = clients[(second as usize + n) % clients.len()];
+            let (command, args) = match (second as usize + n) % 6 {
+                0 | 1 => ("GET", format!(r#""user:{id}""#)),
+                2 => ("HGETALL", format!(r#""orders:2026:{:04}""#, id % 420)),
+                3 => (
+                    "SETEX",
+                    format!(r#""session:web:{id:05}" "1800" "{{"user":{id}}}""#),
+                ),
+                4 => ("ZINCRBY", format!(r#""leaderboard:eu" "5" "user:{id}""#)),
+                _ => ("EXPIRE", format!(r#""cache:page:{:03}" "120""#, id % 48)),
+            };
+            feed.push_at(
+                command.into(),
+                format!("db0 {client}  {args}"),
+                start + std::time::Duration::from_secs(second),
+            );
+        }
+        // The rest of that second's traffic: counted in the rate and the
+        // total, never queued, which is how the feed survives a busy server.
+        let rate = 3_000.0 + (second as f64 * 0.21).sin().abs() * 6_500.0;
+        feed.push_dropped_at(
+            rate as u64 - burst as u64,
+            start + std::time::Duration::from_secs(second),
+        );
     }
     feed.follow = false;
     feed.scroll = feed.messages.len() - 3;

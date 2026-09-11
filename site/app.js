@@ -38,6 +38,8 @@ const captions = {
     "Editing a value. JSON is checked before it is saved, so a typo is refused rather than stored.",
   codecs:
     "A gzipped JSON document, recognised by its header and shown decoded. Edits are compressed again on save, and v picks another view.",
+  monitor:
+    "MONITOR, grouped by command, with the rate and what came in too fast to show. It closes with the feed, and asks first on production.",
 };
 
 if (panel) {
