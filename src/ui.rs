@@ -330,7 +330,11 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         title.push_str(" · PARTIAL RESULTS");
     }
     if app.truncated {
-        title.push_str("  ·  TRUNCATED");
+        title.push_str(if app.key_limit < crate::redis_client::KEY_LIMIT_MAX {
+            "  ·  TRUNCATED (+ more)"
+        } else {
+            "  ·  TRUNCATED"
+        });
     }
     if !app.marked.is_empty() {
         title.push_str(&format!("  ·  {} marked", app.marked.len()));
@@ -374,9 +378,34 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             } else {
                 human_ttl(k.ttl)
             };
+            let more = !app.value_coverage.complete
+                && app.value_window.limit < crate::redis_client::VALUE_LIMIT_MAX;
             let size = match &app.value {
+                Some(KeyValue::Rows { rows, total, .. }) if app.value_window.filter.is_some() => {
+                    let filter = app.value_window.filter.as_deref().unwrap_or_default();
+                    let reach = if app.value_coverage.complete {
+                        format!("all {total} searched")
+                    } else {
+                        format!("searched {} of {total}", app.value_coverage.examined)
+                    };
+                    format!(
+                        "   filter {}: {} match(es) · {reach}{}",
+                        truncate(filter, 24),
+                        rows.len(),
+                        if more { " · + for more" } else { "" }
+                    )
+                }
                 Some(KeyValue::Rows { rows, total, .. }) if (*total as usize) > rows.len() => {
-                    format!("   showing {} of {}", rows.len(), total)
+                    format!(
+                        "   showing {} of {}{}",
+                        rows.len(),
+                        total,
+                        if more { " · + loads more" } else { "" }
+                    )
+                }
+                // A time series has no cheap total: a full page may have more.
+                Some(KeyValue::Rows { total, .. }) if more => {
+                    format!("   {total} element(s) · + loads more")
                 }
                 Some(KeyValue::Rows { total, .. }) => format!("   {total} element(s)"),
                 Some(KeyValue::Str(s)) => format!("   {} byte(s)", s.len()),
@@ -607,10 +636,13 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let Some(m) = &app.modal else { return };
     match m {
         Modal::Help => {
-            let rect = centered(area, 74, 32);
+            // As tall as the list needs, up to the terminal: a fixed height
+            // cut the last sections off on any screen.
+            let lines = help_text(palette);
+            let rect = centered(area, 74, (lines.len() as u16 + 2).max(32));
             clear_area(f, rect, palette);
             f.render_widget(
-                Paragraph::new(help_text(palette))
+                Paragraph::new(lines)
                     .block(panel("Keybindings — esc closes", true, palette))
                     .wrap(Wrap { trim: false }),
                 rect,
@@ -1450,10 +1482,17 @@ fn channel_color(channel: &str, palette: Palette) -> Color {
 fn pubsub_feed(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette) {
     let rect = centered(area, area.width.saturating_sub(6).min(110), area.height);
     clear_area(f, rect, palette);
-    let title = format!(
-        "{} — s resubscribe · w publish · f follow · c clear · y copy · esc closes",
-        state.title()
-    );
+    let title = if state.monitor {
+        format!(
+            "{} — s filter · f follow · c clear · y copy · esc stops",
+            state.title()
+        )
+    } else {
+        format!(
+            "{} — s resubscribe · w publish · f follow · c clear · y copy · esc closes",
+            state.title()
+        )
+    };
     let block = panel(&title, true, palette);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -1526,7 +1565,9 @@ fn feed_header(f: &mut Frame, spark: Rect, counters: Rect, state: &PubSubState, 
     }
 
     let line = if state.messages.is_empty() && state.total == 0 {
-        let waiting = if state.keyspace {
+        let waiting = if state.monitor {
+            "waiting for commands … other clients' commands appear here as the server runs them"
+        } else if state.keyspace {
             "waiting … keyspace events need notify-keyspace-events set on the server"
         } else {
             "waiting for messages …"
@@ -1535,7 +1576,11 @@ fn feed_header(f: &mut Frame, spark: Rect, counters: Rect, state: &PubSubState, 
     } else {
         Line::from(vec![
             Span::styled(
-                format!("{} msg/s", state.per_second()),
+                format!(
+                    "{} {}/s",
+                    state.per_second(),
+                    if state.monitor { "cmd" } else { "msg" }
+                ),
                 Style::new().fg(palette.foreground).bold(),
             ),
             Span::styled(
@@ -1546,6 +1591,14 @@ fn feed_header(f: &mut Frame, spark: Rect, counters: Rect, state: &PubSubState, 
                     state.messages.len()
                 ),
                 Style::new().fg(palette.dim),
+            ),
+            Span::styled(
+                if state.dropped > 0 {
+                    format!("  ·  {} too fast to show", state.dropped)
+                } else {
+                    String::new()
+                },
+                Style::new().fg(palette.warning),
             ),
             Span::styled(
                 if state.follow {
@@ -1566,7 +1619,15 @@ fn feed_header(f: &mut Frame, spark: Rect, counters: Rect, state: &PubSubState, 
 
 /// Which channels the traffic is on, busiest first.
 fn channel_breakdown(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette) {
-    let block = panel("Channels", false, palette);
+    let block = panel(
+        if state.monitor {
+            "Commands"
+        } else {
+            "Channels"
+        },
+        false,
+        palette,
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -2071,6 +2132,7 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         ),
         row("a", "add an element (hash / list / set / zset / stream)"),
         row("x", "delete the selected element   v  view as gzip, hex …"),
+        row("f / +", "filter the elements · load more elements or keys"),
         row("PgUp / PgDn", "scroll the selected JSON / XML preview"),
         head("Server"),
         row(
@@ -2081,7 +2143,10 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
             "M",
             "namespace memory — which prefix holds the RAM · t big keys",
         ),
-        row("P", "pub/sub feed        N  keyspace event feed"),
+        row(
+            "P",
+            "pub/sub feed    N  keyspace events    W  command monitor",
+        ),
         row("S", "consumer groups of the selected stream"),
         row("L", "run a Lua script — marked keys become KEYS[1..]"),
         row(":", "raw command console — tab completes, ctrl+r searches"),
