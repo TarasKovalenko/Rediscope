@@ -33,6 +33,7 @@ fn target(key: &str, kind: KeyType, selector: &str, original: &str) -> EditTarge
         kind,
         selector: selector.into(),
         original: original.into(),
+        decoded: None,
     }
 }
 
@@ -407,6 +408,7 @@ async fn add_forms_write_and_editing_a_row_goes_through_conflict_detection() {
             rows: vec![rediscope::redis_client::Row {
                 id: "existing".into(),
                 cells: vec!["existing".into(), "value".into()],
+                decoding: None,
             }],
             total: 1,
         },

@@ -12,6 +12,8 @@ Python runtime.
 | <img src="docs/screenshots/server-info.svg" alt="The server info dialog with its section tabs"> | <img src="docs/screenshots/memory.svg" alt="The namespace memory report, showing which prefixes hold the RAM"> |
 | **Pub/Sub feed** | **Value editor** |
 | <img src="docs/screenshots/pubsub.svg" alt="The pub/sub feed with a rate sparkline, channel breakdown and a JSON preview"> | <img src="docs/screenshots/editor.svg" alt="Editing a JSON value, checked before it is saved"> |
+| **Compressed values** | **Command monitor** |
+| <img src="docs/screenshots/codecs.svg" alt="A gzipped JSON value, recognised by its header and shown decoded and formatted"> | <img src="docs/screenshots/monitor.svg" alt="The MONITOR feed, grouped by command, with the rate and the traffic too fast to show"> |
 
 **[taraskovalenko.github.io/Rediscope](https://taraskovalenko.github.io/Rediscope/)** — install commands, every screen, and the keys worth knowing.
 
@@ -117,12 +119,26 @@ rediscope
 
 - **Namespace tree.** Keys grouped by `:` into collapsible folders, with a
   per-folder key count and a type badge on every leaf.
-- **Safe listing.** `SCAN` in batches, never `KEYS *`, capped at 5,000 keys per
-  view. The header says so when a result was truncated, so you know to narrow
-  the pattern rather than trusting a short list.
+- **Safe listing.** `SCAN` in batches, never `KEYS *`, 5,000 keys per view to
+  start with. The header says so when a result was truncated, and `+` loads
+  5,000 more, up to 50,000, rescanning so a refresh stays consistent.
 - **Bounded value reads.** Collections are read through `HSCAN`/`SSCAN` or a
   ranged `LRANGE`/`ZRANGE`, up to 1,000 elements, while still reporting the true
   total ("showing 1000 of 4.2M"). A million-element list will not stall the UI.
+  With the value pane focused, `+` loads another 1,000, up to 10,000.
+- **Filter inside a collection** (`f`). Type a glob, or a bare word that becomes
+  `*word*`, to keep only the matching elements of the open key. Hash fields and
+  set and sorted-set members are matched by the server with `HSCAN`/`SSCAN`/`ZSCAN
+  MATCH`; list items and stream field names and values are walked in chunks
+  and matched locally with the same rules. Patterns match the stored bytes.
+  Each read looks at up to 100,000 elements, and a list or stream walk pulls at
+  most 64 MiB, in chunks that shrink when items are large (both grow as `+`
+  raises the limit). The header says how many elements it searched and
+  whether it reached the end. A filtered sorted set shows the lowest scores
+  among the matches it examined. List rows keep their real index, and deleting
+  one checks that the index still holds the item you saw, so a queue that
+  moved in the meantime loses nothing it shouldn't. `Esc` in the value pane
+  clears the filter.
 - **Live TTLs.** Expiries count down in place, and a key leaves the tree the
   second it expires, so nothing stale sits in the view between scans.
 - **Search.** `/` filters by glob against the server, not just what's on screen.
@@ -153,6 +169,31 @@ rediscope
   bytes escaped as `\xNN`, so one binary key can no longer break the whole scan.
   Editing is refused on anything shown as a dump, because saving it would store
   the description over the bytes it describes.
+- **Compressed, packed and encoded values** (`v`). Bytes carrying a gzip, zlib,
+  zstd or LZ4 header, or a MessagePack map or array, are decoded automatically
+  and shown with the codec named in the header (`string · gzip · json`). Text
+  is never second-guessed: a value that reads as text is shown exactly as
+  before. `v` picks a view for the open key — `auto`, `plain` (as stored), or
+  one of gzip, zlib, deflate, zstd, lz4, brotli, msgpack, base64 and hex — and
+  it applies to a string or to every element of a hash, list, set, sorted set
+  or stream. Edits are encoded the same way on save: change a gzipped JSON
+  document and it is stored gzipped, with the TTL kept and the conflict check
+  still comparing the exact bytes that were read; saving without a change
+  writes back the original bytes untouched. MessagePack is edited as JSON, and
+  the `hex` view edits binary values up to 256 KiB byte for byte. A value that
+  cannot be written back exactly is shown but marked read-only: MessagePack
+  holding binary or float32 data or encoded differently than rediscope would
+  write it, base64 in another flavour, a decompressed payload that is not text,
+  or decoded text past 1 MiB, which the pane cuts off. Concatenated zstd, LZ4
+  and gzip frames decode in full, and a stream followed by bytes it does not
+  account for is shown as stored rather than half-decoded. Decompression stops
+  at 32 MiB per value and 64 MiB per read, and MessagePack is decoded up to
+  1 MiB, so a small compression bomb cannot take the client down. Set and
+  sorted-set members shown through a codec are view-only, since the member is
+  also the element's address.
+- **Custom codecs.** Point rediscope at your own decoder — `protoc`, a
+  deserializer script — and it appears in the `v` list. See
+  [Custom codecs](#custom-codecs).
 - **JSON values.** A string holding JSON is shown indented and syntax-coloured
   with a `json` badge. The editor opens it pretty-printed, `Ctrl+F` reformats,
   and `Ctrl+S` refuses to save a document that no longer parses. Key order is
@@ -201,6 +242,16 @@ rediscope
   which channels the traffic is on, each in its own colour; selecting a JSON or
   XML message pretty-prints it below the feed. `w` publishes one, `f` follows
   the tail, `y` copies the feed.
+- **Command monitor** (`W`). `MONITOR` in the same feed: every command the
+  server runs, grouped by command name, with the rate and a filter (`s`) that
+  keeps commands whose name or arguments match. A busy server runs more
+  commands than a terminal can show, so the feed takes at most 500 every
+  100 ms and counts the rest as "too fast to show" instead of queueing them,
+  and keeps the first 2 KiB of each command's arguments. The `MONITOR`
+  connection closes with the feed, however the feed goes away.
+  A production profile asks before starting it, because `MONITOR` costs the
+  server real throughput while it runs; `Esc` stops it. Standalone profiles
+  only for now, like pub/sub.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
   evicted live. Needs `notify-keyspace-events` set on the server.
@@ -331,9 +382,12 @@ Press `?` in the app for this list at any time.
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
 | `PgUp` `PgDn` | Scroll the selected JSON or XML preview |
+| `v` | View the value as auto, plain, gzip, zstd, msgpack, hex … or a custom codec |
+| `f` | Filter the open collection's elements · `Esc` in the value pane clears it |
+| `+` | Load more: keys with the tree focused, elements with the value pane focused |
 | `i` | Server info |
 | `M` | Namespace memory report |
-| `P` / `N` | Pub/sub feed · keyspace event feed |
+| `P` / `N` / `W` | Pub/sub feed · keyspace event feed · command monitor |
 | `S` | Consumer groups of the selected stream |
 | `Q` | Run a RediSearch query |
 | `p` | Colour theme picker |
@@ -368,7 +422,7 @@ Press `?` in the app for this list at any time.
 ### Pub/Sub and keyspace events (`P` / `N`)
 | Key | Action |
 |---|---|
-| `s` | Change what the feed is subscribed to |
+| `s` | Change what the feed is subscribed to · in the command monitor, change its filter |
 | `w` | Publish a message |
 | `f` | Follow the newest message · `↑` `↓` `PgUp` `PgDn` scroll back |
 | `c` / `y` | Clear the feed and its statistics · copy it |
@@ -589,6 +643,56 @@ cannot truncate it. A file that exists but does not parse is moved aside as
 `connections.json.bad-<timestamp>` rather than replaced, and a file that cannot
 be read at all disables saving for the session instead of overwriting profiles
 that are still on disk.
+
+### Custom codecs
+
+Add a `codecs` list to `connections.json` to view values through your own
+programs. `decode` receives the stored bytes on stdin and prints the text to
+show; the optional `encode` does the reverse, and without it values shown
+through the codec are read-only. Before an edit is saved, the pair is checked
+against itself: the text `decode` reads back from the new bytes must survive
+another `encode` and `decode` unchanged. The edit must also survive the trip: an
+encoder that prints nothing, or reads back as the value you started from, saves
+nothing. A decoder that prints its own canonical form (a trailing newline,
+reordered fields) and an encoder that never writes the same bytes twice
+(encryption with a fresh salt) both work. These checks catch a broken or
+mismatched pair, not every possible bug in one, so test a new codec on a
+disposable key first. Both are argument lists, not
+shell strings, so a value only ever reaches the program's stdin, and
+`REDISCOPE_PASSWORD` is removed from the program's environment. A leading `~` in
+the program path is expanded. A name cannot reuse a built-in view (`gzip`,
+`plain`, …).
+
+`timeout_secs` (default 10, at most 600) is shared by every element of one
+read: a program that hangs on a hash field stops the rest of that hash from
+going through it, rather than stalling each field in turn. On timeout the
+program is killed together with anything it started (on Unix, its whole process
+group). A failing program has its stderr shown in the status line.
+
+> **Warning:** a decoder runs on whatever the server holds, and anyone who can
+> write to that server controls its input. Never configure a deserializer that
+> can execute code — Python `pickle`, Java serialization, PHP `unserialize` —
+> against data you do not fully trust.
+
+```json
+{
+  "codecs": [
+    {
+      "name": "user.proto",
+      "decode": ["protoc", "--decode=app.User", "-I", "/srv/proto", "user.proto"],
+      "encode": ["protoc", "--encode=app.User", "-I", "/srv/proto", "user.proto"]
+    },
+    {
+      "name": "protobuf-raw",
+      "decode": ["protoc", "--decode_raw"],
+      "timeout_secs": 5
+    }
+  ]
+}
+```
+
+Custom codecs are only run when you choose one with `v`; automatic detection
+uses the built-in codecs alone.
 
 ### Environments and the production lease
 

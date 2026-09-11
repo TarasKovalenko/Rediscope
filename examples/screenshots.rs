@@ -18,7 +18,7 @@ use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use rediscope::app::{App, InfoState, Modal, Msg, PubSubState};
 use rediscope::config::{Connection, Store};
-use rediscope::redis_client::{ClientEntry, Diagnostics, ServerInfo, SlowEntry};
+use rediscope::redis_client::{ClientEntry, Diagnostics, KeyValue, ServerInfo, SlowEntry};
 use rediscope::theme::Theme;
 use rediscope::ui;
 
@@ -100,15 +100,39 @@ async fn main() -> anyhow::Result<()> {
     app.modal = Some(Modal::PubSub(demo_feed()));
     shot(&mut app, "pubsub")?;
 
-    println!("wrote {} screenshots to {OUT}/", 6);
+    // 7. The command monitor, fabricated the same way.
+    app.modal = Some(Modal::PubSub(demo_monitor()));
+    shot(&mut app, "monitor")?;
+
+    // 8. A gzipped JSON document, recognised by its header and decoded on the
+    //    way to the screen. Taken last, so the folders it opens never show
+    //    behind the dialogs above.
+    app.modal = None;
+    collapse_all(&mut app);
+    open_path(&mut app, &["cache", "profile", "1042"]);
+    drain(&mut app, &mut rx);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Down);
+    pump(&mut app, &mut rx, |a| {
+        matches!(a.value, Some(KeyValue::Decoded { .. }))
+            && a.current
+                .as_ref()
+                .is_some_and(|k| k.name == "cache:profile:1042")
+    })
+    .await;
+    shot(&mut app, "codecs")?;
+
+    println!("wrote {} screenshots to {OUT}/", 8);
     Ok(())
 }
 
-fn demo_store(url: &str) -> Store {
+fn demo_store(_url: &str) -> Store {
     Store {
         theme: Theme::TokyoNight,
         connections: vec![
-            demo_connection(url),
+            // Pictured at the address the docs tell people to use, whichever
+            // server `REDISCOPE_DEMO_URL` actually points the run at.
+            demo_connection(&format!("redis://127.0.0.1:6379/{DEMO_DB}")),
             Connection {
                 name: "staging".into(),
                 host: "cache-01.staging.example".into(),
@@ -180,6 +204,47 @@ fn demo_feed() -> PubSubState {
                 start + std::time::Duration::from_secs(second),
             );
         }
+    }
+    feed.follow = false;
+    feed.scroll = feed.messages.len() - 3;
+    feed
+}
+
+/// A `MONITOR` feed as a busy cache would fill it: the commands, the rate, and
+/// the share it could not keep up with. Fabricated like the pub/sub feed, so
+/// the picture never changes between runs and shows no real client.
+fn demo_monitor() -> PubSubState {
+    let mut feed = PubSubState::monitor(Vec::new());
+    let start = feed.started;
+    let clients = ["10.4.19.31:52110", "10.4.19.44:40912", "10.4.20.7:61208"];
+    for second in 0..40u64 {
+        let burst = 2.0 + (second as f64 * 0.3).cos().abs() * 7.0;
+        for n in 0..burst as usize {
+            let id = 1042 + (second * 7 + n as u64) % 400;
+            let client = clients[(second as usize + n) % clients.len()];
+            let (command, args) = match (second as usize + n) % 6 {
+                0 | 1 => ("GET", format!(r#""user:{id}""#)),
+                2 => ("HGETALL", format!(r#""orders:2026:{:04}""#, id % 420)),
+                3 => (
+                    "SETEX",
+                    format!(r#""session:web:{id:05}" "1800" "{{"user":{id}}}""#),
+                ),
+                4 => ("ZINCRBY", format!(r#""leaderboard:eu" "5" "user:{id}""#)),
+                _ => ("EXPIRE", format!(r#""cache:page:{:03}" "120""#, id % 48)),
+            };
+            feed.push_at(
+                command.into(),
+                format!("db0 {client}  {args}"),
+                start + std::time::Duration::from_secs(second),
+            );
+        }
+        // The rest of that second's traffic: counted in the rate and the
+        // total, never queued, which is how the feed survives a busy server.
+        let rate = 3_000.0 + (second as f64 * 0.21).sin().abs() * 6_500.0;
+        feed.push_dropped_at(
+            rate as u64 - burst as u64,
+            start + std::time::Duration::from_secs(second),
+        );
     }
     feed.follow = false;
     feed.scroll = feed.messages.len() - 3;
@@ -312,6 +377,15 @@ async fn seed(url: &str) -> anyhow::Result<()> {
 
     let profile = r#"{"id":1042,"name":"Ada Lovelace","plan":"team","seats":12,"regions":["eu-west","us-east"],"createdAt":"2025-11-02T09:14:00Z"}"#;
     let _: () = c.set("user:1042", profile).await?;
+
+    // The same kind of document the way many apps actually cache it: gzipped.
+    // The value pane recognises the header and shows the JSON inside.
+    let cached = r#"{"id":1042,"name":"Ada Lovelace","plan":"team","seats":12,"features":["sso","audit-log","priority-support"],"limits":{"projects":50,"storageGb":200},"renewsAt":"2026-11-02T00:00:00Z"}"#;
+    let gzipped = rediscope::codec::encode(
+        &rediscope::codec::Codec::Builtin(rediscope::codec::Builtin::Gzip),
+        cached,
+    )?;
+    let _: () = c.set_ex("cache:profile:1042", gzipped, 3_600).await?;
 
     let mut pipe = redis::pipe();
     for n in 0..1_400 {
@@ -459,8 +533,13 @@ fn shot(app: &mut App, name: &str) -> anyhow::Result<()> {
     // The banner in the title bar reports whichever server generated the
     // pictures. Pin it, so a developer's local build never ends up in the
     // README, and every screenshot agrees with the invented INFO reply.
-    if app.client.is_some() {
+    if let Some(client) = app.client.as_mut() {
         app.server_line = "redis 7.4.2 · standalone".into();
+        // Likewise the address: whatever `REDISCOPE_DEMO_URL` points at, the
+        // pictures show the default one. Only the label changes; the
+        // connection itself is already open.
+        client.conn.host = "127.0.0.1".into();
+        client.conn.port = 6379;
     }
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT))?;
     terminal.draw(|f| ui::draw(f, app))?;

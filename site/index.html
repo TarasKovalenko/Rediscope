@@ -31,9 +31,10 @@
   <p class="eyebrow">v__VERSION__ · MIT · macOS, Linux, Windows</p>
   <h1>A Redis client that lives in your terminal.</h1>
   <p class="lede">
-    Browse the keyspace as a folder tree, read and edit every value type, watch
-    TTLs count down, find out which prefix is eating your RAM, and drop into a
-    raw command console. One static binary. No Electron, no Python runtime.
+    Browse the keyspace as a folder tree, read and edit every value type
+    (gzipped and MessagePack ones too), watch TTLs count down, find out which
+    prefix is eating your RAM, and drop into a raw command console. One static
+    binary. No Electron, no Python runtime.
   </p>
 
   <div class="install-quick">
@@ -62,6 +63,8 @@
     <button role="tab" aria-selected="false" data-shot="memory">Memory report</button>
     <button role="tab" aria-selected="false" data-shot="pubsub">Pub/Sub feed</button>
     <button role="tab" aria-selected="false" data-shot="editor">Value editor</button>
+    <button role="tab" aria-selected="false" data-shot="codecs">Compressed values</button>
+    <button role="tab" aria-selected="false" data-shot="monitor">Command monitor</button>
   </div>
 
   <figure class="shot" data-shot-panel>
@@ -75,6 +78,8 @@
     <figure class="shot"><img src="screenshots/memory.svg" alt="The namespace memory report." loading="lazy"><figcaption>Which prefix holds the RAM.</figcaption></figure>
     <figure class="shot"><img src="screenshots/pubsub.svg" alt="The pub/sub feed." loading="lazy"><figcaption>The pub/sub feed.</figcaption></figure>
     <figure class="shot"><img src="screenshots/editor.svg" alt="The JSON value editor." loading="lazy"><figcaption>Editing a JSON value.</figcaption></figure>
+    <figure class="shot"><img src="screenshots/codecs.svg" alt="A gzipped JSON value, decoded and formatted." loading="lazy"><figcaption>A gzipped value, decoded on sight.</figcaption></figure>
+    <figure class="shot"><img src="screenshots/monitor.svg" alt="The command monitor feed." loading="lazy"><figcaption>Every command the server runs, live.</figcaption></figure>
   </noscript>
 </section>
 
@@ -88,7 +93,8 @@
         <li>The keyspace as a folder tree, split on <code>:</code>, with a count on every folder.</li>
         <li><kbd>/</kbd> searches by pattern, <kbd>F</kbd> searches inside values.</li>
         <li>Live TTLs: keys leave the tree as they expire.</li>
-        <li>Scans, never <code>KEYS</code>, so a big keyspace stays responsive.</li>
+        <li>Scans, never <code>KEYS</code>, so a big keyspace stays responsive. <kbd>+</kbd> loads more: 5,000 keys at a time up to 50,000, or 1,000 elements of a big key up to 10,000.</li>
+        <li><kbd>f</kbd> filters one hash, list, set, sorted set or stream by a pattern, on the server where Redis can match and within a stated budget where it can't.</li>
         <li>Scrolling reads nothing until the cursor stops, so a thousand keys cost one request.</li>
       </ul>
     </article>
@@ -98,9 +104,20 @@
       <ul>
         <li>Every type: strings, hashes, lists, sets, sorted sets, streams, JSON.</li>
         <li>JSON is checked before it is saved, and reformatted on request.</li>
-        <li>Values that are not text show as a hex dump instead of failing the read, and binary key names scan as escaped bytes.</li>
+        <li>Binary that no codec recognises shows as a hex dump instead of failing the read, and binary key names scan as escaped bytes.</li>
         <li>Rename, re-TTL, copy and delete, one key or a marked batch.</li>
         <li>Export and import keys with their TTLs, as <code>DUMP</code> payloads.</li>
+      </ul>
+    </article>
+
+    <article>
+      <h3>Decode</h3>
+      <ul>
+        <li>gzip, zlib, zstd and LZ4 streams and MessagePack are recognised by their header and shown decoded, JSON formatted. Text is never second-guessed.</li>
+        <li><kbd>v</kbd> picks the view for a key: as stored, brotli, raw deflate, base64, hex, or a codec of your own.</li>
+        <li>Edits are encoded back the same way, with the TTL kept and the conflict check still comparing the stored bytes.</li>
+        <li>Plug in your own decoder, like <code>protoc</code> or a script: a program that reads the value on stdin.</li>
+        <li>Anything that can't make the round trip exactly is shown read-only rather than saved wrong, and a compression bomb stops at 32 MiB.</li>
       </ul>
     </article>
 
@@ -111,6 +128,7 @@
         <li>A namespace memory report: which prefix is holding the RAM, and how much of the keyspace the answer is based on.</li>
         <li>Slow log and client list, with a kill on the selected client.</li>
         <li>A pub/sub feed with a live rate sparkline and a per-channel breakdown.</li>
+        <li>A <code>MONITOR</code> feed: every command the server runs, grouped and filterable, batched so a busy server can't flood it. Production profiles ask first.</li>
       </ul>
     </article>
 
@@ -167,6 +185,7 @@
         <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>Move · <kbd>→</kbd> <kbd>←</kbd> open and fold a prefix</td></tr>
         <tr><td><kbd>/</kbd></td><td>Search by pattern</td></tr>
         <tr><td><kbd>F</kbd></td><td>Find a string inside values</td></tr>
+        <tr><td><kbd>f</kbd> <kbd>+</kbd></td><td>Filter a key's elements · load more</td></tr>
         <tr><td><kbd>Tab</kbd></td><td>Switch pane</td></tr>
         <tr><td><kbd>m</kbd> <kbd>u</kbd></td><td>Mark a key · clear the marks</td></tr>
         <tr><td><kbd>y</kbd></td><td>Copy the key name</td></tr>
@@ -189,7 +208,9 @@
         <tr><td><kbd>i</kbd></td><td>Server info</td></tr>
         <tr><td><kbd>M</kbd></td><td>Namespace memory report</td></tr>
         <tr><td><kbd>P</kbd> <kbd>N</kbd></td><td>Pub/sub feed · keyspace events</td></tr>
+        <tr><td><kbd>W</kbd></td><td>Watch every command (<code>MONITOR</code>)</td></tr>
         <tr><td><kbd>S</kbd></td><td>Consumer groups of a stream</td></tr>
+        <tr><td><kbd>v</kbd></td><td>View a value as gzip, MessagePack, hex…</td></tr>
         <tr><td><kbd>:</kbd></td><td>Raw command console</td></tr>
         <tr><td><kbd>?</kbd></td><td>Every other key</td></tr>
       </tbody>

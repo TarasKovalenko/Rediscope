@@ -8,6 +8,7 @@ use redis::{
     RedisConnectionInfo, TlsCertificates,
 };
 
+use crate::codec::{Decoding, Shown, View};
 use crate::config::{Connection, Deployment};
 mod edit;
 mod topology;
@@ -26,8 +27,24 @@ pub struct ScanReport {
 pub const KEY_LIMIT: usize = 5_000;
 /// Hard ceiling on elements pulled into one value pane.
 pub const VALUE_LIMIT: usize = 1_000;
+/// How far `+` can raise the key limit, one [`KEY_LIMIT`] at a time.
+pub const KEY_LIMIT_MAX: usize = 50_000;
+/// How far `+` can raise the element limit, one [`VALUE_LIMIT`] at a time.
+pub const VALUE_LIMIT_MAX: usize = 10_000;
+/// How many elements a filtered read looks at before it stops and says how
+/// far it got. Scales with the element limit.
+pub const FILTER_BUDGET: usize = 100_000;
+/// Elements asked for per round trip by a filtered walk.
+const FILTER_CHUNK: usize = 1_000;
+/// Most bytes a locally matched list or stream walk pulls, per page of the
+/// element limit. Server-side MATCH walks move only the matches.
+pub const FILTER_BYTES: usize = 64 * 1024 * 1024;
+/// About how many bytes one chunk of a locally matched walk should carry.
+const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// How much of a non-text value the hex dump shows.
 const HEX_DUMP_LIMIT: usize = 4_096;
+/// Most decoded text one value read may produce, across all of its elements.
+const DECODE_BUDGET: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
@@ -99,15 +116,24 @@ pub struct KeyInfo {
 
 /// One row of a collection-typed value. `id` is whatever the mutators need to
 /// address this row (hash field, list index, set/zset member, stream id).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Row {
     pub id: String,
     pub cells: Vec<String>,
+    /// Set when the row's element value is shown decoded by a codec: how it
+    /// was decoded and the bytes it came from. The id is never decoded.
+    pub decoding: Option<Decoding>,
 }
 
 #[derive(Clone, Debug)]
 pub enum KeyValue {
     Str(String),
+    /// A string value shown through a codec: the decoded text, and how to get
+    /// back to the stored bytes.
+    Decoded {
+        text: String,
+        decoding: Decoding,
+    },
     Rows {
         headers: Vec<&'static str>,
         rows: Vec<Row>,
@@ -686,6 +712,16 @@ impl Client {
         Ok(self.raw.get_async_pubsub().await?)
     }
 
+    /// A `MONITOR` connection of its own: every command the server runs, as
+    /// it runs it. Dropping it ends the monitoring.
+    pub async fn monitor(&self) -> Result<redis::aio::Monitor> {
+        anyhow::ensure!(
+            self.conn.deployment == Deployment::Standalone,
+            "MONITOR watches one server, and is not supported for discovered deployments yet"
+        );
+        Ok(self.raw.get_async_monitor().await?)
+    }
+
     /// Command names for console completion, and the subset flagged `write`.
     /// `COMMAND` works on every server version, unlike `COMMAND LIST`, and one
     /// reply per connection is cheap. The write set is what a read-only
@@ -1091,157 +1127,346 @@ impl Client {
 
     /// Read a bounded window of a key's value. Collection types report their
     /// true total so the UI can say "showing 1000 of 4.2M".
+    ///
+    /// Values are shown exactly as stored: text, or a hex dump of bytes that
+    /// are not text. [`Client::read_value_as`] reads through a codec instead.
     pub async fn read_value(&self, name: &str, kind: KeyType) -> Result<KeyValue> {
+        let (raw, _) = self.read_raw(name, kind, &Window::default()).await?;
+        Ok(materialize(raw, &View::Plain).0)
+    }
+
+    /// [`Client::read_value`] seen through `view`: compressed, packed or
+    /// encoded values come back decoded, carrying the bytes they came from so
+    /// an edit can be encoded the same way. The second half is a notice for
+    /// the status line when a chosen codec could not read some of the value.
+    pub async fn read_value_as(
+        &self,
+        name: &str,
+        kind: KeyType,
+        view: &View,
+    ) -> Result<(KeyValue, Option<String>)> {
+        let read = self
+            .read_window(name, kind, view, &Window::default())
+            .await?;
+        Ok((read.value, read.notice))
+    }
+
+    /// [`Client::read_value_as`] over a chosen window of a collection: more
+    /// than the default number of elements, and optionally only the ones that
+    /// match a pattern. Says how much of the collection the read covered.
+    pub async fn read_window(
+        &self,
+        name: &str,
+        kind: KeyType,
+        view: &View,
+        window: &Window,
+    ) -> Result<Read> {
+        let (raw, coverage) = self.read_raw(name, kind, window).await?;
+        let (value, notice) = if *view == View::Plain {
+            materialize(raw, view)
+        } else {
+            // Decompressing tens of megabytes, or waiting on a custom codec's
+            // program, must not hold up the async workers.
+            let view = view.clone();
+            tokio::task::spawn_blocking(move || materialize(raw, &view))
+                .await
+                .context("decoding the value failed")?
+        };
+        Ok(Read {
+            value,
+            notice,
+            coverage,
+        })
+    }
+
+    async fn read_raw(
+        &self,
+        name: &str,
+        kind: KeyType,
+        window: &Window,
+    ) -> Result<(RawValue, Coverage)> {
         let mut c = self.mgr.clone();
-        let lim = VALUE_LIMIT;
+        let lim = window.limit.clamp(1, VALUE_LIMIT_MAX);
+        let filter = window.filter.as_deref().filter(|f| !f.is_empty());
+        // How many elements a filtered read may look at, and how many bytes
+        // a locally matched walk may pull. Loading more widens both in step
+        // with the limit.
+        let pages = (lim / VALUE_LIMIT).max(1);
+        let budget = FILTER_BUDGET as u64 * pages as u64;
+        let byte_budget = FILTER_BYTES * pages;
+        let whole = |total: u64| Coverage {
+            filtered: false,
+            complete: true,
+            examined: total,
+        };
         Ok(match kind {
             KeyType::String => {
                 let v: Option<Vec<u8>> = c.get(decode_key(name)).await?;
-                KeyValue::Str(v.map(decode_value).unwrap_or_default())
+                (RawValue::Str(v.unwrap_or_default()), whole(1))
             }
             KeyType::Hash => {
                 let total: u64 = c.hlen(decode_key(name)).await?;
+                let scan = self
+                    .scan_elements("HSCAN", name, filter, lim, 2, budget)
+                    .await?;
+                let coverage = scan.coverage(scan.items.len() / 2, lim, total, filter.is_some());
+                let mut items = scan.items.into_iter();
                 let mut rows = Vec::new();
-                let mut cursor: u64 = 0;
-                loop {
-                    let (next, flat): (u64, Vec<Vec<u8>>) = redis::cmd("HSCAN")
-                        .arg(decode_key(name))
-                        .arg(cursor)
-                        .arg("COUNT")
-                        .arg(200)
-                        .query_async(&mut c)
-                        .await?;
-                    for pair in flat.chunks(2) {
-                        if let [f, v] = pair {
-                            let f = decode_value(f.clone());
-                            rows.push(Row {
-                                id: f.clone(),
-                                cells: vec![f, decode_value(v.clone())],
-                            });
-                        }
-                    }
-                    cursor = next;
-                    if cursor == 0 || rows.len() >= lim {
-                        break;
-                    }
+                while let (Some(f), Some(v)) = (items.next(), items.next()) {
+                    let f = decode_value(f);
+                    rows.push(RawRow {
+                        id: f.clone(),
+                        cells: vec![RawCell::Text(f), RawCell::Bytes(v)],
+                    });
                 }
                 rows.truncate(lim);
                 rows.sort_by(|a, b| a.id.cmp(&b.id));
-                KeyValue::Rows {
-                    headers: vec!["field", "value"],
-                    rows,
-                    total,
-                }
+                (
+                    RawValue::Rows {
+                        headers: vec!["field", "value"],
+                        rows,
+                        total,
+                    },
+                    coverage,
+                )
             }
             KeyType::List => {
                 let total: u64 = c.llen(decode_key(name)).await?;
-                let items: Vec<Vec<u8>> = c.lrange(decode_key(name), 0, lim as isize - 1).await?;
-                let rows = items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| Row {
-                        id: i.to_string(),
-                        cells: vec![i.to_string(), decode_value(v)],
-                    })
-                    .collect();
-                KeyValue::Rows {
-                    headers: vec!["index", "value"],
-                    rows,
-                    total,
+                let Some(pattern) = filter else {
+                    let items: Vec<Vec<u8>> =
+                        c.lrange(decode_key(name), 0, lim as isize - 1).await?;
+                    let rows: Vec<RawRow> = items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| RawRow {
+                            id: i.to_string(),
+                            cells: vec![RawCell::Text(i.to_string()), RawCell::Bytes(v)],
+                        })
+                        .collect();
+                    let coverage = Coverage {
+                        filtered: false,
+                        complete: rows.len() as u64 >= total,
+                        examined: rows.len() as u64,
+                    };
+                    return Ok((
+                        RawValue::Rows {
+                            headers: vec!["index", "value"],
+                            rows,
+                            total,
+                        },
+                        coverage,
+                    ));
+                };
+                // Lists have no MATCH: walk them in chunks and keep the
+                // matches, each with its real index so edits and deletes
+                // still address the right element. Every item crosses the
+                // network to be matched, so the walk is held to a byte budget
+                // too, and chunks shrink when items are large.
+                let mut rows = Vec::new();
+                let mut start = 0u64;
+                let mut pace = Pace::new(byte_budget);
+                while start < total && start < budget && rows.len() <= lim && pace.room() {
+                    let want = (pace.chunk() as u64).min(budget - start);
+                    let end = start + want - 1;
+                    let items: Vec<Vec<u8>> = c
+                        .lrange(decode_key(name), start as isize, end as isize)
+                        .await?;
+                    if items.is_empty() {
+                        break;
+                    }
+                    pace.took(items.len(), items.iter().map(Vec::len).sum());
+                    for (i, v) in items.iter().enumerate() {
+                        if crate::glob::matches(pattern.as_bytes(), v) {
+                            let index = (start + i as u64).to_string();
+                            rows.push(RawRow {
+                                id: index.clone(),
+                                cells: vec![RawCell::Text(index), RawCell::Bytes(v.clone())],
+                            });
+                        }
+                    }
+                    start += items.len() as u64;
                 }
+                let complete = start >= total && rows.len() <= lim;
+                rows.truncate(lim);
+                (
+                    RawValue::Rows {
+                        headers: vec!["index", "value"],
+                        rows,
+                        total,
+                    },
+                    Coverage {
+                        filtered: true,
+                        complete,
+                        examined: start.min(total),
+                    },
+                )
             }
             KeyType::Set => {
                 let total: u64 = c.scard(decode_key(name)).await?;
-                let mut rows = Vec::new();
-                let mut cursor: u64 = 0;
-                loop {
-                    let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SSCAN")
-                        .arg(decode_key(name))
-                        .arg(cursor)
-                        .arg("COUNT")
-                        .arg(200)
-                        .query_async(&mut c)
-                        .await?;
-                    for m in batch {
-                        let m = decode_value(m);
-                        rows.push(Row {
-                            id: m.clone(),
-                            cells: vec![m],
-                        });
-                    }
-                    cursor = next;
-                    if cursor == 0 || rows.len() >= lim {
-                        break;
-                    }
-                }
+                let scan = self
+                    .scan_elements("SSCAN", name, filter, lim, 1, budget)
+                    .await?;
+                let mut rows: Vec<RawRow> = scan
+                    .items
+                    .iter()
+                    .map(|m| RawRow {
+                        id: decode_value(m.clone()),
+                        cells: vec![RawCell::Bytes(m.clone())],
+                    })
+                    .collect();
+                let coverage = scan.coverage(rows.len(), lim, total, filter.is_some());
                 rows.truncate(lim);
                 rows.sort_by(|a, b| a.id.cmp(&b.id));
-                KeyValue::Rows {
-                    headers: vec!["member"],
-                    rows,
-                    total,
-                }
+                (
+                    RawValue::Rows {
+                        headers: vec!["member"],
+                        rows,
+                        total,
+                    },
+                    coverage,
+                )
             }
             KeyType::ZSet => {
                 let total: u64 = c.zcard(decode_key(name)).await?;
-                let items: Vec<(Vec<u8>, f64)> = c
-                    .zrange_withscores(decode_key(name), 0, lim as isize - 1)
-                    .await?;
+                let (items, coverage) = match filter {
+                    None => {
+                        let items: Vec<(Vec<u8>, f64)> = c
+                            .zrange_withscores(decode_key(name), 0, lim as isize - 1)
+                            .await?;
+                        let coverage = Coverage {
+                            filtered: false,
+                            complete: items.len() as u64 >= total,
+                            examined: items.len() as u64,
+                        };
+                        (items, coverage)
+                    }
+                    Some(_) => {
+                        // Scan to the budget rather than stopping at the first
+                        // `lim` matches, so what is shown is the lowest scores
+                        // among everything examined, not an arbitrary subset.
+                        let scan = self
+                            .scan_elements("ZSCAN", name, filter, usize::MAX, 2, budget)
+                            .await?;
+                        let mut flat = scan.items.iter();
+                        let mut items = Vec::new();
+                        while let (Some(m), Some(s)) = (flat.next(), flat.next()) {
+                            let score = std::str::from_utf8(s)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(f64::NAN);
+                            items.push((m.clone(), score));
+                        }
+                        // ZSCAN hands members back in no order; show them in
+                        // score order, the way the unfiltered view does.
+                        items.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                        let coverage = scan.coverage(items.len(), lim, total, true);
+                        items.truncate(lim);
+                        (items, coverage)
+                    }
+                };
                 let rows = items
                     .into_iter()
-                    .map(|(m, s)| {
-                        let m = decode_value(m);
-                        Row {
-                            id: m.clone(),
-                            cells: vec![m, format_score(s)],
-                        }
+                    .map(|(m, s)| RawRow {
+                        id: decode_value(m.clone()),
+                        cells: vec![RawCell::Bytes(m), RawCell::Text(format_score(s))],
                     })
                     .collect();
-                KeyValue::Rows {
-                    headers: vec!["member", "score"],
-                    rows,
-                    total,
-                }
+                (
+                    RawValue::Rows {
+                        headers: vec!["member", "score"],
+                        rows,
+                        total,
+                    },
+                    coverage,
+                )
             }
             KeyType::Stream => {
                 let total: u64 = c.xlen(decode_key(name)).await?;
-                let raw: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XREVRANGE")
-                    .arg(decode_key(name))
-                    .arg("+")
-                    .arg("-")
-                    .arg("COUNT")
-                    .arg(lim)
-                    .query_async(&mut c)
-                    .await?;
-                let rows = raw
-                    .into_iter()
-                    .map(|(id, flat)| {
-                        let fields = flat
-                            .chunks(2)
-                            .map(|p| match p {
-                                [f, v] => {
-                                    format!(
-                                        "{}={}",
-                                        decode_value(f.clone()),
-                                        decode_value(v.clone())
-                                    )
-                                }
-                                [f] => decode_value(f.clone()),
-                                _ => String::new(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("  ");
-                        Row {
-                            id: id.clone(),
-                            cells: vec![id, fields],
+                let entry = |(id, flat): (String, Vec<Vec<u8>>)| RawRow {
+                    id: id.clone(),
+                    cells: vec![RawCell::Text(id), RawCell::Fields(flat)],
+                };
+                let Some(pattern) = filter else {
+                    let raw: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XREVRANGE")
+                        .arg(decode_key(name))
+                        .arg("+")
+                        .arg("-")
+                        .arg("COUNT")
+                        .arg(lim)
+                        .query_async(&mut c)
+                        .await?;
+                    let rows: Vec<RawRow> = raw.into_iter().map(entry).collect();
+                    let coverage = Coverage {
+                        filtered: false,
+                        complete: rows.len() as u64 >= total,
+                        examined: rows.len() as u64,
+                    };
+                    return Ok((
+                        RawValue::Rows {
+                            headers: vec!["id", "fields"],
+                            rows,
+                            total,
+                        },
+                        coverage,
+                    ));
+                };
+                // Newest first, a chunk at a time, keeping entries where any
+                // field name or value matches.
+                let mut rows = Vec::new();
+                let mut end = "+".to_string();
+                let mut examined = 0u64;
+                let mut reached_start = false;
+                let mut pace = Pace::new(byte_budget);
+                while examined < budget && rows.len() <= lim && pace.room() {
+                    let asked = pace.chunk().min((budget - examined) as usize);
+                    let chunk: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XREVRANGE")
+                        .arg(decode_key(name))
+                        .arg(&end)
+                        .arg("-")
+                        .arg("COUNT")
+                        .arg(asked)
+                        .query_async(&mut c)
+                        .await?;
+                    examined += chunk.len() as u64;
+                    pace.took(
+                        chunk.len(),
+                        chunk
+                            .iter()
+                            .map(|(_, flat)| flat.iter().map(Vec::len).sum::<usize>())
+                            .sum(),
+                    );
+                    let next = chunk.last().and_then(|(id, _)| previous_stream_id(id));
+                    let short = chunk.len() < asked;
+                    for (id, flat) in chunk {
+                        if flat
+                            .iter()
+                            .any(|part| crate::glob::matches(pattern.as_bytes(), part))
+                        {
+                            rows.push(entry((id, flat)));
                         }
-                    })
-                    .collect();
-                KeyValue::Rows {
-                    headers: vec!["id", "fields"],
-                    rows,
-                    total,
+                    }
+                    match next {
+                        Some(next) if !short => end = next,
+                        _ => {
+                            reached_start = true;
+                            break;
+                        }
+                    }
                 }
+                let complete = reached_start && rows.len() <= lim;
+                rows.truncate(lim);
+                (
+                    RawValue::Rows {
+                        headers: vec!["id", "fields"],
+                        rows,
+                        total,
+                    },
+                    Coverage {
+                        filtered: true,
+                        complete,
+                        examined: if complete { total } else { examined.min(total) },
+                    },
+                )
             }
             KeyType::Json => {
                 let doc: Option<Vec<u8>> = redis::cmd("JSON.GET")
@@ -1249,7 +1474,10 @@ impl Client {
                     .arg(".")
                     .query_async(&mut c)
                     .await?;
-                KeyValue::Str(doc.map(decode_value).unwrap_or_else(|| "null".into()))
+                (
+                    RawValue::Doc(doc.map(decode_value).unwrap_or_else(|| "null".into())),
+                    whole(1),
+                )
             }
             KeyType::TimeSeries => {
                 let raw: Vec<(u64, f64)> = redis::cmd("TS.RANGE")
@@ -1261,23 +1489,92 @@ impl Client {
                     .query_async(&mut c)
                     .await?;
                 let total = raw.len() as u64;
+                let coverage = Coverage {
+                    filtered: false,
+                    // TS.RANGE has no cheap total; a short page is the end.
+                    complete: raw.len() < lim,
+                    examined: total,
+                };
                 let rows = raw
                     .into_iter()
-                    .map(|(ts, v)| Row {
+                    .map(|(ts, v)| RawRow {
                         id: ts.to_string(),
-                        cells: vec![ts.to_string(), format_score(v)],
+                        cells: vec![
+                            RawCell::Text(ts.to_string()),
+                            RawCell::Text(format_score(v)),
+                        ],
                     })
                     .collect();
-                KeyValue::Rows {
-                    headers: vec!["timestamp", "value"],
-                    rows,
-                    total,
+                (
+                    RawValue::Rows {
+                        headers: vec!["timestamp", "value"],
+                        rows,
+                        total,
+                    },
+                    coverage,
+                )
+            }
+            KeyType::Other => (
+                RawValue::Unsupported(
+                    "This key's type has no viewer yet. Use the command console (:) to inspect it."
+                        .into(),
+                ),
+                whole(0),
+            ),
+        })
+    }
+
+    /// Walk a hash, set or sorted set with its `*SCAN` command until `want`
+    /// elements are in hand, the cursor comes back to 0, or a filtered walk
+    /// has looked at `budget` elements. `per_item` is how many reply entries
+    /// make one element (2 for field/value and member/score pairs).
+    async fn scan_elements(
+        &self,
+        command: &str,
+        name: &str,
+        filter: Option<&str>,
+        want: usize,
+        per_item: usize,
+        budget: u64,
+    ) -> Result<Scanned> {
+        let mut c = self.mgr.clone();
+        // Unfiltered walks keep the batch size they always had. A filter
+        // mostly returns nothing per call, so it asks for more work per call.
+        let count = if filter.is_some() { FILTER_CHUNK } else { 200 };
+        let mut items = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: u64 = 0;
+        let mut examined = 0u64;
+        loop {
+            let mut cmd = redis::cmd(command);
+            cmd.arg(decode_key(name)).arg(cursor);
+            if let Some(pattern) = filter {
+                cmd.arg("MATCH").arg(pattern);
+            }
+            cmd.arg("COUNT").arg(count);
+            let (next, batch): (u64, Vec<Vec<u8>>) = cmd.query_async(&mut c).await?;
+            // SCAN may return an element twice while the collection rehashes.
+            let mut batch = batch.into_iter();
+            while let Some(first) = batch.next() {
+                let rest: Vec<Vec<u8>> = batch.by_ref().take(per_item - 1).collect();
+                if seen.insert(first.clone()) {
+                    items.push(first);
+                    items.extend(rest);
                 }
             }
-            KeyType::Other => KeyValue::Unsupported(
-                "This key's type has no viewer yet. Use the command console (:) to inspect it."
-                    .into(),
-            ),
+            examined += count as u64;
+            cursor = next;
+            if cursor == 0
+                || items.len() / per_item >= want
+                || (filter.is_some() && examined >= budget)
+            {
+                break;
+            }
+        }
+        Ok(Scanned {
+            items,
+            finished: cursor == 0,
+            examined,
         })
     }
 
@@ -1399,6 +1696,36 @@ impl Client {
     /// Redis has no delete-by-index. Overwrite the slot with a unique sentinel,
     /// then LREM it — the standard swap-and-trim, made safe by a sentinel that
     /// cannot collide with real data.
+    /// Remove the item at `index`, but only if it still holds `expected`.
+    /// Lists shift under concurrent pushes and pops, so an index read a
+    /// moment ago can already name a different item. Returns false, having
+    /// changed nothing, when it does.
+    pub async fn list_remove_checked(
+        &self,
+        name: &str,
+        index: isize,
+        expected: &[u8],
+    ) -> Result<bool> {
+        const REMOVE: &str = r#"
+local current = redis.call('LINDEX', KEYS[1], ARGV[1])
+if current ~= ARGV[2] then return 0 end
+redis.call('LSET', KEYS[1], ARGV[1], ARGV[3])
+redis.call('LREM', KEYS[1], 1, ARGV[3])
+return 1
+"#;
+        let mut c = self.mgr.clone();
+        let removed: i64 = redis::cmd("EVAL")
+            .arg(REMOVE)
+            .arg(1)
+            .arg(decode_key(name))
+            .arg(index)
+            .arg(expected)
+            .arg(sentinel())
+            .query_async(&mut c)
+            .await?;
+        Ok(removed == 1)
+    }
+
     pub async fn list_remove_at(&self, name: &str, index: isize) -> Result<()> {
         let mut c = self.mgr.clone();
         let sentinel = sentinel();
@@ -1780,11 +2107,14 @@ impl Client {
         let needle = needle.to_lowercase();
         let mut hits = Vec::new();
         for key in candidates {
-            let Ok(value) = self.read_value(&key.name, key.kind).await else {
+            // Compressed and packed values are searched as their decoded text.
+            let Ok((value, _)) = self.read_value_as(&key.name, key.kind, &View::Auto).await else {
                 continue;
             };
             let found = match &value {
-                KeyValue::Str(s) => s.to_lowercase().contains(&needle),
+                KeyValue::Str(s) | KeyValue::Decoded { text: s, .. } => {
+                    s.to_lowercase().contains(&needle)
+                }
                 KeyValue::Rows { rows, .. } => rows
                     .iter()
                     .any(|r| r.cells.iter().any(|c| c.to_lowercase().contains(&needle))),
@@ -2170,6 +2500,314 @@ fn decode_value(bytes: Vec<u8>) -> String {
     }
 }
 
+/// Most of a `MONITOR` line's detail the feed keeps.
+pub const MONITOR_DETAIL_LIMIT: usize = 2 * 1024;
+
+/// One line of `MONITOR` output, split for the feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorLine {
+    /// The command name, upper case: `SET`, `HGETALL`.
+    pub command: String,
+    /// Database and client, then the arguments as Redis quoted them:
+    /// `db0 127.0.0.1:52100  "user:1" "ada"`.
+    pub detail: String,
+}
+
+impl MonitorLine {
+    /// The line as the feed keeps it. Arguments can be megabytes of escaped
+    /// binary, so the detail is cut to [`MONITOR_DETAIL_LIMIT`] with a note of
+    /// how much was left out. Filter before calling this, on the whole line.
+    pub fn shortened(mut self) -> Self {
+        if self.detail.len() > MONITOR_DETAIL_LIMIT {
+            let extra = self.detail.len() - MONITOR_DETAIL_LIMIT;
+            let mut cut = MONITOR_DETAIL_LIMIT;
+            while !self.detail.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.detail.truncate(cut);
+            self.detail.push_str(&format!(" … {extra} more bytes"));
+        }
+        self
+    }
+}
+
+/// Split a `MONITOR` line such as
+/// `1718000000.123456 [0 127.0.0.1:52100] "set" "user:1" "ada"`.
+/// The timestamp is dropped: the feed stamps arrival itself.
+pub fn parse_monitor_line(line: &str) -> Option<MonitorLine> {
+    let (_, rest) = line.split_once(' ')?;
+    let rest = rest.strip_prefix('[')?;
+    let (source, args) = rest.split_once("] ")?;
+    let (db, client) = source.split_once(' ')?;
+    let args = args.trim_start();
+    let quoted = args.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    let command = quoted[..end].to_ascii_uppercase();
+    let arguments = quoted[end + 1..].trim_start();
+    Some(MonitorLine {
+        command,
+        detail: format!("db{db} {client}  {arguments}")
+            .trim_end()
+            .to_string(),
+    })
+}
+
+/// A stored value as text: itself when it is UTF-8, a hex dump when it is not.
+pub fn text_or_dump(bytes: Vec<u8>) -> String {
+    decode_value(bytes)
+}
+
+/// Which part of a collection a read covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Window {
+    /// Most elements to return.
+    pub limit: usize,
+    /// A Redis glob: only elements matching it are returned. Hash fields and
+    /// set and sorted-set members are matched by the server; list items and
+    /// stream field names and values are matched here. Always the stored bytes.
+    pub filter: Option<String>,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self {
+            limit: VALUE_LIMIT,
+            filter: None,
+        }
+    }
+}
+
+/// How much of a collection a read covered, for the value pane header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// The read was filtered.
+    pub filtered: bool,
+    /// Every element was looked at and every match returned: loading more
+    /// would change nothing.
+    pub complete: bool,
+    /// About how many elements were looked at.
+    pub examined: u64,
+}
+
+impl Coverage {
+    /// What a read with no window information covered, judged from its rows.
+    pub fn of(value: &KeyValue) -> Self {
+        match value {
+            KeyValue::Rows { rows, total, .. } => Self {
+                filtered: false,
+                complete: rows.len() as u64 >= *total,
+                examined: rows.len() as u64,
+            },
+            _ => Self {
+                filtered: false,
+                complete: true,
+                examined: 1,
+            },
+        }
+    }
+}
+
+/// A value read through a view and a window.
+#[derive(Clone, Debug)]
+pub struct Read {
+    pub value: KeyValue,
+    /// Why part of the value could not be shown through the chosen view.
+    pub notice: Option<String>,
+    pub coverage: Coverage,
+}
+
+/// What a `*SCAN` walk collected.
+struct Scanned {
+    items: Vec<Vec<u8>>,
+    /// The cursor came back to 0: nothing was left unvisited.
+    finished: bool,
+    examined: u64,
+}
+
+impl Scanned {
+    fn coverage(&self, found: usize, limit: usize, total: u64, filtered: bool) -> Coverage {
+        let complete = self.finished && found <= limit;
+        let examined = if complete {
+            total
+        } else if filtered {
+            self.examined.min(total)
+        } else {
+            found.min(limit) as u64
+        };
+        Coverage {
+            filtered,
+            complete,
+            examined,
+        }
+    }
+}
+
+/// How big the next chunk of a locally matched walk should be. Starts small,
+/// grows to [`FILTER_CHUNK`] for small elements and shrinks for large ones,
+/// so one reply never carries much more than [`CHUNK_BYTES`].
+struct Pace {
+    chunk: usize,
+    left: usize,
+}
+
+impl Pace {
+    fn new(bytes: usize) -> Self {
+        Self {
+            chunk: 64,
+            left: bytes,
+        }
+    }
+
+    fn chunk(&self) -> usize {
+        self.chunk
+    }
+
+    /// Whether the byte budget has any room left.
+    fn room(&self) -> bool {
+        self.left > 0
+    }
+
+    fn took(&mut self, elements: usize, bytes: usize) {
+        self.left = self.left.saturating_sub(bytes);
+        if let Some(average) = bytes.checked_div(elements) {
+            // Shrink at once for large items, but grow at most twofold per
+            // chunk, so a jump from tiny to huge items costs one small chunk.
+            let target = (CHUNK_BYTES / average.max(1)).clamp(1, FILTER_CHUNK);
+            self.chunk = target.min(self.chunk * 2);
+        }
+    }
+}
+
+/// The stream id just before `id`, for walking backwards with an exclusive
+/// end on servers older than 6.2, which have no `(id` syntax.
+fn previous_stream_id(id: &str) -> Option<String> {
+    let (ms, seq) = id.split_once('-')?;
+    let (ms, seq): (u64, u64) = (ms.parse().ok()?, seq.parse().ok()?);
+    match (ms, seq) {
+        (_, s) if s > 0 => Some(format!("{ms}-{}", s - 1)),
+        (m, _) if m > 0 => Some(format!("{}-{}", m - 1, u64::MAX)),
+        _ => None,
+    }
+}
+
+/// A value as read from the server, before any codec has looked at it.
+enum RawValue {
+    Str(Vec<u8>),
+    /// A RedisJSON document: always text, never passed through a codec.
+    Doc(String),
+    Rows {
+        headers: Vec<&'static str>,
+        rows: Vec<RawRow>,
+        total: u64,
+    },
+    Unsupported(String),
+}
+
+struct RawRow {
+    id: String,
+    cells: Vec<RawCell>,
+}
+
+enum RawCell {
+    /// Indexes, hash field names, scores, stream ids: shown as they are.
+    Text(String),
+    /// An element's value, which a codec may decode.
+    Bytes(Vec<u8>),
+    /// A stream entry's flat field/value list; the values may be decoded.
+    Fields(Vec<Vec<u8>>),
+}
+
+/// Turn a raw read into what the value pane shows, decoding through `view`.
+/// With [`View::Plain`] this is exactly what the pane has always shown.
+fn materialize(raw: RawValue, view: &View) -> (KeyValue, Option<String>) {
+    let mut failures = 0usize;
+    let mut first_error = None;
+    // One budget for the whole value: each element may use what the ones
+    // before it left, in bytes and in time for a custom codec's program.
+    let mut budget = crate::codec::Budget::new(DECODE_BUDGET);
+    let mut cell = |bytes: Vec<u8>| -> (String, Option<Decoding>) {
+        match crate::codec::show_with(bytes, view, &mut budget) {
+            Shown::Plain(text) => (text, None),
+            Shown::Decoded { text, decoding } => (text, Some(decoding)),
+            Shown::Failed { text, error } => {
+                failures += 1;
+                first_error.get_or_insert(error);
+                (text, None)
+            }
+        }
+    };
+    let value = match raw {
+        RawValue::Str(bytes) => match cell(bytes) {
+            (text, None) => KeyValue::Str(text),
+            (text, Some(decoding)) => KeyValue::Decoded { text, decoding },
+        },
+        RawValue::Doc(text) => KeyValue::Str(text),
+        RawValue::Unsupported(msg) => KeyValue::Unsupported(msg),
+        RawValue::Rows {
+            headers,
+            rows,
+            total,
+        } => {
+            let rows = rows
+                .into_iter()
+                .map(|row| {
+                    let mut decoded = None;
+                    let cells = row
+                        .cells
+                        .into_iter()
+                        .map(|c| match c {
+                            RawCell::Text(text) => text,
+                            RawCell::Bytes(bytes) => {
+                                let (text, decoding) = cell(bytes);
+                                decoded = decoded.take().or(decoding);
+                                text
+                            }
+                            RawCell::Fields(flat) => {
+                                let mut flat = flat.into_iter();
+                                let mut parts = Vec::new();
+                                while let Some(f) = flat.next() {
+                                    let f = decode_value(f);
+                                    match flat.next() {
+                                        Some(v) => {
+                                            let (v, decoding) = cell(v);
+                                            decoded = decoded.take().or(decoding);
+                                            parts.push(format!("{f}={v}"));
+                                        }
+                                        None => parts.push(f),
+                                    }
+                                }
+                                parts.join("  ")
+                            }
+                        })
+                        .collect();
+                    Row {
+                        id: row.id,
+                        cells,
+                        decoding: decoded,
+                    }
+                })
+                .collect();
+            KeyValue::Rows {
+                headers,
+                rows,
+                total,
+            }
+        }
+    };
+    let notice = first_error.map(|error| {
+        let codec = match view {
+            View::Codec(codec) => codec.name().to_string(),
+            _ => "the codec".into(),
+        };
+        if matches!(value, KeyValue::Rows { .. }) {
+            format!("{failures} element(s) could not be read as {codec} and are shown as stored: {error}")
+        } else {
+            format!("Could not read this value as {codec}; showing it as stored: {error}")
+        }
+    });
+    (value, notice)
+}
+
 /// Opens every hex dump, so a dump can be recognised again and never written
 /// back to the server as if it were the value it describes.
 pub const BINARY_MARKER: &str = "<binary, ";
@@ -2446,6 +3084,100 @@ pub fn is_destructive(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_lines_split_into_command_and_detail() {
+        let line = parse_monitor_line(
+            r#"1718000000.123456 [0 127.0.0.1:52100] "set" "user:1" "ada lovelace""#,
+        )
+        .unwrap();
+        assert_eq!(line.command, "SET");
+        assert_eq!(
+            line.detail,
+            r#"db0 127.0.0.1:52100  "user:1" "ada lovelace""#
+        );
+
+        let lua = parse_monitor_line(r#"1718000000.1 [3 lua] "incr" "hits""#).unwrap();
+        assert_eq!(
+            (lua.command.as_str(), lua.detail.as_str()),
+            ("INCR", r#"db3 lua  "hits""#)
+        );
+
+        let unix = parse_monitor_line(r#"1.0 [0 unix:/tmp/redis.sock] "ping""#).unwrap();
+        assert_eq!(unix.command, "PING");
+        assert_eq!(unix.detail, "db0 unix:/tmp/redis.sock");
+
+        let escaped =
+            parse_monitor_line(r#"1.0 [0 1.2.3.4:5] "set" "k" "say \"hi\" \x00""#).unwrap();
+        assert_eq!(escaped.detail, r#"db0 1.2.3.4:5  "k" "say \"hi\" \x00""#);
+
+        for junk in ["OK", "", "1.0 no brackets", "1.0 [0 x] no quotes"] {
+            assert_eq!(parse_monitor_line(junk), None, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn monitor_details_are_cut_to_a_glimpse() {
+        let big = "x".repeat(MONITOR_DETAIL_LIMIT * 3);
+        let full = parse_monitor_line(&format!(r#"1.0 [0 1.2.3.4:5] "set" "k" "{big}""#)).unwrap();
+        assert!(
+            full.detail.len() > MONITOR_DETAIL_LIMIT * 3,
+            "parsing keeps it whole"
+        );
+        let line = full.shortened();
+        assert!(
+            line.detail.len() < MONITOR_DETAIL_LIMIT + 40,
+            "{}",
+            line.detail.len()
+        );
+        assert!(
+            line.detail.ends_with("more bytes"),
+            "{}",
+            &line.detail[line.detail.len() - 30..]
+        );
+    }
+
+    #[test]
+    fn a_walk_paces_its_chunks_by_element_size() {
+        let mut pace = Pace::new(10 * CHUNK_BYTES);
+        assert_eq!(pace.chunk(), 64, "starts small before sizes are known");
+        pace.took(64, 64 * 100);
+        assert_eq!(pace.chunk(), 128, "small elements: grows, at most twofold");
+        for _ in 0..5 {
+            pace.took(pace.chunk(), pace.chunk() * 100);
+        }
+        assert_eq!(pace.chunk(), FILTER_CHUNK, "until full chunks");
+        pace.took(10, 10 * 1024 * 1024);
+        assert_eq!(pace.chunk(), 4, "megabyte elements: a few at a time");
+        pace.took(1, 10 * 1024 * 1024);
+        assert_eq!(pace.chunk(), 1, "ten-megabyte elements: one at a time");
+        assert!(pace.room());
+        pace.took(1, 100 * CHUNK_BYTES);
+        assert!(!pace.room(), "the byte budget is spent");
+    }
+
+    #[test]
+    fn stream_ids_step_back_across_the_millisecond() {
+        assert_eq!(previous_stream_id("5-3").as_deref(), Some("5-2"));
+        assert_eq!(
+            previous_stream_id("5-0").as_deref(),
+            Some("4-18446744073709551615")
+        );
+        assert_eq!(previous_stream_id("0-0"), None);
+        assert_eq!(previous_stream_id("garbage"), None);
+    }
+
+    #[test]
+    fn coverage_of_a_plain_read_follows_its_rows() {
+        let rows = |n: usize, total: u64| KeyValue::Rows {
+            headers: vec!["member"],
+            rows: vec![Row::default(); n],
+            total,
+        };
+        assert!(Coverage::of(&rows(3, 3)).complete);
+        assert!(!Coverage::of(&rows(1000, 5000)).complete);
+        assert!(Coverage::of(&KeyValue::Str("x".into())).complete);
+    }
 
     #[test]
     fn key_names_round_trip_through_their_escaped_form() {

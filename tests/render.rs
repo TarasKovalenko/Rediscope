@@ -79,10 +79,12 @@ fn populate(app: &mut App) {
                 Row {
                     id: "name".into(),
                     cells: vec!["name".into(), "ada".into()],
+                    decoding: None,
                 },
                 Row {
                     id: "bio".into(),
                     cells: vec!["bio".into(), "multi\nline\tvalue".into()],
+                    decoding: None,
                 },
             ],
             total: 2,
@@ -245,6 +247,7 @@ async fn previews_structured_list_values_and_handles_long_editor_titles() {
                     "0".into(),
                     "<key id=\"abc\"><creationDate>2026-09-04</creationDate><descriptor><masterKey requiresEncryption=\"true\"><value>protected</value></masterKey></descriptor></key>".into(),
                 ],
+                decoding: None,
             }],
             total: 1,
         },
@@ -756,6 +759,7 @@ fn conflict_preview_is_readable_and_survives_small_terminals() {
             kind: KeyType::String,
             selector: String::new(),
             original: "original value".into(),
+            decoded: None,
         },
         values: vec!["my unsaved draft".into()],
         current: Some("concurrent writer".into()),
@@ -773,4 +777,129 @@ fn conflict_preview_is_readable_and_survives_small_terminals() {
         assert!(text.contains(expected), "missing {expected}");
     }
     render_all_sizes(&mut app);
+}
+
+#[tokio::test]
+async fn decoded_values_and_the_view_picker_render_at_any_size() {
+    use rediscope::codec::{Builtin, Codec, Decoding};
+    let mut a = app();
+    populate(&mut a);
+    let gzip = Decoding {
+        codec: Codec::Builtin(Builtin::Gzip),
+        raw: vec![0x1f, 0x8b, 0x08, 0x00],
+        read_only: None,
+    };
+    a.on_msg(Msg::Value {
+        info: key("app:user:1", KeyType::String, -1),
+        value: KeyValue::Decoded {
+            text: "{\"plan\":\"pro\"}".into(),
+            decoding: gzip.clone(),
+        },
+    });
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 120, 40);
+    assert!(screen.contains("gzip"), "the codec is named in the header");
+    assert!(screen.contains("json"), "the decoded text is still JSON");
+    assert!(screen.contains("\"plan\""), "the decoded text is shown");
+    assert!(screen.contains("4 byte(s) stored"), "{screen}");
+
+    // Decoded collection elements, one of them read-only.
+    a.on_msg(Msg::Value {
+        info: key("app:user:2", KeyType::Hash, 3600),
+        value: KeyValue::Rows {
+            headers: vec!["field", "value"],
+            rows: vec![
+                Row {
+                    id: "doc".into(),
+                    cells: vec!["doc".into(), "{\"a\":1}".into()],
+                    decoding: Some(gzip.clone()),
+                },
+                Row {
+                    id: "bin".into(),
+                    cells: vec!["bin".into(), "<binary, 3 bytes>\n".into()],
+                    decoding: Some(Decoding {
+                        read_only: Some("not text".into()),
+                        ..gzip.clone()
+                    }),
+                },
+            ],
+            total: 2,
+        },
+    });
+    render_all_sizes(&mut a);
+    assert!(render_text(&mut a, 120, 40).contains("gzip (read-only)"));
+
+    press(&mut a, KeyCode::Char('v'));
+    assert!(matches!(a.modal, Some(Modal::ViewPicker { .. })));
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 120, 40);
+    for label in ["auto", "plain", "gzip", "zstd", "msgpack", "hex"] {
+        assert!(screen.contains(label), "{label} missing from the picker");
+    }
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none());
+    assert!(render_text(&mut a, 120, 40).contains("plain"));
+}
+
+#[tokio::test]
+async fn the_monitor_feed_and_filtered_collections_render_at_any_size() {
+    let mut a = app();
+    populate(&mut a);
+
+    // A filtered hash that has not been searched to the end.
+    a.value_window.filter = Some("user:*".into());
+    a.on_msg(Msg::Value {
+        info: key("app:user:2", KeyType::Hash, 3600),
+        value: KeyValue::Rows {
+            headers: vec!["field", "value"],
+            rows: vec![Row {
+                id: "user:1".into(),
+                cells: vec!["user:1".into(), "ada".into()],
+                decoding: None,
+            }],
+            total: 250_000,
+        },
+    });
+    a.value_coverage = rediscope::redis_client::Coverage {
+        filtered: true,
+        complete: false,
+        examined: 100_000,
+    };
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 140, 40);
+    assert!(screen.contains("filter user:*: 1 match(es)"), "{screen}");
+    assert!(screen.contains("searched 100000 of 250000"), "{screen}");
+
+    // An unfiltered first page offers more.
+    a.value_window.filter = None;
+    a.value_coverage = rediscope::redis_client::Coverage::default();
+    render_all_sizes(&mut a);
+    assert!(render_text(&mut a, 140, 40).contains("showing 1 of 250000 · + loads more"));
+
+    // The tree says more keys can be loaded.
+    a.truncated = true;
+    a.pattern = "*".into();
+    assert!(render_text(&mut a, 160, 40).contains("TRUNCATED (+ more)"));
+
+    // The command monitor, with a burst it could not keep up with.
+    let mut feed = rediscope::app::PubSubState::monitor(vec!["user:*".into()]);
+    feed.push(
+        "SET".into(),
+        "db0 10.0.0.7:51234  \"user:1\" \"ada\"".into(),
+    );
+    feed.push("GET".into(), "db0 10.0.0.7:51234  \"user:1\"".into());
+    feed.push_dropped(1_234);
+    a.modal = Some(Modal::PubSub(feed));
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 140, 40);
+    assert!(screen.contains("Command monitor"), "{screen}");
+    assert!(screen.contains("cmd/s"), "{screen}");
+    assert!(screen.contains("1234 too fast to show"), "{screen}");
+    assert!(screen.contains("Commands"), "{screen}");
+
+    // An empty monitor explains what it is waiting for.
+    a.modal = Some(Modal::PubSub(rediscope::app::PubSubState::monitor(vec![])));
+    render_all_sizes(&mut a);
+    assert!(render_text(&mut a, 140, 40).contains("waiting for commands"));
 }

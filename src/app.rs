@@ -3,21 +3,23 @@
 //! Every Redis call runs on a spawned task and reports back over an mpsc
 //! channel, so the UI thread never awaits the network.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::codec::View;
 use crate::config::{Connection, Store};
 use crate::history::History;
 use crate::input::{Completion, InputBuf, ReverseSearch, complete};
 use crate::json::{self, JsonMode};
 use crate::memory::{PrefixRow, Rollup};
 use crate::redis_client::{
-    Client, CommandTable, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT, KeyInfo,
-    KeyType, KeyValue, ServerInfo, StreamGroup, StreamGroupDetail, is_destructive,
+    Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT,
+    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, ServerInfo, StreamGroup, StreamGroupDetail,
+    VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
 };
 use crate::theme::Theme;
 use crate::tree::{Tree, VisibleRow};
@@ -48,6 +50,24 @@ pub enum Msg {
         info: KeyInfo,
         value: KeyValue,
     },
+    /// A value read started by [`App::reload_value`]. Only the reply to the
+    /// latest read is shown: an earlier one, still decoding when the view or
+    /// the key changed, would put back what the user just moved away from.
+    Loaded {
+        seq: u64,
+        info: KeyInfo,
+        value: KeyValue,
+        /// Why part of the value could not be shown through the chosen view.
+        notice: Option<String>,
+        /// How much of a collection the read covered.
+        coverage: Coverage,
+    },
+    /// A value read started by [`App::reload_value`] failed. Ignored unless it
+    /// is the latest read, like [`Msg::Loaded`].
+    LoadFailed {
+        seq: u64,
+        error: String,
+    },
     /// A write finished; `Ok` carries the status line to show.
     Mutated(Result<String, String>),
     EditCompleted {
@@ -70,6 +90,12 @@ pub enum Msg {
     PubSub {
         channel: String,
         payload: String,
+    },
+    /// Commands seen by `MONITOR` since the last batch, as (command, detail),
+    /// and how many more arrived than a batch keeps.
+    MonitorBatch {
+        lines: Vec<(String, String)>,
+        dropped: u64,
     },
     /// Consumer groups of the open stream.
     Groups(Box<Result<Vec<StreamGroup>, String>>),
@@ -143,6 +169,9 @@ pub enum Action {
     ListDel {
         key: String,
         index: isize,
+        /// The item's stored bytes as read, when known: the delete only goes
+        /// ahead if the index still holds them.
+        expected: Option<Vec<u8>>,
     },
     SetAdd(String),
     SetDel {
@@ -164,6 +193,10 @@ pub enum Action {
     RunCommand(String),
     /// Subscribe the pub/sub feed to the typed patterns.
     Subscribe,
+    /// Start `MONITOR`, after a production profile confirmed it.
+    Monitor,
+    /// Restart `MONITOR` keeping only commands matching the typed patterns.
+    MonitorFilter,
     /// Publish a message from the pub/sub feed.
     Publish,
     /// Delete every marked key.
@@ -174,6 +207,8 @@ pub enum Action {
     CopyKey(String),
     /// Search key values for a substring.
     GrepValues,
+    /// Filter the open collection's elements by a pattern.
+    FilterElements,
     /// Write keys to a file, and read them back.
     Export(Vec<String>),
     Import,
@@ -790,6 +825,12 @@ pub struct PubSubState {
     /// True when the feed is following keyspace notifications rather than
     /// application channels, which only changes how it is labelled.
     pub keyspace: bool,
+    /// True when the feed is `MONITOR` output: every command the server runs,
+    /// grouped by command name instead of channel. `patterns` then filters.
+    pub monitor: bool,
+    /// Commands that arrived faster than the feed keeps them. Counted in the
+    /// rate and total, but not shown.
+    pub dropped: u64,
     /// Newest last. Capped, so a busy channel cannot grow without bound.
     pub messages: Vec<FeedMessage>,
     /// Stopped when the modal closes, so no task outlives the view.
@@ -814,6 +855,12 @@ pub struct PubSubState {
 /// How many messages the feed keeps.
 pub const PUBSUB_LIMIT: usize = 2_000;
 
+/// How often the `MONITOR` reader hands its batch to the UI.
+pub const MONITOR_FLUSH: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Most commands one `MONITOR` batch keeps; the rest are only counted.
+pub const MONITOR_BATCH: usize = 500;
+
 /// How many seconds of traffic the rate sparkline covers.
 pub const PUBSUB_RATE_WINDOW: usize = 60;
 
@@ -822,6 +869,8 @@ impl PubSubState {
         Self {
             patterns,
             keyspace,
+            monitor: false,
+            dropped: 0,
             messages: Vec::new(),
             task: None,
             scroll: 0,
@@ -835,8 +884,34 @@ impl PubSubState {
         }
     }
 
+    /// A feed of `MONITOR` output, keeping the commands that match any of
+    /// `filters` (all of them when there are none).
+    pub fn monitor(filters: Vec<String>) -> Self {
+        let mut state = Self::new(filters, false);
+        state.monitor = true;
+        state
+    }
+
     pub fn push(&mut self, channel: String, payload: String) {
         self.push_at(channel, payload, std::time::Instant::now());
+    }
+
+    /// Count `count` commands that were not kept, so the rate and total stay
+    /// true on a server faster than the feed.
+    pub fn push_dropped(&mut self, count: u64) {
+        self.push_dropped_at(count, std::time::Instant::now());
+    }
+
+    pub fn push_dropped_at(&mut self, count: u64, at: std::time::Instant) {
+        if count == 0 {
+            return;
+        }
+        self.advance_to(at);
+        let slot = self.slot(self.bucket);
+        self.rate[slot] = self.rate[slot].saturating_add(count.min(u32::MAX as u64) as u32);
+        self.peak = self.peak.max(self.rate[slot]);
+        self.total += count;
+        self.dropped += count;
     }
 
     pub fn push_at(&mut self, channel: String, payload: String, at: std::time::Instant) {
@@ -893,6 +968,7 @@ impl PubSubState {
 
     /// Forget every message and statistic, keeping the subscription itself.
     pub fn clear(&mut self) {
+        self.dropped = 0;
         self.messages.clear();
         self.channels.clear();
         self.rate = [0; PUBSUB_RATE_WINDOW];
@@ -920,6 +996,13 @@ impl PubSubState {
     }
 
     pub fn title(&self) -> String {
+        if self.monitor {
+            return if self.patterns.is_empty() {
+                "Command monitor — every command".into()
+            } else {
+                format!("Command monitor — {}", self.patterns.join(" "))
+            };
+        }
         let what = if self.keyspace {
             "Keyspace events"
         } else {
@@ -934,6 +1017,14 @@ impl PubSubState {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+/// A feed that goes away for any reason, closed or replaced by another
+/// dialog, takes its subscription or `MONITOR` connection with it.
+impl Drop for PubSubState {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1038,6 +1129,12 @@ pub enum Modal {
         selected: usize,
         original: Theme,
     },
+    /// How to look at the open key's bytes: as stored, or through a codec.
+    ViewPicker {
+        key: String,
+        selected: usize,
+        options: Vec<View>,
+    },
     Help,
 }
 
@@ -1092,6 +1189,11 @@ pub struct App {
     pub value: Option<KeyValue>,
     pub value_state: TableState,
     pub value_scroll: u16,
+    /// Keys the user chose a view for with `v`. Every other key is read with
+    /// [`View::Auto`]. Kept for the session, and cleared on reconnect.
+    pub views: HashMap<String, View>,
+    /// The open string value's rendered lines, reused while it is unchanged.
+    pub text_cache: Option<crate::ui::TextCache>,
 
     pub modal: Option<Modal>,
 
@@ -1105,6 +1207,18 @@ pub struct App {
     /// The key a value read is in flight for. A reply for anything else has
     /// been scrolled past and must not replace what is on screen.
     pending_value: Option<String>,
+    /// Numbers every value read, so only the latest reply is shown.
+    value_seq: u64,
+    /// How many keys a scan may load, raised a page at a time with `+`, and
+    /// the pattern that limit belongs to: a new pattern starts from one page.
+    pub key_limit: usize,
+    key_limit_pattern: String,
+    /// Which part of the open collection is read: how many elements, and the
+    /// `f` filter. Belongs to `value_window_key` and resets for another key.
+    pub value_window: Window,
+    value_window_key: Option<String>,
+    /// How much of the open collection the last read covered.
+    pub value_coverage: Coverage,
 
     /// When the TTL clock last advanced.
     last_tick: std::time::Instant,
@@ -1150,10 +1264,18 @@ impl App {
             value: None,
             value_state: TableState::default(),
             value_scroll: 0,
+            views: HashMap::new(),
+            text_cache: None,
             modal: None,
             pending_selection: None,
             value_due: None,
             pending_value: None,
+            value_seq: 0,
+            key_limit: KEY_LIMIT,
+            key_limit_pattern: "*".into(),
+            value_window: Window::default(),
+            value_window_key: None,
+            value_coverage: Coverage::default(),
             last_tick: std::time::Instant::now(),
         }
     }
@@ -1172,6 +1294,8 @@ impl App {
 
     pub fn connect(&mut self, conn: Connection) {
         self.edit_session = self.edit_session.wrapping_add(1);
+        // Another server or database: the same key name may hold anything.
+        self.reset_windows();
         if let Some(client) = &self.client {
             let _ = client.lock_writes();
         }
@@ -1189,9 +1313,14 @@ impl App {
             return;
         };
         let pattern = self.pattern.clone();
+        if pattern != self.key_limit_pattern {
+            self.key_limit = KEY_LIMIT;
+            self.key_limit_pattern = pattern.clone();
+        }
+        let limit = self.key_limit;
         self.loading = true;
         self.spawn(async move {
-            match client.scan_report(&pattern, KEY_LIMIT).await {
+            match client.scan_report(&pattern, limit).await {
                 Ok(mut report) => {
                     let dbsize = match client.dbsize().await {
                         Ok(size) => size,
@@ -1225,15 +1354,59 @@ impl App {
             return;
         };
         self.pending_value = Some(name.clone());
+        self.value_seq = self.value_seq.wrapping_add(1);
+        let seq = self.value_seq;
+        let view = self.view_for(&name);
+        if self.value_window_key.as_deref() != Some(name.as_str()) {
+            self.value_window = Window::default();
+            self.value_window_key = Some(name.clone());
+        }
+        let window = self.value_window.clone();
         self.spawn(async move {
             match client.key_info(&name).await {
-                Ok(info) => match client.read_value(&info.name, info.kind).await {
-                    Ok(value) => Msg::Value { info, value },
-                    Err(e) => Msg::Error(format!("read failed: {e}")),
+                Ok(info) => match client
+                    .read_window(&info.name, info.kind, &view, &window)
+                    .await
+                {
+                    Ok(read) => Msg::Loaded {
+                        seq,
+                        info,
+                        value: read.value,
+                        notice: read.notice,
+                        coverage: read.coverage,
+                    },
+                    Err(e) => Msg::LoadFailed {
+                        seq,
+                        error: format!("read failed: {e}"),
+                    },
                 },
-                Err(e) => Msg::Error(format!("read failed: {e}")),
+                Err(e) => Msg::LoadFailed {
+                    seq,
+                    error: format!("read failed: {e}"),
+                },
             }
         });
+    }
+
+    /// Put a freshly read value in the pane, keeping the selected element when
+    /// it is the same key being refreshed.
+    fn show_value(&mut self, info: KeyInfo, value: KeyValue) {
+        let same_key = self.current.as_ref().is_some_and(|c| c.name == info.name);
+        self.current = Some(info);
+        self.value = Some(value);
+        if !same_key {
+            self.value_state.select(Some(0));
+            self.value_scroll = 0;
+        } else if let Some(KeyValue::Rows { rows, .. }) = &self.value {
+            let idx = self.value_state.selected().unwrap_or(0);
+            self.value_state
+                .select(Some(idx.min(rows.len().saturating_sub(1))));
+        }
+    }
+
+    /// How the value pane reads `key`: the view chosen for it, or auto.
+    pub fn view_for(&self, key: &str) -> View {
+        self.views.get(key).cloned().unwrap_or_default()
     }
 
     fn mutate<F, Fut>(&mut self, ok_status: &str, f: F)
@@ -1335,6 +1508,22 @@ impl App {
     // ---- message handling -------------------------------------------------
 
     pub fn on_msg(&mut self, msg: Msg) {
+        let monitoring = self.monitor_open();
+        self.handle_msg(msg);
+        // A reply that opened a dialog of its own replaced the feed, and the
+        // MONITOR connection closed with it. Say so rather than let it vanish.
+        if monitoring && !self.monitor_open() {
+            self.status = "Command monitor stopped: another dialog replaced it".into();
+        }
+    }
+
+    /// Whether a command monitor is running, on screen or set aside.
+    fn monitor_open(&self) -> bool {
+        matches!(&self.modal, Some(Modal::PubSub(s)) if s.monitor)
+            || self.held_feed.as_ref().is_some_and(|f| f.monitor)
+    }
+
+    fn handle_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Connected(result) => {
                 self.connecting = false;
@@ -1384,10 +1573,21 @@ impl App {
                 dbsize,
                 pattern,
             } => {
-                self.status = if warnings.is_empty() {
-                    "Keys refreshed".into()
-                } else {
+                self.status = if !warnings.is_empty() {
                     format!("PARTIAL RESULTS: {}", warnings.join("; "))
+                } else if truncated && self.key_limit < KEY_LIMIT_MAX {
+                    format!(
+                        "Showing the first {} matching keys · + loads {} more",
+                        keys.len(),
+                        KEY_LIMIT
+                    )
+                } else if truncated {
+                    format!(
+                        "Showing the first {} matching keys, the most one view loads · narrow the pattern with /",
+                        keys.len()
+                    )
+                } else {
+                    "Keys refreshed".into()
                 };
                 self.coverage_warnings = warnings;
                 self.loading = false;
@@ -1424,6 +1624,29 @@ impl App {
                     self.tree_state.select(Some(idx));
                 }
             }
+            Msg::Loaded {
+                seq,
+                info,
+                value,
+                notice,
+                coverage,
+            } => {
+                if seq != self.value_seq {
+                    return;
+                }
+                if let Some(notice) = notice {
+                    self.status = notice;
+                }
+                self.pending_value = None;
+                self.show_value(info, value);
+                self.value_coverage = coverage;
+            }
+            Msg::LoadFailed { seq, error } => {
+                if seq == self.value_seq {
+                    self.pending_value = None;
+                    self.on_msg(Msg::Error(error));
+                }
+            }
             Msg::Value { info, value } => {
                 // A reply for a key the cursor has already left is discarded,
                 // so a slow read can never overwrite a newer selection.
@@ -1435,17 +1658,8 @@ impl App {
                     return;
                 }
                 self.pending_value = None;
-                let same_key = self.current.as_ref().is_some_and(|c| c.name == info.name);
-                self.current = Some(info);
-                self.value = Some(value);
-                if !same_key {
-                    self.value_state.select(Some(0));
-                    self.value_scroll = 0;
-                } else if let Some(KeyValue::Rows { rows, .. }) = &self.value {
-                    let idx = self.value_state.selected().unwrap_or(0);
-                    self.value_state
-                        .select(Some(idx.min(rows.len().saturating_sub(1))));
-                }
+                self.value_coverage = Coverage::of(&value);
+                self.show_value(info, value);
             }
             Msg::EditCompleted {
                 session,
@@ -1515,6 +1729,21 @@ impl App {
                     pattern,
                 });
                 self.status = status;
+            }
+            Msg::MonitorBatch { lines, dropped } => {
+                let feed = match &mut self.modal {
+                    Some(Modal::PubSub(state)) if state.monitor => Some(state),
+                    _ => self.held_feed.as_mut().filter(|f| f.monitor),
+                };
+                match feed {
+                    Some(state) => {
+                        for (command, detail) in lines {
+                            state.push(command, detail);
+                        }
+                        state.push_dropped(dropped);
+                    }
+                    None => self.stop_feeds(),
+                }
             }
             Msg::PubSub { channel, payload } => match &mut self.modal {
                 Some(Modal::PubSub(state)) => state.push(channel, payload),
@@ -2009,7 +2238,11 @@ impl App {
                 self.should_quit = true;
             }
             KeyCode::Esc => {
-                if self.pattern != "*" {
+                // With the value pane focused, Esc drops the element filter
+                // first, the way it drops the key pattern in the tree.
+                if self.focus == Focus::Value && self.value_window.filter.is_some() {
+                    self.set_element_filter(None);
+                } else if self.pattern != "*" {
                     self.pattern = "*".into();
                     self.reload_keys();
                 }
@@ -2044,6 +2277,7 @@ impl App {
             KeyCode::Char('L') => self.prompt_lua(),
             KeyCode::Char('P') => self.prompt_pubsub(),
             KeyCode::Char('N') => self.watch_keyspace(),
+            KeyCode::Char('W') => self.prompt_monitor(),
             KeyCode::Char('S') => self.open_stream_groups(),
             KeyCode::Char('Q') => self.prompt_search(),
             KeyCode::Char('n') => self.prompt_new_key(),
@@ -2053,6 +2287,9 @@ impl App {
             KeyCode::Char('a') => self.prompt_add_item(),
             KeyCode::Char('e') | KeyCode::Char('E') => self.prompt_edit(),
             KeyCode::Char('x') => self.confirm_delete_row(),
+            KeyCode::Char('v') => self.open_view_picker(),
+            KeyCode::Char('+') => self.load_more(),
+            KeyCode::Char('f') => self.prompt_element_filter(),
             _ => match self.focus {
                 Focus::Tree => self.tree_key(key),
                 Focus::Value => self.value_key(key),
@@ -2111,6 +2348,9 @@ impl App {
                 if self.current.as_ref().map(|c| &c.name) != Some(&k.name) {
                     self.current = Some(k);
                     self.value = None;
+                    // Any read still in flight is for the key we just left.
+                    self.value_seq = self.value_seq.wrapping_add(1);
+                    self.value_coverage = Coverage::default();
                     // Wait for the cursor to settle. A reply already on its way
                     // for the key we just left is dropped when it arrives.
                     self.value_due = Some(std::time::Instant::now() + VALUE_DEBOUNCE);
@@ -2121,6 +2361,7 @@ impl App {
                 self.value = None;
                 self.value_due = None;
                 self.pending_value = None;
+                self.value_seq = self.value_seq.wrapping_add(1);
             }
         }
     }
@@ -2601,8 +2842,18 @@ impl App {
         };
         let name = k.name.clone();
         if matches!(k.kind, KeyType::String | KeyType::Json) {
-            let current = match &self.value {
-                Some(KeyValue::Str(s)) => s.clone(),
+            let (current, decoded) = match &self.value {
+                Some(KeyValue::Str(s)) => (s.clone(), None),
+                Some(KeyValue::Decoded { text, decoding }) => {
+                    if let Some(reason) = &decoding.read_only {
+                        self.status = format!(
+                            "Shown through {} and read-only: {reason}. Press v and choose plain to edit the stored value",
+                            decoding.codec.name()
+                        );
+                        return;
+                    }
+                    (text.clone(), Some(decoding.clone()))
+                }
                 _ => {
                     self.status = "Wait for the value to load before editing".into();
                     return;
@@ -2622,14 +2873,19 @@ impl App {
             } else {
                 current.clone()
             };
-            let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
+            let mut ta = TextArea::from(editor_lines(&text));
             ta.set_cursor_line_style(ratatui::style::Style::default());
+            // Through a codec the title says so: the draft is encoded again on save.
+            let via = decoded
+                .as_ref()
+                .map(|d| format!("{} ", d.codec.name()))
+                .unwrap_or_default();
             let title = if k.kind == KeyType::Json {
                 format!("Edit document '{name}'")
             } else if mode.is_json() {
-                format!("Edit JSON '{name}'")
+                format!("Edit {via}JSON '{name}'")
             } else {
-                format!("Edit string '{name}'")
+                format!("Edit {via}string '{name}'")
             };
             // A RedisJSON document is always JSON, whatever the text looks like
             // right now, so it is checked before it is written back.
@@ -2643,6 +2899,7 @@ impl App {
                 kind: k.kind,
                 selector: String::new(),
                 original: current,
+                decoded,
             });
             self.modal = Some(Modal::Editor {
                 title,
@@ -2669,6 +2926,27 @@ impl App {
                 "This element is binary and shown as a hex dump; it cannot be edited here".into();
             return;
         }
+        // An element shown through a codec is saved back through it. That is
+        // only offered where the element's value is not also its address.
+        // Streams are never edited, whatever the view: they fall through to
+        // the message that says so.
+        if let Some(decoding) = row.decoding.as_ref().filter(|_| k.kind != KeyType::Stream) {
+            if let Some(reason) = &decoding.read_only {
+                self.status = format!(
+                    "Shown through {} and read-only: {reason}. Press v and choose plain to edit the stored value",
+                    decoding.codec.name()
+                );
+                return;
+            }
+            if matches!(k.kind, KeyType::Set | KeyType::ZSet) {
+                self.status = format!(
+                    "Members shown through {} are read-only. Press v and choose plain to edit the stored member",
+                    decoding.codec.name()
+                );
+                return;
+            }
+        }
+        let decoded = row.decoding.clone();
         self.modal = Some(match k.kind {
             KeyType::Hash => Modal::Form {
                 title: format!("Edit field '{}'", row.id),
@@ -2676,7 +2954,7 @@ impl App {
                 fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
                 focus: 0,
                 error: None,
-                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default() }),
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default(), decoded }),
             },
             KeyType::List => {
                 let index: isize = row.id.parse().unwrap_or(0);
@@ -2686,7 +2964,7 @@ impl App {
                     fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
                     focus: 0,
                     error: None,
-                    action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: index.to_string(), original: row.cells.get(1).cloned().unwrap_or_default() }),
+                    action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: index.to_string(), original: row.cells.get(1).cloned().unwrap_or_default(), decoded }),
                 }
             }
             KeyType::Set => Modal::Form {
@@ -2695,7 +2973,7 @@ impl App {
                 fields: vec![Field::text("Member", &row.id)],
                 focus: 0,
                 error: None,
-                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id.clone(), original: row.id }),
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id.clone(), original: row.id, decoded: None }),
             },
             KeyType::ZSet => Modal::Form {
                 title: "Edit sorted-set member".into(),
@@ -2706,7 +2984,7 @@ impl App {
                 ],
                 focus: 0,
                 error: None,
-                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default() }),
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default(), decoded: None }),
             },
             KeyType::TimeSeries => Modal::Message {
                 title: "Not editable".into(),
@@ -2734,7 +3012,7 @@ impl App {
             } else {
                 value
             };
-            let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
+            let mut ta = TextArea::from(editor_lines(&text));
             ta.set_cursor_line_style(ratatui::style::Style::default());
             self.modal = Some(Modal::Editor {
                 title: format!("Edit '{}'", target.key),
@@ -2784,9 +3062,23 @@ impl App {
             ),
             KeyType::List => {
                 let index: isize = row.id.parse().unwrap_or(0);
+                // What the index held when it was read: the bytes behind a
+                // decoded item, the text itself otherwise. A hex dump is only
+                // a picture of the bytes, so that case deletes by index alone,
+                // as it always has.
+                let cell = row.cells.get(1).cloned().unwrap_or_default();
+                let expected = match &row.decoding {
+                    Some(decoding) => Some(decoding.raw.clone()),
+                    None if crate::redis_client::is_hex_dump(&cell) => None,
+                    None => Some(cell.into_bytes()),
+                };
                 (
                     format!("Delete item [{index}] from '{name}'?"),
-                    Action::ListDel { key: name, index },
+                    Action::ListDel {
+                        key: name,
+                        index,
+                        expected,
+                    },
                 )
             }
             KeyType::Set => (
@@ -2878,6 +3170,117 @@ impl App {
                 let payload: String = msg.get_payload().unwrap_or_default();
                 if tx.send(Msg::PubSub { channel, payload }).is_err() {
                     return;
+                }
+            }
+        }));
+        self.modal = Some(Modal::PubSub(state));
+    }
+
+    /// `W`: watch every command the server runs. MONITOR costs the server
+    /// real throughput, so a production profile asks first.
+    fn prompt_monitor(&mut self) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        if client.conn.deployment != crate::config::Deployment::Standalone {
+            self.status =
+                "MONITOR watches one server; it is not available for Cluster or Sentinel profiles yet"
+                    .into();
+            return;
+        }
+        if client.production() {
+            self.modal = Some(Modal::Confirm {
+                message: format!(
+                    "MONITOR streams every command '{}' receives to this terminal and can cut the server's throughput sharply while it runs. Start it? (y/n)",
+                    client.conn.name
+                ),
+                action: Action::Monitor,
+            });
+            return;
+        }
+        self.start_monitor(Vec::new());
+    }
+
+    /// Open a `MONITOR` connection and stream what it sees into the feed.
+    ///
+    /// A busy server runs far more commands than a terminal can show, so the
+    /// reader batches them every [`MONITOR_FLUSH`] and keeps at most
+    /// [`MONITOR_BATCH`] per batch; the rest are counted, not queued.
+    fn start_monitor(&mut self, filters: Vec<String>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        if let Some(Modal::PubSub(old)) = &mut self.modal {
+            old.stop();
+        }
+        let mut state = PubSubState::monitor(filters.clone());
+        // Lowercased once here, and each line once below, rather than both
+        // for every pattern on every command.
+        let patterns: Vec<Vec<u8>> = filters
+            .iter()
+            .map(|f| normalize_pattern(f).to_ascii_lowercase().into_bytes())
+            .collect();
+        let tx = self.tx.clone();
+        state.task = Some(tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let monitor = match client.monitor().await {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("cannot start MONITOR: {e}")));
+                    return;
+                }
+            };
+            let mut stream = monitor.into_on_message::<String>();
+            let mut tick = tokio::time::interval(MONITOR_FLUSH);
+            let mut batch: Vec<(String, String)> = Vec::new();
+            let mut dropped = 0u64;
+            loop {
+                tokio::select! {
+                    line = stream.next() => {
+                        let Some(line) = line else {
+                            let _ = tx.send(Msg::MonitorBatch {
+                                lines: std::mem::take(&mut batch),
+                                dropped,
+                            });
+                            let _ = tx.send(Msg::Error("MONITOR connection closed".into()));
+                            return;
+                        };
+                        let Some(parsed) = crate::redis_client::parse_monitor_line(&line) else {
+                            continue;
+                        };
+                        // Filtered on the whole line, then cut for the feed.
+                        if !patterns.is_empty() {
+                            let text = format!("{} {}", parsed.command, parsed.detail)
+                                .to_ascii_lowercase();
+                            if !patterns
+                                .iter()
+                                .any(|p| crate::glob::matches(p, text.as_bytes()))
+                            {
+                                continue;
+                            }
+                        }
+                        if batch.len() < MONITOR_BATCH {
+                            let parsed = parsed.shortened();
+                            batch.push((parsed.command, parsed.detail));
+                        } else {
+                            dropped += 1;
+                        }
+                    }
+                    _ = tick.tick() => {
+                        if batch.is_empty() && dropped == 0 {
+                            continue;
+                        }
+                        let lines = std::mem::take(&mut batch);
+                        if tx
+                            .send(Msg::MonitorBatch {
+                                lines,
+                                dropped: std::mem::take(&mut dropped),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                 }
             }
         }));
@@ -3059,6 +3462,134 @@ impl App {
         }));
     }
 
+    /// Forget per-key views, raised limits and element filters: they were
+    /// chosen for keys on the server or database being left.
+    fn reset_windows(&mut self) {
+        self.views.clear();
+        self.key_limit = KEY_LIMIT;
+        self.key_limit_pattern.clear();
+        self.value_window = Window::default();
+        self.value_window_key = None;
+        self.value_coverage = Coverage::default();
+    }
+
+    /// `+`: load another page of whatever the focused pane shows, keys in the
+    /// tree or elements of the open collection.
+    fn load_more(&mut self) {
+        if self.focus == Focus::Value && !matches!(self.value, Some(KeyValue::Rows { .. })) {
+            self.status =
+                "+ loads more elements of a collection, or more keys with the tree focused".into();
+            return;
+        }
+        if self.focus == Focus::Value {
+            if self.value_coverage.complete {
+                self.status = "Every element is already loaded".into();
+            } else if self.value_window.limit >= VALUE_LIMIT_MAX {
+                self.status = format!(
+                    "Showing the most elements one read loads ({VALUE_LIMIT_MAX}); narrow them with f"
+                );
+            } else {
+                self.value_window.limit =
+                    (self.value_window.limit + VALUE_LIMIT).min(VALUE_LIMIT_MAX);
+                self.status = format!("Loading up to {} elements ...", self.value_window.limit);
+                self.reload_value();
+            }
+            return;
+        }
+        if !self.truncated {
+            self.status = "Every matching key is already loaded".into();
+        } else if self.key_limit >= KEY_LIMIT_MAX {
+            self.status = format!(
+                "Showing the most keys one view loads ({KEY_LIMIT_MAX}); narrow the pattern with /"
+            );
+        } else {
+            self.key_limit = (self.key_limit + KEY_LIMIT).min(KEY_LIMIT_MAX);
+            // The raised limit belongs to the pattern on screen.
+            self.key_limit_pattern = self.pattern.clone();
+            self.status = format!("Loading up to {} keys ...", self.key_limit);
+            self.reload_keys();
+        }
+    }
+
+    /// `f`: filter the open collection's elements by a pattern.
+    fn prompt_element_filter(&mut self) {
+        let Some(k) = self.current.as_ref() else {
+            self.status = "Select a key first".into();
+            return;
+        };
+        if !matches!(
+            k.kind,
+            KeyType::Hash | KeyType::List | KeyType::Set | KeyType::ZSet | KeyType::Stream
+        ) {
+            self.status =
+                "f filters the elements of a hash, list, set, sorted set or stream".into();
+            return;
+        }
+        let what = match k.kind {
+            KeyType::Hash => "Field pattern",
+            KeyType::Set | KeyType::ZSet => "Member pattern",
+            KeyType::List => "Item pattern",
+            _ => "Field or value pattern",
+        };
+        let current = self.value_window.filter.clone().unwrap_or_default();
+        self.modal = Some(Modal::Form {
+            title: format!("Filter '{}'", k.name),
+            hint: "Glob or bare word (becomes *word*) · empty shows everything · Enter applies"
+                .into(),
+            fields: vec![Field::text(what, &current)],
+            focus: 0,
+            error: None,
+            action: Action::FilterElements,
+        });
+    }
+
+    /// Read the open collection again with `filter`, from the first page.
+    fn set_element_filter(&mut self, filter: Option<String>) {
+        self.value_window = Window {
+            limit: VALUE_LIMIT,
+            filter,
+        };
+        if let Some(k) = &self.current {
+            self.value_window_key = Some(k.name.clone());
+        }
+        self.value_state.select(Some(0));
+        self.value_scroll = 0;
+        self.status = match &self.value_window.filter {
+            Some(f) => format!("Filtering elements by {f}"),
+            None => "Showing every element".into(),
+        };
+        self.reload_value();
+    }
+
+    /// Choose how the open key's value is shown: auto, as stored, or
+    /// through a particular codec.
+    fn open_view_picker(&mut self) {
+        let Some(k) = self.current.as_ref() else {
+            self.status = "Select a key first".into();
+            return;
+        };
+        if !matches!(
+            k.kind,
+            KeyType::String
+                | KeyType::Hash
+                | KeyType::List
+                | KeyType::Set
+                | KeyType::ZSet
+                | KeyType::Stream
+        ) {
+            self.status = format!("A {} key is always shown as stored", k.kind.name());
+            return;
+        }
+        let options = View::all(&self.store.codecs);
+        let current = self.view_for(&k.name);
+        let selected = options.iter().position(|v| *v == current).unwrap_or(0);
+        self.modal = Some(Modal::ViewPicker {
+            key: k.name.clone(),
+            selected,
+            options,
+        });
+    }
+
     fn open_theme_picker(&mut self) {
         let original = self.store.theme;
         self.modal = Some(Modal::ThemePicker {
@@ -3123,6 +3654,37 @@ impl App {
             }
             if close {
                 self.modal = None;
+            }
+            return;
+        }
+        if let Some(Modal::ViewPicker {
+            key: name,
+            selected,
+            options,
+        }) = &mut self.modal
+        {
+            let last = options.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
+                KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(last),
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Home | KeyCode::Char('g') => *selected = 0,
+                KeyCode::End | KeyCode::Char('G') => *selected = last,
+                KeyCode::Enter => {
+                    let name = name.clone();
+                    let view = options.get(*selected).cloned().unwrap_or_default();
+                    self.modal = None;
+                    self.status = format!("Showing '{name}' as {}", view.label());
+                    if view == View::Auto {
+                        self.views.remove(&name);
+                    } else {
+                        self.views.insert(name.clone(), view);
+                    }
+                    if self.current.as_ref().is_some_and(|c| c.name == name) {
+                        self.reload_value();
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -3533,6 +4095,21 @@ impl App {
                         state.scroll = state.messages.len().saturating_sub(1);
                     }
                 }
+                KeyCode::Char('s') if state.monitor => {
+                    state.stop();
+                    let current = state.patterns.join(" ");
+                    self.modal = Some(Modal::Form {
+                        title: "Monitor filter".into(),
+                        hint: "Space-separated globs or words, matched against the command and its arguments · empty watches everything".into(),
+                        fields: vec![Field::text("Keep commands matching", &current)],
+                        focus: 0,
+                        error: None,
+                        action: Action::MonitorFilter,
+                    });
+                }
+                KeyCode::Char('w') if state.monitor => {
+                    self.status = "Publishing belongs to the pub/sub feed (P)".into();
+                }
                 KeyCode::Char('s') => {
                     state.stop();
                     let current = state.patterns.join(" ");
@@ -3601,7 +4178,9 @@ impl App {
                 }
                 _ => {}
             },
-            Modal::Groups(_) | Modal::ThemePicker { .. } => unreachable!("handled above"),
+            Modal::Groups(_) | Modal::ThemePicker { .. } | Modal::ViewPicker { .. } => {
+                unreachable!("handled above")
+            }
         }
     }
 
@@ -3753,6 +4332,8 @@ impl App {
 
     fn switch_db(&mut self, db: i64) {
         self.edit_session = self.edit_session.wrapping_add(1);
+        // The same key name in another database may hold anything.
+        self.reset_windows();
         if let Some(client) = &self.client {
             let _ = client.lock_writes();
         }
@@ -4025,8 +4606,21 @@ impl App {
                     c.list_push(&key, &val).await
                 });
             }
-            Action::ListDel { key, index } => self.mutate("Item deleted", move |c| async move {
-                c.list_remove_at(&key, index).await
+            Action::ListDel {
+                key,
+                index,
+                expected,
+            } => self.mutate("Item deleted", move |c| async move {
+                match expected {
+                    Some(expected) => {
+                        anyhow::ensure!(
+                            c.list_remove_checked(&key, index, &expected).await?,
+                            "Item [{index}] changed since it was read, so nothing was deleted; refresh with r and try again"
+                        );
+                        Ok(())
+                    }
+                    None => c.list_remove_at(&key, index).await,
+                }
             }),
             Action::SetAdd(key) => {
                 let m = v(0);
@@ -4057,6 +4651,11 @@ impl App {
             Action::StreamDel { key, id } => self.mutate("Entry deleted", move |c| async move {
                 c.stream_delete(&key, &id).await
             }),
+            Action::Monitor => self.start_monitor(Vec::new()),
+            Action::MonitorFilter => {
+                let filters = v(0).split_whitespace().map(str::to_string).collect();
+                self.start_monitor(filters);
+            }
             Action::Subscribe => {
                 let patterns: Vec<String> = v(0).split_whitespace().map(str::to_string).collect();
                 if patterns.is_empty() {
@@ -4165,6 +4764,11 @@ impl App {
                         Err(e) => Msg::Mutated(Err(e.to_string())),
                     }
                 });
+            }
+            Action::FilterElements => {
+                let raw = v(0);
+                let filter = (!raw.trim().is_empty()).then(|| normalize_pattern(raw.trim()));
+                self.set_element_filter(filter);
             }
             Action::GrepValues => {
                 let needle = v(0);
@@ -4507,7 +5111,8 @@ pub fn normalize_pattern(raw: &str) -> String {
     if raw.contains(['*', '?', '[']) {
         raw.to_string()
     } else {
-        format!("*{raw}*")
+        // A bare word is literal, backslashes included.
+        format!("*{}*", raw.replace('\\', "\\\\"))
     }
 }
 
@@ -4628,6 +5233,13 @@ fn next_focus(fields: &[Field], from: usize, dir: isize) -> usize {
         }
     }
     from
+}
+
+/// A value split into editor lines so that joining them with `\n` on save
+/// gives the value back: a trailing newline, or a `\r` before one, survives an
+/// edit that did not touch it.
+fn editor_lines(text: &str) -> Vec<&str> {
+    text.split('\n').collect()
 }
 
 fn move_sel<S: Selectable>(state: &mut S, len: usize, delta: isize) {
@@ -4984,6 +5596,21 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_gives_back_exactly_the_text_it_was_opened_on() {
+        for text in ["hello", "hello\n", "a\r\nb\r\n", "", "\n\n", "x\n\ny"] {
+            assert_eq!(editor_lines(text).join("\n"), text, "{text:?}");
+        }
+        let mut app = tick_app(vec![info("k", -1)]);
+        app.current = Some(info("k", -1));
+        app.value = Some(KeyValue::Str("line\n".into()));
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        let Some(Modal::Editor { textarea, .. }) = &app.modal else {
+            panic!("expected the editor")
+        };
+        assert_eq!(textarea.lines().join("\n"), "line\n");
+    }
+
+    #[test]
     fn a_plain_string_edit_is_never_json_checked() {
         let mut app = tick_app(vec![info("greeting", -1)]);
         app.current = Some(info("greeting", -1));
@@ -4997,6 +5624,539 @@ mod tests {
         assert_eq!(*json, JsonMode::None);
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.modal.is_none(), "a plain string saves straight away");
+    }
+
+    fn gzip_decoding(read_only: Option<&str>) -> crate::codec::Decoding {
+        crate::codec::Decoding {
+            codec: crate::codec::Codec::Builtin(crate::codec::Builtin::Gzip),
+            raw: vec![0x1f, 0x8b, 0x08],
+            read_only: read_only.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn bare_words_are_literal_including_backslashes() {
+        assert_eq!(normalize_pattern("user"), "*user*");
+        assert_eq!(normalize_pattern("a\\b"), "*a\\\\b*");
+        assert!(crate::glob::matches(
+            normalize_pattern("a\\b").as_bytes(),
+            b"xa\\by"
+        ));
+        assert!(!crate::glob::matches(
+            normalize_pattern("a\\b").as_bytes(),
+            b"ab"
+        ));
+        assert_eq!(
+            normalize_pattern("user:*"),
+            "user:*",
+            "globs are left alone"
+        );
+    }
+
+    #[test]
+    fn deleting_a_list_item_carries_what_it_held() {
+        let key = KeyInfo {
+            name: "q".into(),
+            kind: KeyType::List,
+            ttl: -1,
+        };
+        let mut app = tick_app(vec![key.clone()]);
+        app.current = Some(key);
+        app.value = Some(KeyValue::Rows {
+            headers: vec!["index", "value"],
+            rows: vec![crate::redis_client::Row {
+                id: "1500".into(),
+                cells: vec!["1500".into(), "job-7".into()],
+                decoding: None,
+            }],
+            total: 3000,
+        });
+        app.value_state.select(Some(0));
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        let Some(Modal::Confirm {
+            action: Action::ListDel {
+                index, expected, ..
+            },
+            ..
+        }) = &app.modal
+        else {
+            panic!("expected the delete confirmation")
+        };
+        assert_eq!(*index, 1500);
+        assert_eq!(expected.as_deref(), Some(&b"job-7"[..]));
+    }
+
+    #[test]
+    fn plus_on_a_string_does_not_load_keys() {
+        let mut app = tick_app(vec![info("s", -1)]);
+        app.current = Some(info("s", -1));
+        app.value = Some(KeyValue::Str("x".into()));
+        app.focus = Focus::Value;
+        app.truncated = true;
+        app.on_key(KeyEvent::from(KeyCode::Char('+')));
+        assert_eq!(app.key_limit, KEY_LIMIT);
+        assert!(app.status.contains("tree focused"), "{}", app.status);
+    }
+
+    #[tokio::test]
+    async fn connecting_elsewhere_forgets_limits_filters_and_views() {
+        let mut app = tick_app(vec![]);
+        app.key_limit = 3 * KEY_LIMIT;
+        app.value_window = Window {
+            limit: 4 * VALUE_LIMIT,
+            filter: Some("*x*".into()),
+        };
+        app.views.insert("k".into(), View::Plain);
+        app.connect(crate::config::Connection {
+            host: "127.0.0.1".into(),
+            port: 1,
+            ..Default::default()
+        });
+        assert_eq!(app.key_limit, KEY_LIMIT);
+        assert_eq!(app.value_window, Window::default());
+        assert!(app.views.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_scan_says_how_to_load_more() {
+        let mut app = tick_app(vec![]);
+        app.on_msg(Msg::Keys {
+            keys: vec![info("a", -1)],
+            truncated: true,
+            warnings: vec![],
+            dbsize: 9,
+            pattern: "*".into(),
+        });
+        assert!(app.status.contains("+ loads 5000 more"), "{}", app.status);
+        app.key_limit = KEY_LIMIT_MAX;
+        app.on_msg(Msg::Keys {
+            keys: vec![info("a", -1)],
+            truncated: true,
+            warnings: vec![],
+            dbsize: 9,
+            pattern: "*".into(),
+        });
+        assert!(app.status.contains("narrow the pattern"), "{}", app.status);
+        app.on_msg(Msg::Keys {
+            keys: vec![info("a", -1)],
+            truncated: false,
+            warnings: vec![],
+            dbsize: 1,
+            pattern: "*".into(),
+        });
+        assert_eq!(app.status, "Keys refreshed");
+    }
+
+    #[test]
+    fn plus_raises_the_key_limit_a_page_at_a_time_up_to_the_cap() {
+        let mut app = tick_app(vec![info("a", -1)]);
+        app.on_key(KeyEvent::from(KeyCode::Char('+')));
+        assert_eq!(app.key_limit, KEY_LIMIT, "nothing more to load");
+        assert!(app.status.contains("already loaded"), "{}", app.status);
+
+        app.truncated = true;
+        app.on_key(KeyEvent::from(KeyCode::Char('+')));
+        assert_eq!(app.key_limit, 2 * KEY_LIMIT);
+        app.key_limit = KEY_LIMIT_MAX;
+        app.on_key(KeyEvent::from(KeyCode::Char('+')));
+        assert_eq!(app.key_limit, KEY_LIMIT_MAX);
+        assert!(app.status.contains("narrow the pattern"), "{}", app.status);
+    }
+
+    fn collection_app(kind: KeyType, complete: bool) -> App {
+        let key = KeyInfo {
+            name: "c".into(),
+            kind,
+            ttl: -1,
+        };
+        let mut app = tick_app(vec![key.clone()]);
+        app.current = Some(key);
+        app.focus = Focus::Value;
+        app.value = Some(KeyValue::Rows {
+            headers: vec!["member"],
+            rows: vec![crate::redis_client::Row::default()],
+            total: if complete { 1 } else { 5_000 },
+        });
+        app.value_coverage = Coverage::of(app.value.as_ref().unwrap());
+        app
+    }
+
+    #[test]
+    fn plus_in_the_value_pane_loads_more_elements() {
+        let mut app = collection_app(KeyType::Set, true);
+        app.on_key(KeyEvent::from(KeyCode::Char('+')));
+        assert_eq!(app.value_window.limit, VALUE_LIMIT);
+        assert!(app.status.contains("already loaded"), "{}", app.status);
+
+        let mut app = collection_app(KeyType::Set, false);
+        app.on_key(KeyEvent::from(KeyCode::Char('+')));
+        assert_eq!(app.value_window.limit, 2 * VALUE_LIMIT);
+        app.value_window.limit = VALUE_LIMIT_MAX;
+        app.on_key(KeyEvent::from(KeyCode::Char('+')));
+        assert_eq!(app.value_window.limit, VALUE_LIMIT_MAX);
+        assert!(app.status.contains("with f"), "{}", app.status);
+    }
+
+    #[test]
+    fn f_filters_a_collection_and_esc_clears_it() {
+        let mut app = collection_app(KeyType::Hash, false);
+        app.value_window.limit = 3 * VALUE_LIMIT;
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form {
+                action: Action::FilterElements,
+                ..
+            })
+        ));
+        for c in "user".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert_eq!(app.value_window.filter.as_deref(), Some("*user*"));
+        assert_eq!(
+            app.value_window.limit, VALUE_LIMIT,
+            "a new filter starts at one page"
+        );
+
+        // Esc in the value pane drops the filter, not the key pattern.
+        app.pattern = "app:*".into();
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.value_window.filter, None);
+        assert_eq!(app.pattern, "app:*");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(
+            app.pattern, "*",
+            "then Esc clears the key pattern as before"
+        );
+    }
+
+    #[test]
+    fn f_on_a_string_explains_itself() {
+        let mut app = tick_app(vec![info("s", -1)]);
+        app.current = Some(info("s", -1));
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("hash, list"), "{}", app.status);
+    }
+
+    #[test]
+    fn monitor_batches_feed_the_monitor_and_count_what_was_dropped() {
+        let mut app = tick_app(vec![]);
+        app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
+        app.on_msg(Msg::MonitorBatch {
+            lines: vec![
+                ("SET".into(), "db0 1.2.3.4:5  \"k\" \"v\"".into()),
+                ("GET".into(), "db0 1.2.3.4:5  \"k\"".into()),
+                ("SET".into(), "db0 1.2.3.4:5  \"k2\" \"v\"".into()),
+            ],
+            dropped: 7,
+        });
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("feed closed")
+        };
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(state.total, 10, "dropped commands still count");
+        assert_eq!(state.dropped, 7);
+        assert_eq!(state.channels[0], ("SET".to_string(), 2));
+        assert!(state.title().starts_with("Command monitor"));
+
+        // A monitor batch never lands in a pub/sub feed.
+        app.modal = Some(Modal::PubSub(PubSubState::new(vec!["*".into()], false)));
+        app.on_msg(Msg::MonitorBatch {
+            lines: vec![("SET".into(), "x".into())],
+            dropped: 0,
+        });
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("feed closed")
+        };
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn the_monitor_feed_filters_instead_of_resubscribing_and_never_publishes() {
+        let mut app = tick_app(vec![]);
+        app.modal = Some(Modal::PubSub(PubSubState::monitor(vec!["user:*".into()])));
+        app.on_key(KeyEvent::from(KeyCode::Char('w')));
+        assert!(matches!(app.modal, Some(Modal::PubSub(_))));
+        assert!(app.status.contains("pub/sub"), "{}", app.status);
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        let Some(Modal::Form { action, fields, .. }) = &app.modal else {
+            panic!("expected the filter form")
+        };
+        assert!(matches!(action, Action::MonitorFilter));
+        assert_eq!(fields[0].input.value(), "user:*");
+    }
+
+    #[test]
+    fn a_monitor_replaced_by_a_reply_says_it_stopped() {
+        let mut app = tick_app(vec![]);
+        app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
+        app.on_msg(Msg::Script(Ok("done".into())));
+        assert!(!matches!(app.modal, Some(Modal::PubSub(_))));
+        assert!(app.status.contains("monitor stopped"), "{}", app.status);
+
+        // Closing it on purpose is not news.
+        app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        app.on_msg(Msg::Status("ok".into()));
+        assert_eq!(app.status, "ok");
+    }
+
+    #[test]
+    fn clearing_the_feed_resets_the_dropped_count() {
+        let mut state = PubSubState::monitor(vec![]);
+        state.push_dropped(5);
+        state.clear();
+        assert_eq!((state.dropped, state.total), (0, 0));
+    }
+
+    #[test]
+    fn only_the_latest_value_read_reaches_the_pane() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        app.current = Some(info("a", -1));
+        // Two reads are in flight: the first through a slow codec, the second
+        // after the view was changed. The second answers first.
+        app.value_seq = 2;
+        app.on_msg(Msg::Loaded {
+            seq: 2,
+            info: info("a", -1),
+            value: KeyValue::Str("as stored".into()),
+            coverage: Coverage::default(),
+            notice: None,
+        });
+        app.on_msg(Msg::Loaded {
+            seq: 1,
+            info: info("a", -1),
+            value: KeyValue::Str("stale decode".into()),
+            coverage: Coverage::default(),
+            notice: Some("stale notice".into()),
+        });
+        assert!(matches!(app.value, Some(KeyValue::Str(ref s)) if s == "as stored"));
+        assert!(!app.status.contains("stale"), "{}", app.status);
+
+        // The latest reply's notice is shown with it.
+        app.value_seq = 3;
+        app.on_msg(Msg::Loaded {
+            seq: 3,
+            info: info("a", -1),
+            value: KeyValue::Str("x".into()),
+            coverage: Coverage::default(),
+            notice: Some("2 element(s) could not be read".into()),
+        });
+        assert_eq!(app.status, "2 element(s) could not be read");
+    }
+
+    #[test]
+    fn a_superseded_read_that_fails_stays_quiet() {
+        let mut app = tick_app(vec![info("a", -1)]);
+        app.status = "ok".into();
+        app.value_seq = 5;
+        app.on_msg(Msg::LoadFailed {
+            seq: 4,
+            error: "read failed: old".into(),
+        });
+        assert_eq!(app.status, "ok");
+        app.on_msg(Msg::LoadFailed {
+            seq: 5,
+            error: "read failed: now".into(),
+        });
+        assert!(app.status.contains("read failed: now"), "{}", app.status);
+    }
+
+    #[test]
+    fn moving_to_another_key_drops_the_read_in_flight() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        app.tree_state.select(Some(0));
+        app.on_tree_move();
+        let in_flight = app.value_seq;
+        app.tree_state.select(Some(1));
+        app.on_tree_move();
+        app.on_msg(Msg::Loaded {
+            seq: in_flight,
+            info: info("a", -1),
+            value: KeyValue::Str("late".into()),
+            coverage: Coverage::default(),
+            notice: None,
+        });
+        assert!(app.value.is_none());
+        assert_eq!(app.current.as_ref().unwrap().name, "b");
+    }
+
+    #[test]
+    fn v_picks_a_view_for_the_open_key_only() {
+        use crate::codec::{Builtin, Codec};
+        let mut app = tick_app(vec![info("blob", -1), info("other", -1)]);
+        app.current = Some(info("blob", -1));
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        let Some(Modal::ViewPicker {
+            selected, options, ..
+        }) = &app.modal
+        else {
+            panic!("expected the view picker")
+        };
+        assert_eq!(*selected, 0, "auto is the default");
+        let gzip = options
+            .iter()
+            .position(|v| *v == View::Codec(Codec::Builtin(Builtin::Gzip)))
+            .unwrap();
+        for _ in 0..gzip {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.view_for("blob"),
+            View::Codec(Codec::Builtin(Builtin::Gzip))
+        );
+        assert_eq!(app.view_for("other"), View::Auto);
+
+        // Reopening starts on the chosen view; Esc changes nothing.
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(matches!(app.modal, Some(Modal::ViewPicker { selected, .. }) if selected == gzip));
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(
+            app.view_for("blob"),
+            View::Codec(Codec::Builtin(Builtin::Gzip))
+        );
+
+        // Choosing auto again forgets the key.
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        app.on_key(KeyEvent::from(KeyCode::Char('g')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.views.is_empty());
+    }
+
+    #[test]
+    fn the_view_picker_lists_configured_custom_codecs() {
+        let mut app = tick_app(vec![info("blob", -1)]);
+        app.store.codecs = vec![crate::codec::CustomCodec {
+            name: "proto".into(),
+            decode: vec!["protoc".into()],
+            ..Default::default()
+        }];
+        app.current = Some(info("blob", -1));
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        let Some(Modal::ViewPicker { options, .. }) = &app.modal else {
+            panic!("expected the view picker")
+        };
+        assert_eq!(options.last().unwrap().label(), "proto (custom)");
+    }
+
+    #[test]
+    fn document_types_have_no_view_picker() {
+        let mut app = tick_app(vec![]);
+        app.current = Some(KeyInfo {
+            name: "doc".into(),
+            kind: KeyType::Json,
+            ttl: -1,
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("as stored"), "{}", app.status);
+    }
+
+    #[test]
+    fn editing_a_decoded_string_edits_the_text_and_remembers_the_codec() {
+        let mut app = tick_app(vec![info("doc", -1)]);
+        app.current = Some(info("doc", -1));
+        app.value = Some(KeyValue::Decoded {
+            text: r#"{"a":1}"#.into(),
+            decoding: gzip_decoding(None),
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        let Some(Modal::Editor {
+            title,
+            action: Action::SafeEdit(target),
+            json,
+            ..
+        }) = &app.modal
+        else {
+            panic!("expected the editor")
+        };
+        assert_eq!(title, "Edit gzip JSON 'doc'");
+        assert_eq!(*json, JsonMode::Compact);
+        assert_eq!(target.original, r#"{"a":1}"#);
+        assert_eq!(target.decoded, Some(gzip_decoding(None)));
+    }
+
+    #[test]
+    fn a_read_only_decoding_is_never_opened_for_editing() {
+        let mut app = tick_app(vec![info("doc", -1)]);
+        app.current = Some(info("doc", -1));
+        app.value = Some(KeyValue::Decoded {
+            text: "{}".into(),
+            decoding: gzip_decoding(Some("not text")),
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("read-only"), "{}", app.status);
+    }
+
+    fn rows_app(kind: KeyType, decoding: Option<crate::codec::Decoding>) -> App {
+        let key = KeyInfo {
+            name: "c".into(),
+            kind,
+            ttl: -1,
+        };
+        let mut app = tick_app(vec![key.clone()]);
+        app.current = Some(key);
+        let (headers, cells) = match kind {
+            KeyType::Set => (vec!["member"], vec!["shown".to_string()]),
+            KeyType::List => (vec!["index", "value"], vec!["0".into(), "shown".into()]),
+            _ => (vec!["field", "value"], vec!["f".into(), "shown".into()]),
+        };
+        app.value = Some(KeyValue::Rows {
+            headers,
+            rows: vec![crate::redis_client::Row {
+                id: cells[0].clone(),
+                cells,
+                decoding,
+            }],
+            total: 1,
+        });
+        app.value_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn decoded_hash_values_and_list_items_save_through_their_codec() {
+        for kind in [KeyType::Hash, KeyType::List] {
+            let mut app = rows_app(kind, Some(gzip_decoding(None)));
+            app.on_key(KeyEvent::from(KeyCode::Char('e')));
+            let Some(Modal::Form {
+                fields,
+                action: Action::SafeEdit(target),
+                ..
+            }) = &app.modal
+            else {
+                panic!("expected the edit form for {kind:?}")
+            };
+            assert_eq!(fields[0].input.value(), "shown");
+            assert_eq!(target.original, "shown");
+            assert_eq!(target.decoded, Some(gzip_decoding(None)));
+        }
+    }
+
+    #[test]
+    fn decoded_members_are_view_only() {
+        let mut app = rows_app(KeyType::Set, Some(gzip_decoding(None)));
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("read-only"), "{}", app.status);
+
+        // Without a codec a set member edits exactly as before.
+        let mut app = rows_app(KeyType::Set, None);
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form {
+                action: Action::SafeEdit(EditTarget { decoded: None, .. }),
+                ..
+            })
+        ));
     }
     fn console_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
