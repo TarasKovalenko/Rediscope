@@ -1,6 +1,6 @@
 //! Regenerate the README screenshots.
 //!
-//!     redis-server --port 6379 --daemonize yes
+//!     redis-server --port 6379 --daemonize yes      # Redis 8, for the vector set
 //!     cargo run --example screenshots
 //!
 //! Every screen is rendered through ratatui's test backend and written out as
@@ -122,7 +122,41 @@ async fn main() -> anyhow::Result<()> {
     .await;
     shot(&mut app, "codecs")?;
 
-    println!("wrote {} screenshots to {OUT}/", 8);
+    // 9. The ctrl+p palette, part way through typing a key it will jump to.
+    app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    for c in "1042".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    shot(&mut app, "palette")?;
+    press(&mut app, KeyCode::Esc);
+
+    // 10. A vector set, searched for the elements most like one of them.
+    collapse_all(&mut app);
+    open_path(&mut app, &["embeddings", "products"]);
+    drain(&mut app, &mut rx);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Down);
+    pump(&mut app, &mut rx, |a| {
+        a.value.is_some()
+            && a.current
+                .as_ref()
+                .is_some_and(|k| k.name == "embeddings:products")
+    })
+    .await;
+    press(&mut app, KeyCode::Tab);
+    for _ in 0..2 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Char('S'));
+    pump(
+        &mut app,
+        &mut rx,
+        |a| matches!(&a.value, Some(KeyValue::Rows { headers, .. }) if headers.len() == 3),
+    )
+    .await;
+    shot(&mut app, "vectors")?;
+
+    println!("wrote {} screenshots to {OUT}/", 10);
     Ok(())
 }
 
@@ -254,7 +288,7 @@ fn demo_monitor() -> PubSubState {
 /// A plausible `INFO` reply for a mid-sized production cache. Invented from end
 /// to end: no field here came off a real server.
 const DEMO_INFO: &str = "# Server\r
-redis_version:7.4.2\r
+redis_version:8.2.1\r
 redis_mode:standalone\r
 os:Linux 6.8.0-51-generic x86_64\r
 arch_bits:64\r
@@ -446,6 +480,81 @@ async fn seed(url: &str) -> anyhow::Result<()> {
     for (member, score) in [("ada", 940), ("grace", 880), ("alan", 815)] {
         let _: () = c.zadd("leaderboard:eu", member, score).await?;
     }
+    // A vector set of product embeddings (Redis 8). Eight dimensions is
+    // nothing like a real model, but it searches the same way.
+    let products = [
+        (
+            "trail-runner",
+            "shoes",
+            129,
+            [0.9, 0.1, 0.8, 0.2, 0.1, 0.0, 0.3, 0.1],
+        ),
+        (
+            "road-racer",
+            "shoes",
+            149,
+            [0.8, 0.2, 0.9, 0.1, 0.2, 0.1, 0.2, 0.0],
+        ),
+        (
+            "hiking-boot",
+            "shoes",
+            189,
+            [0.9, 0.0, 0.5, 0.6, 0.1, 0.1, 0.5, 0.2],
+        ),
+        (
+            "rain-shell",
+            "jackets",
+            220,
+            [0.2, 0.9, 0.1, 0.7, 0.3, 0.1, 0.4, 0.1],
+        ),
+        (
+            "down-parka",
+            "jackets",
+            340,
+            [0.1, 0.8, 0.0, 0.9, 0.2, 0.2, 0.1, 0.3],
+        ),
+        (
+            "wool-beanie",
+            "hats",
+            35,
+            [0.0, 0.5, 0.1, 0.8, 0.9, 0.1, 0.0, 0.2],
+        ),
+        (
+            "sun-cap",
+            "hats",
+            29,
+            [0.3, 0.2, 0.4, 0.0, 0.9, 0.0, 0.6, 0.1],
+        ),
+        (
+            "day-pack",
+            "bags",
+            95,
+            [0.5, 0.3, 0.3, 0.3, 0.1, 0.9, 0.4, 0.2],
+        ),
+        (
+            "trail-socks",
+            "socks",
+            18,
+            [0.8, 0.1, 0.7, 0.3, 0.2, 0.1, 0.2, 0.9],
+        ),
+    ];
+    for (name, category, price, vector) in products {
+        let mut add = redis::cmd("VADD");
+        add.arg("embeddings:products")
+            .arg("VALUES")
+            .arg(vector.len());
+        for v in vector {
+            add.arg(v);
+        }
+        add.arg(name).arg("SETATTR").arg(format!(
+            r#"{{"category":"{category}","price":{price},"in_stock":{}}}"#,
+            price < 300
+        ));
+        let _: i64 = add
+            .query_async(&mut c)
+            .await
+            .map_err(|e| anyhow::anyhow!("the demo needs Redis 8 for its vector set: {e}"))?;
+    }
     for n in 0..6 {
         let _: () = c
             .xadd(
@@ -534,7 +643,7 @@ fn shot(app: &mut App, name: &str) -> anyhow::Result<()> {
     // pictures. Pin it, so a developer's local build never ends up in the
     // README, and every screenshot agrees with the invented INFO reply.
     if let Some(client) = app.client.as_mut() {
-        app.server_line = "redis 7.4.2 · standalone".into();
+        app.server_line = "redis 8.2.1 · standalone".into();
         // Likewise the address: whatever `REDISCOPE_DEMO_URL` points at, the
         // pictures show the default one. Only the label changes; the
         // connection itself is already open.

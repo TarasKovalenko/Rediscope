@@ -40,6 +40,10 @@ const captions = {
     "A gzipped JSON document, recognised by its header and shown decoded. Edits are compressed again on save, and v picks another view.",
   monitor:
     "MONITOR, grouped by command, with the rate and what came in too fast to show. It closes with the feed, and asks first on production.",
+  palette:
+    "Ctrl+P matches every loaded key and every action as you type. Enter opens the folders above a key and selects it, or runs the action.",
+  vectors:
+    "A Redis 8 vector set, ranked by similarity to the selected element. The attributes of each element are formatted below.",
 };
 
 if (panel) {
