@@ -2,6 +2,7 @@
 //! drive the Redis layer directly.
 
 pub mod app;
+pub mod codec;
 pub mod config;
 pub mod headless;
 pub mod history;

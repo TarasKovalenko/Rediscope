@@ -8,6 +8,7 @@ use redis::{
     RedisConnectionInfo, TlsCertificates,
 };
 
+use crate::codec::{Decoding, Shown, View};
 use crate::config::{Connection, Deployment};
 mod edit;
 mod topology;
@@ -28,6 +29,8 @@ pub const KEY_LIMIT: usize = 5_000;
 pub const VALUE_LIMIT: usize = 1_000;
 /// How much of a non-text value the hex dump shows.
 const HEX_DUMP_LIMIT: usize = 4_096;
+/// Most decoded text one value read may produce, across all of its elements.
+const DECODE_BUDGET: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
@@ -99,15 +102,24 @@ pub struct KeyInfo {
 
 /// One row of a collection-typed value. `id` is whatever the mutators need to
 /// address this row (hash field, list index, set/zset member, stream id).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Row {
     pub id: String,
     pub cells: Vec<String>,
+    /// Set when the row's element value is shown decoded by a codec: how it
+    /// was decoded and the bytes it came from. The id is never decoded.
+    pub decoding: Option<Decoding>,
 }
 
 #[derive(Clone, Debug)]
 pub enum KeyValue {
     Str(String),
+    /// A string value shown through a codec: the decoded text, and how to get
+    /// back to the stored bytes.
+    Decoded {
+        text: String,
+        decoding: Decoding,
+    },
     Rows {
         headers: Vec<&'static str>,
         rows: Vec<Row>,
@@ -1091,13 +1103,42 @@ impl Client {
 
     /// Read a bounded window of a key's value. Collection types report their
     /// true total so the UI can say "showing 1000 of 4.2M".
+    ///
+    /// Values are shown exactly as stored: text, or a hex dump of bytes that
+    /// are not text. [`Client::read_value_as`] reads through a codec instead.
     pub async fn read_value(&self, name: &str, kind: KeyType) -> Result<KeyValue> {
+        Ok(materialize(self.read_raw(name, kind).await?, &View::Plain).0)
+    }
+
+    /// [`Client::read_value`] seen through `view`: compressed, packed or
+    /// encoded values come back decoded, carrying the bytes they came from so
+    /// an edit can be encoded the same way. The second half is a notice for
+    /// the status line when a chosen codec could not read some of the value.
+    pub async fn read_value_as(
+        &self,
+        name: &str,
+        kind: KeyType,
+        view: &View,
+    ) -> Result<(KeyValue, Option<String>)> {
+        let raw = self.read_raw(name, kind).await?;
+        if *view == View::Plain {
+            return Ok(materialize(raw, view));
+        }
+        // Decompressing tens of megabytes, or waiting on a custom codec's
+        // program, must not hold up the async workers.
+        let view = view.clone();
+        tokio::task::spawn_blocking(move || materialize(raw, &view))
+            .await
+            .context("decoding the value failed")
+    }
+
+    async fn read_raw(&self, name: &str, kind: KeyType) -> Result<RawValue> {
         let mut c = self.mgr.clone();
         let lim = VALUE_LIMIT;
         Ok(match kind {
             KeyType::String => {
                 let v: Option<Vec<u8>> = c.get(decode_key(name)).await?;
-                KeyValue::Str(v.map(decode_value).unwrap_or_default())
+                RawValue::Str(v.unwrap_or_default())
             }
             KeyType::Hash => {
                 let total: u64 = c.hlen(decode_key(name)).await?;
@@ -1111,14 +1152,13 @@ impl Client {
                         .arg(200)
                         .query_async(&mut c)
                         .await?;
-                    for pair in flat.chunks(2) {
-                        if let [f, v] = pair {
-                            let f = decode_value(f.clone());
-                            rows.push(Row {
-                                id: f.clone(),
-                                cells: vec![f, decode_value(v.clone())],
-                            });
-                        }
+                    let mut flat = flat.into_iter();
+                    while let (Some(f), Some(v)) = (flat.next(), flat.next()) {
+                        let f = decode_value(f);
+                        rows.push(RawRow {
+                            id: f.clone(),
+                            cells: vec![RawCell::Text(f), RawCell::Bytes(v)],
+                        });
                     }
                     cursor = next;
                     if cursor == 0 || rows.len() >= lim {
@@ -1127,7 +1167,7 @@ impl Client {
                 }
                 rows.truncate(lim);
                 rows.sort_by(|a, b| a.id.cmp(&b.id));
-                KeyValue::Rows {
+                RawValue::Rows {
                     headers: vec!["field", "value"],
                     rows,
                     total,
@@ -1139,12 +1179,12 @@ impl Client {
                 let rows = items
                     .into_iter()
                     .enumerate()
-                    .map(|(i, v)| Row {
+                    .map(|(i, v)| RawRow {
                         id: i.to_string(),
-                        cells: vec![i.to_string(), decode_value(v)],
+                        cells: vec![RawCell::Text(i.to_string()), RawCell::Bytes(v)],
                     })
                     .collect();
-                KeyValue::Rows {
+                RawValue::Rows {
                     headers: vec!["index", "value"],
                     rows,
                     total,
@@ -1163,10 +1203,9 @@ impl Client {
                         .query_async(&mut c)
                         .await?;
                     for m in batch {
-                        let m = decode_value(m);
-                        rows.push(Row {
-                            id: m.clone(),
-                            cells: vec![m],
+                        rows.push(RawRow {
+                            id: decode_value(m.clone()),
+                            cells: vec![RawCell::Bytes(m)],
                         });
                     }
                     cursor = next;
@@ -1176,7 +1215,7 @@ impl Client {
                 }
                 rows.truncate(lim);
                 rows.sort_by(|a, b| a.id.cmp(&b.id));
-                KeyValue::Rows {
+                RawValue::Rows {
                     headers: vec!["member"],
                     rows,
                     total,
@@ -1189,15 +1228,12 @@ impl Client {
                     .await?;
                 let rows = items
                     .into_iter()
-                    .map(|(m, s)| {
-                        let m = decode_value(m);
-                        Row {
-                            id: m.clone(),
-                            cells: vec![m, format_score(s)],
-                        }
+                    .map(|(m, s)| RawRow {
+                        id: decode_value(m.clone()),
+                        cells: vec![RawCell::Bytes(m), RawCell::Text(format_score(s))],
                     })
                     .collect();
-                KeyValue::Rows {
+                RawValue::Rows {
                     headers: vec!["member", "score"],
                     rows,
                     total,
@@ -1215,29 +1251,12 @@ impl Client {
                     .await?;
                 let rows = raw
                     .into_iter()
-                    .map(|(id, flat)| {
-                        let fields = flat
-                            .chunks(2)
-                            .map(|p| match p {
-                                [f, v] => {
-                                    format!(
-                                        "{}={}",
-                                        decode_value(f.clone()),
-                                        decode_value(v.clone())
-                                    )
-                                }
-                                [f] => decode_value(f.clone()),
-                                _ => String::new(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("  ");
-                        Row {
-                            id: id.clone(),
-                            cells: vec![id, fields],
-                        }
+                    .map(|(id, flat)| RawRow {
+                        id: id.clone(),
+                        cells: vec![RawCell::Text(id), RawCell::Fields(flat)],
                     })
                     .collect();
-                KeyValue::Rows {
+                RawValue::Rows {
                     headers: vec!["id", "fields"],
                     rows,
                     total,
@@ -1249,7 +1268,7 @@ impl Client {
                     .arg(".")
                     .query_async(&mut c)
                     .await?;
-                KeyValue::Str(doc.map(decode_value).unwrap_or_else(|| "null".into()))
+                RawValue::Doc(doc.map(decode_value).unwrap_or_else(|| "null".into()))
             }
             KeyType::TimeSeries => {
                 let raw: Vec<(u64, f64)> = redis::cmd("TS.RANGE")
@@ -1263,18 +1282,21 @@ impl Client {
                 let total = raw.len() as u64;
                 let rows = raw
                     .into_iter()
-                    .map(|(ts, v)| Row {
+                    .map(|(ts, v)| RawRow {
                         id: ts.to_string(),
-                        cells: vec![ts.to_string(), format_score(v)],
+                        cells: vec![
+                            RawCell::Text(ts.to_string()),
+                            RawCell::Text(format_score(v)),
+                        ],
                     })
                     .collect();
-                KeyValue::Rows {
+                RawValue::Rows {
                     headers: vec!["timestamp", "value"],
                     rows,
                     total,
                 }
             }
-            KeyType::Other => KeyValue::Unsupported(
+            KeyType::Other => RawValue::Unsupported(
                 "This key's type has no viewer yet. Use the command console (:) to inspect it."
                     .into(),
             ),
@@ -1780,11 +1802,14 @@ impl Client {
         let needle = needle.to_lowercase();
         let mut hits = Vec::new();
         for key in candidates {
-            let Ok(value) = self.read_value(&key.name, key.kind).await else {
+            // Compressed and packed values are searched as their decoded text.
+            let Ok((value, _)) = self.read_value_as(&key.name, key.kind, &View::Auto).await else {
                 continue;
             };
             let found = match &value {
-                KeyValue::Str(s) => s.to_lowercase().contains(&needle),
+                KeyValue::Str(s) | KeyValue::Decoded { text: s, .. } => {
+                    s.to_lowercase().contains(&needle)
+                }
                 KeyValue::Rows { rows, .. } => rows
                     .iter()
                     .any(|r| r.cells.iter().any(|c| c.to_lowercase().contains(&needle))),
@@ -2168,6 +2193,129 @@ fn decode_value(bytes: Vec<u8>) -> String {
         Ok(text) => text,
         Err(e) => hex_dump(e.as_bytes()),
     }
+}
+
+/// A stored value as text: itself when it is UTF-8, a hex dump when it is not.
+pub fn text_or_dump(bytes: Vec<u8>) -> String {
+    decode_value(bytes)
+}
+
+/// A value as read from the server, before any codec has looked at it.
+enum RawValue {
+    Str(Vec<u8>),
+    /// A RedisJSON document: always text, never passed through a codec.
+    Doc(String),
+    Rows {
+        headers: Vec<&'static str>,
+        rows: Vec<RawRow>,
+        total: u64,
+    },
+    Unsupported(String),
+}
+
+struct RawRow {
+    id: String,
+    cells: Vec<RawCell>,
+}
+
+enum RawCell {
+    /// Indexes, hash field names, scores, stream ids: shown as they are.
+    Text(String),
+    /// An element's value, which a codec may decode.
+    Bytes(Vec<u8>),
+    /// A stream entry's flat field/value list; the values may be decoded.
+    Fields(Vec<Vec<u8>>),
+}
+
+/// Turn a raw read into what the value pane shows, decoding through `view`.
+/// With [`View::Plain`] this is exactly what the pane has always shown.
+fn materialize(raw: RawValue, view: &View) -> (KeyValue, Option<String>) {
+    let mut failures = 0usize;
+    let mut first_error = None;
+    // One budget for the whole value: each element may use what the ones
+    // before it left, in bytes and in time for a custom codec's program.
+    let mut budget = crate::codec::Budget::new(DECODE_BUDGET);
+    let mut cell = |bytes: Vec<u8>| -> (String, Option<Decoding>) {
+        match crate::codec::show_with(bytes, view, &mut budget) {
+            Shown::Plain(text) => (text, None),
+            Shown::Decoded { text, decoding } => (text, Some(decoding)),
+            Shown::Failed { text, error } => {
+                failures += 1;
+                first_error.get_or_insert(error);
+                (text, None)
+            }
+        }
+    };
+    let value = match raw {
+        RawValue::Str(bytes) => match cell(bytes) {
+            (text, None) => KeyValue::Str(text),
+            (text, Some(decoding)) => KeyValue::Decoded { text, decoding },
+        },
+        RawValue::Doc(text) => KeyValue::Str(text),
+        RawValue::Unsupported(msg) => KeyValue::Unsupported(msg),
+        RawValue::Rows {
+            headers,
+            rows,
+            total,
+        } => {
+            let rows = rows
+                .into_iter()
+                .map(|row| {
+                    let mut decoded = None;
+                    let cells = row
+                        .cells
+                        .into_iter()
+                        .map(|c| match c {
+                            RawCell::Text(text) => text,
+                            RawCell::Bytes(bytes) => {
+                                let (text, decoding) = cell(bytes);
+                                decoded = decoded.take().or(decoding);
+                                text
+                            }
+                            RawCell::Fields(flat) => {
+                                let mut flat = flat.into_iter();
+                                let mut parts = Vec::new();
+                                while let Some(f) = flat.next() {
+                                    let f = decode_value(f);
+                                    match flat.next() {
+                                        Some(v) => {
+                                            let (v, decoding) = cell(v);
+                                            decoded = decoded.take().or(decoding);
+                                            parts.push(format!("{f}={v}"));
+                                        }
+                                        None => parts.push(f),
+                                    }
+                                }
+                                parts.join("  ")
+                            }
+                        })
+                        .collect();
+                    Row {
+                        id: row.id,
+                        cells,
+                        decoding: decoded,
+                    }
+                })
+                .collect();
+            KeyValue::Rows {
+                headers,
+                rows,
+                total,
+            }
+        }
+    };
+    let notice = first_error.map(|error| {
+        let codec = match view {
+            View::Codec(codec) => codec.name().to_string(),
+            _ => "the codec".into(),
+        };
+        if matches!(value, KeyValue::Rows { .. }) {
+            format!("{failures} element(s) could not be read as {codec} and are shown as stored: {error}")
+        } else {
+            format!("Could not read this value as {codec}; showing it as stored: {error}")
+        }
+    });
+    (value, notice)
 }
 
 /// Opens every hex dump, so a dump can be recognised again and never written

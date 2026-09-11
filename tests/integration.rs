@@ -66,7 +66,9 @@ async fn scans_types_and_reads_every_value_shape() {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(total, 1);
             }
-            KeyValue::Unsupported(_) => panic!("unexpected type for {}", k.name),
+            KeyValue::Decoded { .. } | KeyValue::Unsupported(_) => {
+                panic!("unexpected type for {}", k.name)
+            }
         }
     }
 
@@ -667,6 +669,7 @@ async fn binary_key_names_and_values_survive_the_whole_round_trip() {
         kind: KeyType::String,
         selector: String::new(),
         original: shown.clone(),
+        decoded: None,
     };
     assert!(
         c.save_edit(&target, &["anything".into()], false)

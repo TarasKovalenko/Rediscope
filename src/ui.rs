@@ -363,6 +363,7 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
 
 fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(area);
+    refresh_text_cache(app, palette);
 
     let header = match &app.current {
         Some(k) => {
@@ -379,6 +380,11 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 }
                 Some(KeyValue::Rows { total, .. }) => format!("   {total} element(s)"),
                 Some(KeyValue::Str(s)) => format!("   {} byte(s)", s.len()),
+                Some(KeyValue::Decoded { text, decoding }) => format!(
+                    "   {} byte(s) stored · {} decoded",
+                    decoding.raw.len(),
+                    text.len()
+                ),
                 _ => String::new(),
             };
             Paragraph::new(vec![
@@ -388,7 +394,18 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                         k.kind.name(),
                         Style::new().fg(type_color(k.kind, palette)).bold(),
                     ),
-                    Span::styled(json_badge(&app.value), Style::new().fg(palette.info).bold()),
+                    Span::styled(
+                        codec_badge(&app.value, &app.view_for(&k.name)),
+                        Style::new().fg(palette.magenta).bold(),
+                    ),
+                    Span::styled(
+                        if app.text_cache.as_ref().is_some_and(|c| c.json) {
+                            "  ·  json"
+                        } else {
+                            ""
+                        },
+                        Style::new().fg(palette.info).bold(),
+                    ),
                     Span::styled(format!("   ttl: {ttl}"), Style::new().fg(palette.dim)),
                     Span::styled(
                         if app.client.as_ref().is_some_and(|c| {
@@ -426,12 +443,23 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             .block(panel("Value", focused, palette)),
             rows[1],
         ),
-        Some(KeyValue::Str(s)) => {
-            let text = json_text(s, palette);
+        Some(KeyValue::Str(_) | KeyValue::Decoded { .. }) => {
+            let lines = app
+                .text_cache
+                .as_ref()
+                .map_or(&[][..], |c| c.lines.as_slice());
+            // A long value is drawn from the lines in view only: wrapping and
+            // styling a hundred thousand lines every frame would freeze the UI.
+            let paragraph = if lines.len() > WINDOWED_LINES {
+                let start = usize::from(app.value_scroll).min(lines.len().saturating_sub(1));
+                let end = (start + usize::from(rows[1].height)).min(lines.len());
+                Paragraph::new(lines[start..end].to_vec())
+            } else {
+                Paragraph::new(lines.to_vec()).scroll((app.value_scroll, 0))
+            };
             f.render_widget(
-                Paragraph::new(text)
+                paragraph
                     .wrap(Wrap { trim: false })
-                    .scroll((app.value_scroll, 0))
                     .block(panel("Value", focused, palette)),
                 rows[1],
             );
@@ -734,6 +762,11 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         Modal::Memory(state) => memory_report(f, area, state, palette),
         Modal::Info(state) => server_info(f, area, state, palette),
         Modal::ThemePicker { selected, .. } => theme_picker(f, area, *selected, palette),
+        Modal::ViewPicker {
+            key,
+            selected,
+            options,
+        } => view_picker(f, area, key, *selected, options, palette),
     }
 }
 
@@ -927,6 +960,46 @@ fn theme_picker(f: &mut Frame, area: Rect, selected: usize, palette: Palette) {
         ListItem::new(line)
     });
     f.render_widget(List::new(items), inner);
+}
+
+/// The `v` dialog: how to show the open key's bytes.
+fn view_picker(
+    f: &mut Frame,
+    area: Rect,
+    key: &str,
+    selected: usize,
+    options: &[crate::codec::View],
+    palette: Palette,
+) {
+    let rect = centered(area, 76, options.len() as u16 + 4);
+    clear_area(f, rect, palette);
+    let title = format!(
+        "View '{}' as — ↑↓ choose, Enter applies, Esc cancels",
+        truncate(key, 24)
+    );
+    let block = panel(&title, true, palette);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let items: Vec<ListItem> = options
+        .iter()
+        .enumerate()
+        .map(|(i, view)| {
+            let marker = if i == selected { "›" } else { " " };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {marker} {:<18}", truncate(&view.label(), 18)),
+                    if i == selected {
+                        Style::new().fg(palette.foreground).bold()
+                    } else {
+                        Style::new().fg(palette.dim)
+                    },
+                ),
+                Span::styled(view.description(), Style::new().fg(palette.dim)),
+            ]))
+        })
+        .collect();
+    let mut state = ratatui::widgets::ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(List::new(items), inner, &mut state);
 }
 
 /// The `INFO` viewer: a tab strip over a scrolling, filterable field list.
@@ -1799,24 +1872,94 @@ fn type_color(kind: KeyType, palette: Palette) -> Color {
 
 /// Collapse control characters so a multi-line value cannot break the table.
 fn one_line(s: &str) -> String {
-    let flat: String = s
-        .chars()
+    // Only the part that is shown is walked: a cell can hold a megabyte of
+    // decoded text, and this runs for every row on every frame.
+    let mut chars = s.chars();
+    let flat: String = chars
+        .by_ref()
+        .take(400)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    if flat.chars().count() > 400 {
-        flat.chars().take(400).collect::<String>() + "…"
+    if chars.next().is_some() {
+        flat + "…"
     } else {
         flat
     }
 }
 
-/// Indent a value that parses as JSON; return it untouched otherwise.
-/// " · json" when a string value parses as a JSON document.
-fn json_badge(value: &Option<KeyValue>) -> String {
-    match value {
-        Some(KeyValue::Str(s)) if json::mode(s).is_json() => "  ·  json".into(),
-        _ => String::new(),
+/// Past this many lines, a string value is drawn from the lines in view only.
+const WINDOWED_LINES: usize = 2_000;
+
+/// A string value's rendered lines, kept between frames. Parsing, indenting
+/// and colouring JSON is by far the most expensive part of a frame, and the
+/// value only changes when it is read again.
+pub struct TextCache {
+    /// The value the lines were rendered from, and the theme they were
+    /// coloured with. Compared rather than hashed: a different value usually
+    /// differs in length or early on, and an unchanged one costs one memcmp.
+    source: String,
+    theme: Theme,
+    /// Whether the value parses as a JSON document, for the header badge.
+    pub json: bool,
+    pub lines: Vec<Line<'static>>,
+}
+
+fn refresh_text_cache(app: &mut App, palette: Palette) {
+    let Some(KeyValue::Str(s) | KeyValue::Decoded { text: s, .. }) = &app.value else {
+        app.text_cache = None;
+        return;
+    };
+    let theme = app.store.theme;
+    if app
+        .text_cache
+        .as_ref()
+        .is_some_and(|c| c.theme == theme && c.source == *s)
+    {
+        return;
     }
+    app.text_cache = Some(TextCache {
+        source: s.clone(),
+        theme,
+        json: json::mode(s).is_json(),
+        lines: json_text(s, palette).lines,
+    });
+}
+
+/// " · gzip" when the value on screen was decoded, naming the codec, and
+/// " · plain" when the user asked for the bytes as stored. Read-only
+/// decodings say so, since `e` will refuse them.
+pub fn codec_badge(value: &Option<KeyValue>, view: &crate::codec::View) -> String {
+    use crate::codec::View;
+    let mut names: Vec<String> = Vec::new();
+    let mut read_only = false;
+    let mut note = |d: &crate::codec::Decoding| {
+        if !names.iter().any(|n| n == d.codec.name()) {
+            names.push(d.codec.name().to_string());
+        }
+        read_only |= d.read_only.is_some();
+    };
+    match value {
+        Some(KeyValue::Decoded { decoding, .. }) => note(decoding),
+        Some(KeyValue::Rows { rows, .. }) => rows
+            .iter()
+            .filter_map(|r| r.decoding.as_ref())
+            .for_each(note),
+        _ => {}
+    }
+    if names.is_empty() {
+        return match view {
+            View::Auto => String::new(),
+            View::Plain => "  ·  plain".into(),
+            // The chosen codec could not read anything here; the status line
+            // says why.
+            other => format!("  ·  {}: not decoded", other.label()),
+        };
+    }
+    let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join("/");
+    format!(
+        "  ·  {shown}{}",
+        if read_only { " (read-only)" } else { "" }
+    )
 }
 
 /// A string value as renderable text: coloured and indented when it is JSON,
@@ -1927,7 +2070,7 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
             "reformat JSON in the editor · ctrl+s validates before saving",
         ),
         row("a", "add an element (hash / list / set / zset / stream)"),
-        row("x", "delete the selected element"),
+        row("x", "delete the selected element   v  view as gzip, hex …"),
         row("PgUp / PgDn", "scroll the selected JSON / XML preview"),
         head("Server"),
         row(

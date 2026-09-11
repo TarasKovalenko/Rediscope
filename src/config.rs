@@ -300,6 +300,11 @@ pub struct Store {
     /// Per-profile view state, keyed by profile name.
     #[serde(default)]
     pub sessions: std::collections::HashMap<String, Session>,
+    /// Codecs defined by the user: external programs the value pane can view,
+    /// and optionally edit, values through. Absent unless configured, so files
+    /// without any are written exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<crate::codec::CustomCodec>,
     /// Set when the file exists but could not be read. Saving is refused while
     /// it is set, so a bad read can never overwrite good profiles with an
     /// empty list.
@@ -328,6 +333,7 @@ impl Store {
                             ..Default::default()
                         }],
                         sessions: Default::default(),
+                        codecs: Vec::new(),
                         read_error: None,
                     },
                     None,
@@ -340,6 +346,7 @@ impl Store {
                         theme: Theme::default(),
                         connections: Vec::new(),
                         sessions: Default::default(),
+                        codecs: Vec::new(),
                         read_error: Some(notice.clone()),
                     },
                     Some(format!("{notice} — saving is disabled so nothing is lost")),
@@ -365,6 +372,7 @@ impl Store {
                             theme: Theme::default(),
                             connections: Vec::new(),
                             sessions: Default::default(),
+                            codecs: Vec::new(),
                             read_error: Some(notice.clone()),
                         },
                         Some(format!(
@@ -403,6 +411,7 @@ impl Store {
                 })
                 .collect(),
             sessions: self.sessions.clone(),
+            codecs: self.codecs.clone(),
             read_error: None,
         };
         let text = serde_json::to_string_pretty(&sanitized)?;
@@ -742,6 +751,7 @@ mod tests {
             theme: Theme::default(),
             connections: Vec::new(),
             sessions: Default::default(),
+            codecs: Vec::new(),
             read_error: Some("permission denied".into()),
         };
         let err = store.save().unwrap_err().to_string();
@@ -763,6 +773,30 @@ mod tests {
     fn an_older_file_without_a_theme_uses_the_classic_theme() {
         let store: Store = serde_json::from_str(r#"{"connections": []}"#).unwrap();
         assert_eq!(store.theme, Theme::Redis);
+    }
+
+    #[test]
+    fn custom_codecs_survive_a_save_and_are_absent_when_unset() {
+        let mut env = ScopedEnv::new();
+        let dir = tempdir();
+        env.set("REDISCOPE_HOME", &dir);
+        // Files that never configured a codec are written without the key.
+        Store::default().save().unwrap();
+        let text = fs::read_to_string(config_file()).unwrap();
+        assert!(!text.contains("codecs"), "{text}");
+
+        let store = Store {
+            codecs: vec![crate::codec::CustomCodec {
+                name: "proto".into(),
+                decode: vec!["protoc".into(), "--decode_raw".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        store.save().unwrap();
+        let (loaded, notice) = Store::load();
+        assert!(notice.is_none());
+        assert_eq!(loaded.codecs, store.codecs);
     }
 
     #[test]
@@ -793,6 +827,7 @@ mod tests {
                 ..Default::default()
             }],
             sessions: Default::default(),
+            codecs: Vec::new(),
             read_error: None,
         };
         first.save().unwrap();
@@ -803,6 +838,7 @@ mod tests {
                 ..Default::default()
             }],
             sessions: Default::default(),
+            codecs: Vec::new(),
             read_error: None,
         };
         second.save().unwrap();

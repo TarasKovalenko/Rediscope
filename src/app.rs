@@ -3,13 +3,14 @@
 //! Every Redis call runs on a spawned task and reports back over an mpsc
 //! channel, so the UI thread never awaits the network.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::codec::View;
 use crate::config::{Connection, Store};
 use crate::history::History;
 use crate::input::{Completion, InputBuf, ReverseSearch, complete};
@@ -47,6 +48,22 @@ pub enum Msg {
     Value {
         info: KeyInfo,
         value: KeyValue,
+    },
+    /// A value read started by [`App::reload_value`]. Only the reply to the
+    /// latest read is shown: an earlier one, still decoding when the view or
+    /// the key changed, would put back what the user just moved away from.
+    Loaded {
+        seq: u64,
+        info: KeyInfo,
+        value: KeyValue,
+        /// Why part of the value could not be shown through the chosen view.
+        notice: Option<String>,
+    },
+    /// A value read started by [`App::reload_value`] failed. Ignored unless it
+    /// is the latest read, like [`Msg::Loaded`].
+    LoadFailed {
+        seq: u64,
+        error: String,
     },
     /// A write finished; `Ok` carries the status line to show.
     Mutated(Result<String, String>),
@@ -1038,6 +1055,12 @@ pub enum Modal {
         selected: usize,
         original: Theme,
     },
+    /// How to look at the open key's bytes: as stored, or through a codec.
+    ViewPicker {
+        key: String,
+        selected: usize,
+        options: Vec<View>,
+    },
     Help,
 }
 
@@ -1092,6 +1115,11 @@ pub struct App {
     pub value: Option<KeyValue>,
     pub value_state: TableState,
     pub value_scroll: u16,
+    /// Keys the user chose a view for with `v`. Every other key is read with
+    /// [`View::Auto`]. Kept for the session, and cleared on reconnect.
+    pub views: HashMap<String, View>,
+    /// The open string value's rendered lines, reused while it is unchanged.
+    pub text_cache: Option<crate::ui::TextCache>,
 
     pub modal: Option<Modal>,
 
@@ -1105,6 +1133,8 @@ pub struct App {
     /// The key a value read is in flight for. A reply for anything else has
     /// been scrolled past and must not replace what is on screen.
     pending_value: Option<String>,
+    /// Numbers every value read, so only the latest reply is shown.
+    value_seq: u64,
 
     /// When the TTL clock last advanced.
     last_tick: std::time::Instant,
@@ -1150,10 +1180,13 @@ impl App {
             value: None,
             value_state: TableState::default(),
             value_scroll: 0,
+            views: HashMap::new(),
+            text_cache: None,
             modal: None,
             pending_selection: None,
             value_due: None,
             pending_value: None,
+            value_seq: 0,
             last_tick: std::time::Instant::now(),
         }
     }
@@ -1172,6 +1205,8 @@ impl App {
 
     pub fn connect(&mut self, conn: Connection) {
         self.edit_session = self.edit_session.wrapping_add(1);
+        // Another server or database: the same key name may hold anything.
+        self.views.clear();
         if let Some(client) = &self.client {
             let _ = client.lock_writes();
         }
@@ -1225,15 +1260,50 @@ impl App {
             return;
         };
         self.pending_value = Some(name.clone());
+        self.value_seq = self.value_seq.wrapping_add(1);
+        let seq = self.value_seq;
+        let view = self.view_for(&name);
         self.spawn(async move {
             match client.key_info(&name).await {
-                Ok(info) => match client.read_value(&info.name, info.kind).await {
-                    Ok(value) => Msg::Value { info, value },
-                    Err(e) => Msg::Error(format!("read failed: {e}")),
+                Ok(info) => match client.read_value_as(&info.name, info.kind, &view).await {
+                    Ok((value, notice)) => Msg::Loaded {
+                        seq,
+                        info,
+                        value,
+                        notice,
+                    },
+                    Err(e) => Msg::LoadFailed {
+                        seq,
+                        error: format!("read failed: {e}"),
+                    },
                 },
-                Err(e) => Msg::Error(format!("read failed: {e}")),
+                Err(e) => Msg::LoadFailed {
+                    seq,
+                    error: format!("read failed: {e}"),
+                },
             }
         });
+    }
+
+    /// Put a freshly read value in the pane, keeping the selected element when
+    /// it is the same key being refreshed.
+    fn show_value(&mut self, info: KeyInfo, value: KeyValue) {
+        let same_key = self.current.as_ref().is_some_and(|c| c.name == info.name);
+        self.current = Some(info);
+        self.value = Some(value);
+        if !same_key {
+            self.value_state.select(Some(0));
+            self.value_scroll = 0;
+        } else if let Some(KeyValue::Rows { rows, .. }) = &self.value {
+            let idx = self.value_state.selected().unwrap_or(0);
+            self.value_state
+                .select(Some(idx.min(rows.len().saturating_sub(1))));
+        }
+    }
+
+    /// How the value pane reads `key`: the view chosen for it, or auto.
+    pub fn view_for(&self, key: &str) -> View {
+        self.views.get(key).cloned().unwrap_or_default()
     }
 
     fn mutate<F, Fut>(&mut self, ok_status: &str, f: F)
@@ -1424,6 +1494,27 @@ impl App {
                     self.tree_state.select(Some(idx));
                 }
             }
+            Msg::Loaded {
+                seq,
+                info,
+                value,
+                notice,
+            } => {
+                if seq != self.value_seq {
+                    return;
+                }
+                if let Some(notice) = notice {
+                    self.status = notice;
+                }
+                self.pending_value = None;
+                self.show_value(info, value);
+            }
+            Msg::LoadFailed { seq, error } => {
+                if seq == self.value_seq {
+                    self.pending_value = None;
+                    self.on_msg(Msg::Error(error));
+                }
+            }
             Msg::Value { info, value } => {
                 // A reply for a key the cursor has already left is discarded,
                 // so a slow read can never overwrite a newer selection.
@@ -1435,17 +1526,7 @@ impl App {
                     return;
                 }
                 self.pending_value = None;
-                let same_key = self.current.as_ref().is_some_and(|c| c.name == info.name);
-                self.current = Some(info);
-                self.value = Some(value);
-                if !same_key {
-                    self.value_state.select(Some(0));
-                    self.value_scroll = 0;
-                } else if let Some(KeyValue::Rows { rows, .. }) = &self.value {
-                    let idx = self.value_state.selected().unwrap_or(0);
-                    self.value_state
-                        .select(Some(idx.min(rows.len().saturating_sub(1))));
-                }
+                self.show_value(info, value);
             }
             Msg::EditCompleted {
                 session,
@@ -2053,6 +2134,7 @@ impl App {
             KeyCode::Char('a') => self.prompt_add_item(),
             KeyCode::Char('e') | KeyCode::Char('E') => self.prompt_edit(),
             KeyCode::Char('x') => self.confirm_delete_row(),
+            KeyCode::Char('v') => self.open_view_picker(),
             _ => match self.focus {
                 Focus::Tree => self.tree_key(key),
                 Focus::Value => self.value_key(key),
@@ -2111,6 +2193,8 @@ impl App {
                 if self.current.as_ref().map(|c| &c.name) != Some(&k.name) {
                     self.current = Some(k);
                     self.value = None;
+                    // Any read still in flight is for the key we just left.
+                    self.value_seq = self.value_seq.wrapping_add(1);
                     // Wait for the cursor to settle. A reply already on its way
                     // for the key we just left is dropped when it arrives.
                     self.value_due = Some(std::time::Instant::now() + VALUE_DEBOUNCE);
@@ -2121,6 +2205,7 @@ impl App {
                 self.value = None;
                 self.value_due = None;
                 self.pending_value = None;
+                self.value_seq = self.value_seq.wrapping_add(1);
             }
         }
     }
@@ -2601,8 +2686,18 @@ impl App {
         };
         let name = k.name.clone();
         if matches!(k.kind, KeyType::String | KeyType::Json) {
-            let current = match &self.value {
-                Some(KeyValue::Str(s)) => s.clone(),
+            let (current, decoded) = match &self.value {
+                Some(KeyValue::Str(s)) => (s.clone(), None),
+                Some(KeyValue::Decoded { text, decoding }) => {
+                    if let Some(reason) = &decoding.read_only {
+                        self.status = format!(
+                            "Shown through {} and read-only: {reason}. Press v and choose plain to edit the stored value",
+                            decoding.codec.name()
+                        );
+                        return;
+                    }
+                    (text.clone(), Some(decoding.clone()))
+                }
                 _ => {
                     self.status = "Wait for the value to load before editing".into();
                     return;
@@ -2622,14 +2717,19 @@ impl App {
             } else {
                 current.clone()
             };
-            let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
+            let mut ta = TextArea::from(editor_lines(&text));
             ta.set_cursor_line_style(ratatui::style::Style::default());
+            // Through a codec the title says so: the draft is encoded again on save.
+            let via = decoded
+                .as_ref()
+                .map(|d| format!("{} ", d.codec.name()))
+                .unwrap_or_default();
             let title = if k.kind == KeyType::Json {
                 format!("Edit document '{name}'")
             } else if mode.is_json() {
-                format!("Edit JSON '{name}'")
+                format!("Edit {via}JSON '{name}'")
             } else {
-                format!("Edit string '{name}'")
+                format!("Edit {via}string '{name}'")
             };
             // A RedisJSON document is always JSON, whatever the text looks like
             // right now, so it is checked before it is written back.
@@ -2643,6 +2743,7 @@ impl App {
                 kind: k.kind,
                 selector: String::new(),
                 original: current,
+                decoded,
             });
             self.modal = Some(Modal::Editor {
                 title,
@@ -2669,6 +2770,27 @@ impl App {
                 "This element is binary and shown as a hex dump; it cannot be edited here".into();
             return;
         }
+        // An element shown through a codec is saved back through it. That is
+        // only offered where the element's value is not also its address.
+        // Streams are never edited, whatever the view: they fall through to
+        // the message that says so.
+        if let Some(decoding) = row.decoding.as_ref().filter(|_| k.kind != KeyType::Stream) {
+            if let Some(reason) = &decoding.read_only {
+                self.status = format!(
+                    "Shown through {} and read-only: {reason}. Press v and choose plain to edit the stored value",
+                    decoding.codec.name()
+                );
+                return;
+            }
+            if matches!(k.kind, KeyType::Set | KeyType::ZSet) {
+                self.status = format!(
+                    "Members shown through {} are read-only. Press v and choose plain to edit the stored member",
+                    decoding.codec.name()
+                );
+                return;
+            }
+        }
+        let decoded = row.decoding.clone();
         self.modal = Some(match k.kind {
             KeyType::Hash => Modal::Form {
                 title: format!("Edit field '{}'", row.id),
@@ -2676,7 +2798,7 @@ impl App {
                 fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
                 focus: 0,
                 error: None,
-                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default() }),
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default(), decoded }),
             },
             KeyType::List => {
                 let index: isize = row.id.parse().unwrap_or(0);
@@ -2686,7 +2808,7 @@ impl App {
                     fields: vec![Field::text("Value", row.cells.get(1).map_or("", |v| v))],
                     focus: 0,
                     error: None,
-                    action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: index.to_string(), original: row.cells.get(1).cloned().unwrap_or_default() }),
+                    action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: index.to_string(), original: row.cells.get(1).cloned().unwrap_or_default(), decoded }),
                 }
             }
             KeyType::Set => Modal::Form {
@@ -2695,7 +2817,7 @@ impl App {
                 fields: vec![Field::text("Member", &row.id)],
                 focus: 0,
                 error: None,
-                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id.clone(), original: row.id }),
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id.clone(), original: row.id, decoded: None }),
             },
             KeyType::ZSet => Modal::Form {
                 title: "Edit sorted-set member".into(),
@@ -2706,7 +2828,7 @@ impl App {
                 ],
                 focus: 0,
                 error: None,
-                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default() }),
+                action: Action::SafeEdit(EditTarget { key: name, kind: k.kind, selector: row.id, original: row.cells.get(1).cloned().unwrap_or_default(), decoded: None }),
             },
             KeyType::TimeSeries => Modal::Message {
                 title: "Not editable".into(),
@@ -2734,7 +2856,7 @@ impl App {
             } else {
                 value
             };
-            let mut ta = TextArea::from(text.lines().collect::<Vec<_>>());
+            let mut ta = TextArea::from(editor_lines(&text));
             ta.set_cursor_line_style(ratatui::style::Style::default());
             self.modal = Some(Modal::Editor {
                 title: format!("Edit '{}'", target.key),
@@ -3059,6 +3181,35 @@ impl App {
         }));
     }
 
+    /// Choose how the open key's value is shown: auto, as stored, or
+    /// through a particular codec.
+    fn open_view_picker(&mut self) {
+        let Some(k) = self.current.as_ref() else {
+            self.status = "Select a key first".into();
+            return;
+        };
+        if !matches!(
+            k.kind,
+            KeyType::String
+                | KeyType::Hash
+                | KeyType::List
+                | KeyType::Set
+                | KeyType::ZSet
+                | KeyType::Stream
+        ) {
+            self.status = format!("A {} key is always shown as stored", k.kind.name());
+            return;
+        }
+        let options = View::all(&self.store.codecs);
+        let current = self.view_for(&k.name);
+        let selected = options.iter().position(|v| *v == current).unwrap_or(0);
+        self.modal = Some(Modal::ViewPicker {
+            key: k.name.clone(),
+            selected,
+            options,
+        });
+    }
+
     fn open_theme_picker(&mut self) {
         let original = self.store.theme;
         self.modal = Some(Modal::ThemePicker {
@@ -3123,6 +3274,37 @@ impl App {
             }
             if close {
                 self.modal = None;
+            }
+            return;
+        }
+        if let Some(Modal::ViewPicker {
+            key: name,
+            selected,
+            options,
+        }) = &mut self.modal
+        {
+            let last = options.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
+                KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(last),
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Home | KeyCode::Char('g') => *selected = 0,
+                KeyCode::End | KeyCode::Char('G') => *selected = last,
+                KeyCode::Enter => {
+                    let name = name.clone();
+                    let view = options.get(*selected).cloned().unwrap_or_default();
+                    self.modal = None;
+                    self.status = format!("Showing '{name}' as {}", view.label());
+                    if view == View::Auto {
+                        self.views.remove(&name);
+                    } else {
+                        self.views.insert(name.clone(), view);
+                    }
+                    if self.current.as_ref().is_some_and(|c| c.name == name) {
+                        self.reload_value();
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -3601,7 +3783,9 @@ impl App {
                 }
                 _ => {}
             },
-            Modal::Groups(_) | Modal::ThemePicker { .. } => unreachable!("handled above"),
+            Modal::Groups(_) | Modal::ThemePicker { .. } | Modal::ViewPicker { .. } => {
+                unreachable!("handled above")
+            }
         }
     }
 
@@ -3753,6 +3937,8 @@ impl App {
 
     fn switch_db(&mut self, db: i64) {
         self.edit_session = self.edit_session.wrapping_add(1);
+        // The same key name in another database may hold anything.
+        self.views.clear();
         if let Some(client) = &self.client {
             let _ = client.lock_writes();
         }
@@ -4630,6 +4816,13 @@ fn next_focus(fields: &[Field], from: usize, dir: isize) -> usize {
     from
 }
 
+/// A value split into editor lines so that joining them with `\n` on save
+/// gives the value back: a trailing newline, or a `\r` before one, survives an
+/// edit that did not touch it.
+fn editor_lines(text: &str) -> Vec<&str> {
+    text.split('\n').collect()
+}
+
 fn move_sel<S: Selectable>(state: &mut S, len: usize, delta: isize) {
     if len == 0 {
         state.set(None);
@@ -4984,6 +5177,21 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_gives_back_exactly_the_text_it_was_opened_on() {
+        for text in ["hello", "hello\n", "a\r\nb\r\n", "", "\n\n", "x\n\ny"] {
+            assert_eq!(editor_lines(text).join("\n"), text, "{text:?}");
+        }
+        let mut app = tick_app(vec![info("k", -1)]);
+        app.current = Some(info("k", -1));
+        app.value = Some(KeyValue::Str("line\n".into()));
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        let Some(Modal::Editor { textarea, .. }) = &app.modal else {
+            panic!("expected the editor")
+        };
+        assert_eq!(textarea.lines().join("\n"), "line\n");
+    }
+
+    #[test]
     fn a_plain_string_edit_is_never_json_checked() {
         let mut app = tick_app(vec![info("greeting", -1)]);
         app.current = Some(info("greeting", -1));
@@ -4997,6 +5205,257 @@ mod tests {
         assert_eq!(*json, JsonMode::None);
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.modal.is_none(), "a plain string saves straight away");
+    }
+
+    fn gzip_decoding(read_only: Option<&str>) -> crate::codec::Decoding {
+        crate::codec::Decoding {
+            codec: crate::codec::Codec::Builtin(crate::codec::Builtin::Gzip),
+            raw: vec![0x1f, 0x8b, 0x08],
+            read_only: read_only.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn only_the_latest_value_read_reaches_the_pane() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        app.current = Some(info("a", -1));
+        // Two reads are in flight: the first through a slow codec, the second
+        // after the view was changed. The second answers first.
+        app.value_seq = 2;
+        app.on_msg(Msg::Loaded {
+            seq: 2,
+            info: info("a", -1),
+            value: KeyValue::Str("as stored".into()),
+            notice: None,
+        });
+        app.on_msg(Msg::Loaded {
+            seq: 1,
+            info: info("a", -1),
+            value: KeyValue::Str("stale decode".into()),
+            notice: Some("stale notice".into()),
+        });
+        assert!(matches!(app.value, Some(KeyValue::Str(ref s)) if s == "as stored"));
+        assert!(!app.status.contains("stale"), "{}", app.status);
+
+        // The latest reply's notice is shown with it.
+        app.value_seq = 3;
+        app.on_msg(Msg::Loaded {
+            seq: 3,
+            info: info("a", -1),
+            value: KeyValue::Str("x".into()),
+            notice: Some("2 element(s) could not be read".into()),
+        });
+        assert_eq!(app.status, "2 element(s) could not be read");
+    }
+
+    #[test]
+    fn a_superseded_read_that_fails_stays_quiet() {
+        let mut app = tick_app(vec![info("a", -1)]);
+        app.status = "ok".into();
+        app.value_seq = 5;
+        app.on_msg(Msg::LoadFailed {
+            seq: 4,
+            error: "read failed: old".into(),
+        });
+        assert_eq!(app.status, "ok");
+        app.on_msg(Msg::LoadFailed {
+            seq: 5,
+            error: "read failed: now".into(),
+        });
+        assert!(app.status.contains("read failed: now"), "{}", app.status);
+    }
+
+    #[test]
+    fn moving_to_another_key_drops_the_read_in_flight() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        app.tree_state.select(Some(0));
+        app.on_tree_move();
+        let in_flight = app.value_seq;
+        app.tree_state.select(Some(1));
+        app.on_tree_move();
+        app.on_msg(Msg::Loaded {
+            seq: in_flight,
+            info: info("a", -1),
+            value: KeyValue::Str("late".into()),
+            notice: None,
+        });
+        assert!(app.value.is_none());
+        assert_eq!(app.current.as_ref().unwrap().name, "b");
+    }
+
+    #[test]
+    fn v_picks_a_view_for_the_open_key_only() {
+        use crate::codec::{Builtin, Codec};
+        let mut app = tick_app(vec![info("blob", -1), info("other", -1)]);
+        app.current = Some(info("blob", -1));
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        let Some(Modal::ViewPicker {
+            selected, options, ..
+        }) = &app.modal
+        else {
+            panic!("expected the view picker")
+        };
+        assert_eq!(*selected, 0, "auto is the default");
+        let gzip = options
+            .iter()
+            .position(|v| *v == View::Codec(Codec::Builtin(Builtin::Gzip)))
+            .unwrap();
+        for _ in 0..gzip {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.view_for("blob"),
+            View::Codec(Codec::Builtin(Builtin::Gzip))
+        );
+        assert_eq!(app.view_for("other"), View::Auto);
+
+        // Reopening starts on the chosen view; Esc changes nothing.
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(matches!(app.modal, Some(Modal::ViewPicker { selected, .. }) if selected == gzip));
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(
+            app.view_for("blob"),
+            View::Codec(Codec::Builtin(Builtin::Gzip))
+        );
+
+        // Choosing auto again forgets the key.
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        app.on_key(KeyEvent::from(KeyCode::Char('g')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.views.is_empty());
+    }
+
+    #[test]
+    fn the_view_picker_lists_configured_custom_codecs() {
+        let mut app = tick_app(vec![info("blob", -1)]);
+        app.store.codecs = vec![crate::codec::CustomCodec {
+            name: "proto".into(),
+            decode: vec!["protoc".into()],
+            ..Default::default()
+        }];
+        app.current = Some(info("blob", -1));
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        let Some(Modal::ViewPicker { options, .. }) = &app.modal else {
+            panic!("expected the view picker")
+        };
+        assert_eq!(options.last().unwrap().label(), "proto (custom)");
+    }
+
+    #[test]
+    fn document_types_have_no_view_picker() {
+        let mut app = tick_app(vec![]);
+        app.current = Some(KeyInfo {
+            name: "doc".into(),
+            kind: KeyType::Json,
+            ttl: -1,
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("as stored"), "{}", app.status);
+    }
+
+    #[test]
+    fn editing_a_decoded_string_edits_the_text_and_remembers_the_codec() {
+        let mut app = tick_app(vec![info("doc", -1)]);
+        app.current = Some(info("doc", -1));
+        app.value = Some(KeyValue::Decoded {
+            text: r#"{"a":1}"#.into(),
+            decoding: gzip_decoding(None),
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        let Some(Modal::Editor {
+            title,
+            action: Action::SafeEdit(target),
+            json,
+            ..
+        }) = &app.modal
+        else {
+            panic!("expected the editor")
+        };
+        assert_eq!(title, "Edit gzip JSON 'doc'");
+        assert_eq!(*json, JsonMode::Compact);
+        assert_eq!(target.original, r#"{"a":1}"#);
+        assert_eq!(target.decoded, Some(gzip_decoding(None)));
+    }
+
+    #[test]
+    fn a_read_only_decoding_is_never_opened_for_editing() {
+        let mut app = tick_app(vec![info("doc", -1)]);
+        app.current = Some(info("doc", -1));
+        app.value = Some(KeyValue::Decoded {
+            text: "{}".into(),
+            decoding: gzip_decoding(Some("not text")),
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("read-only"), "{}", app.status);
+    }
+
+    fn rows_app(kind: KeyType, decoding: Option<crate::codec::Decoding>) -> App {
+        let key = KeyInfo {
+            name: "c".into(),
+            kind,
+            ttl: -1,
+        };
+        let mut app = tick_app(vec![key.clone()]);
+        app.current = Some(key);
+        let (headers, cells) = match kind {
+            KeyType::Set => (vec!["member"], vec!["shown".to_string()]),
+            KeyType::List => (vec!["index", "value"], vec!["0".into(), "shown".into()]),
+            _ => (vec!["field", "value"], vec!["f".into(), "shown".into()]),
+        };
+        app.value = Some(KeyValue::Rows {
+            headers,
+            rows: vec![crate::redis_client::Row {
+                id: cells[0].clone(),
+                cells,
+                decoding,
+            }],
+            total: 1,
+        });
+        app.value_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn decoded_hash_values_and_list_items_save_through_their_codec() {
+        for kind in [KeyType::Hash, KeyType::List] {
+            let mut app = rows_app(kind, Some(gzip_decoding(None)));
+            app.on_key(KeyEvent::from(KeyCode::Char('e')));
+            let Some(Modal::Form {
+                fields,
+                action: Action::SafeEdit(target),
+                ..
+            }) = &app.modal
+            else {
+                panic!("expected the edit form for {kind:?}")
+            };
+            assert_eq!(fields[0].input.value(), "shown");
+            assert_eq!(target.original, "shown");
+            assert_eq!(target.decoded, Some(gzip_decoding(None)));
+        }
+    }
+
+    #[test]
+    fn decoded_members_are_view_only() {
+        let mut app = rows_app(KeyType::Set, Some(gzip_decoding(None)));
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("read-only"), "{}", app.status);
+
+        // Without a codec a set member edits exactly as before.
+        let mut app = rows_app(KeyType::Set, None);
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Form {
+                action: Action::SafeEdit(EditTarget { decoded: None, .. }),
+                ..
+            })
+        ));
     }
     fn console_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();

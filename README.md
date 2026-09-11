@@ -153,6 +153,31 @@ rediscope
   bytes escaped as `\xNN`, so one binary key can no longer break the whole scan.
   Editing is refused on anything shown as a dump, because saving it would store
   the description over the bytes it describes.
+- **Compressed, packed and encoded values** (`v`). Bytes carrying a gzip, zlib,
+  zstd or LZ4 header, or a MessagePack map or array, are decoded automatically
+  and shown with the codec named in the header (`string · gzip · json`). Text
+  is never second-guessed: a value that reads as text is shown exactly as
+  before. `v` picks a view for the open key — `auto`, `plain` (as stored), or
+  one of gzip, zlib, deflate, zstd, lz4, brotli, msgpack, base64 and hex — and
+  it applies to a string or to every element of a hash, list, set, sorted set
+  or stream. Edits are encoded the same way on save: change a gzipped JSON
+  document and it is stored gzipped, with the TTL kept and the conflict check
+  still comparing the exact bytes that were read; saving without a change
+  writes back the original bytes untouched. MessagePack is edited as JSON, and
+  the `hex` view edits binary values up to 256 KiB byte for byte. A value that
+  cannot be written back exactly is shown but marked read-only: MessagePack
+  holding binary or float32 data or encoded differently than rediscope would
+  write it, base64 in another flavour, a decompressed payload that is not text,
+  or decoded text past 1 MiB, which the pane cuts off. Concatenated zstd, LZ4
+  and gzip frames decode in full, and a stream followed by bytes it does not
+  account for is shown as stored rather than half-decoded. Decompression stops
+  at 32 MiB per value and 64 MiB per read, and MessagePack is decoded up to
+  1 MiB, so a small compression bomb cannot take the client down. Set and
+  sorted-set members shown through a codec are view-only, since the member is
+  also the element's address.
+- **Custom codecs.** Point rediscope at your own decoder — `protoc`, a
+  deserializer script — and it appears in the `v` list. See
+  [Custom codecs](#custom-codecs).
 - **JSON values.** A string holding JSON is shown indented and syntax-coloured
   with a `json` badge. The editor opens it pretty-printed, `Ctrl+F` reformats,
   and `Ctrl+S` refuses to save a document that no longer parses. Key order is
@@ -331,6 +356,7 @@ Press `?` in the app for this list at any time.
 | `a` | Add an element to a hash / list / set / zset / stream |
 | `x` | Delete the selected element |
 | `PgUp` `PgDn` | Scroll the selected JSON or XML preview |
+| `v` | View the value as auto, plain, gzip, zstd, msgpack, hex … or a custom codec |
 | `i` | Server info |
 | `M` | Namespace memory report |
 | `P` / `N` | Pub/sub feed · keyspace event feed |
@@ -589,6 +615,56 @@ cannot truncate it. A file that exists but does not parse is moved aside as
 `connections.json.bad-<timestamp>` rather than replaced, and a file that cannot
 be read at all disables saving for the session instead of overwriting profiles
 that are still on disk.
+
+### Custom codecs
+
+Add a `codecs` list to `connections.json` to view values through your own
+programs. `decode` receives the stored bytes on stdin and prints the text to
+show; the optional `encode` does the reverse, and without it values shown
+through the codec are read-only. Before an edit is saved, the pair is checked
+against itself: the text `decode` reads back from the new bytes must survive
+another `encode` and `decode` unchanged. The edit must also survive the trip: an
+encoder that prints nothing, or reads back as the value you started from, saves
+nothing. A decoder that prints its own canonical form (a trailing newline,
+reordered fields) and an encoder that never writes the same bytes twice
+(encryption with a fresh salt) both work. These checks catch a broken or
+mismatched pair, not every possible bug in one, so test a new codec on a
+disposable key first. Both are argument lists, not
+shell strings, so a value only ever reaches the program's stdin, and
+`REDISCOPE_PASSWORD` is removed from the program's environment. A leading `~` in
+the program path is expanded. A name cannot reuse a built-in view (`gzip`,
+`plain`, …).
+
+`timeout_secs` (default 10, at most 600) is shared by every element of one
+read: a program that hangs on a hash field stops the rest of that hash from
+going through it, rather than stalling each field in turn. On timeout the
+program is killed together with anything it started (on Unix, its whole process
+group). A failing program has its stderr shown in the status line.
+
+> **Warning:** a decoder runs on whatever the server holds, and anyone who can
+> write to that server controls its input. Never configure a deserializer that
+> can execute code — Python `pickle`, Java serialization, PHP `unserialize` —
+> against data you do not fully trust.
+
+```json
+{
+  "codecs": [
+    {
+      "name": "user.proto",
+      "decode": ["protoc", "--decode=app.User", "-I", "/srv/proto", "user.proto"],
+      "encode": ["protoc", "--encode=app.User", "-I", "/srv/proto", "user.proto"]
+    },
+    {
+      "name": "protobuf-raw",
+      "decode": ["protoc", "--decode_raw"],
+      "timeout_secs": 5
+    }
+  ]
+}
+```
+
+Custom codecs are only run when you choose one with `v`; automatic detection
+uses the built-in codecs alone.
 
 ### Environments and the production lease
 
