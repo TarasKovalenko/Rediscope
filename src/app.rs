@@ -16,10 +16,11 @@ use crate::history::History;
 use crate::input::{Completion, InputBuf, ReverseSearch, complete};
 use crate::json::{self, JsonMode};
 use crate::memory::{PrefixRow, Rollup};
+use crate::palette::{PaletteState, Target};
 use crate::redis_client::{
     Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT,
-    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, ServerInfo, StreamGroup, StreamGroupDetail,
-    VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
+    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, ServerInfo, Similar, SimilarTo, StreamGroup,
+    StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
 };
 use crate::theme::Theme;
 use crate::tree::{Tree, VisibleRow};
@@ -61,6 +62,13 @@ pub enum Msg {
         notice: Option<String>,
         /// How much of a collection the read covered.
         coverage: Coverage,
+        /// A line about the value for the pane header, where the type has one.
+        detail: Option<String>,
+    },
+    /// Something read on request, to show in a dialog.
+    Details {
+        title: String,
+        body: Result<String, String>,
     },
     /// A value read started by [`App::reload_value`] failed. Ignored unless it
     /// is the latest read, like [`Msg::Loaded`].
@@ -154,6 +162,11 @@ pub enum Action {
     DeleteKey(String),
     RenameKey(String),
     SetTtl(String),
+    /// Set or clear one hash field's own expiry.
+    SetFieldTtl {
+        key: String,
+        field: String,
+    },
     TsAdd(String),
     TsDel {
         key: String,
@@ -185,6 +198,14 @@ pub enum Action {
         member: String,
     },
     StreamAdd(String),
+    /// Add an element to a vector set (`VADD`).
+    VsetAdd(String),
+    VsetDel {
+        key: String,
+        element: String,
+    },
+    /// Show the elements of a vector set most similar to a query.
+    SimilarSearch,
     StreamDel {
         key: String,
         id: String,
@@ -1129,6 +1150,8 @@ pub enum Modal {
         selected: usize,
         original: Theme,
     },
+    /// `ctrl+p`: every action, loaded key or saved server, fuzzy-matched.
+    Palette(PaletteState),
     /// How to look at the open key's bytes: as stored, or through a codec.
     ViewPicker {
         key: String,
@@ -1216,6 +1239,8 @@ pub struct App {
     /// Which part of the open collection is read: how many elements, and the
     /// `f` filter. Belongs to `value_window_key` and resets for another key.
     pub value_window: Window,
+    /// The header line the last read gave for its value, if any.
+    pub value_detail: Option<String>,
     value_window_key: Option<String>,
     /// How much of the open collection the last read covered.
     pub value_coverage: Coverage,
@@ -1274,6 +1299,7 @@ impl App {
             key_limit: KEY_LIMIT,
             key_limit_pattern: "*".into(),
             value_window: Window::default(),
+            value_detail: None,
             value_window_key: None,
             value_coverage: Coverage::default(),
             last_tick: std::time::Instant::now(),
@@ -1374,6 +1400,7 @@ impl App {
                         value: read.value,
                         notice: read.notice,
                         coverage: read.coverage,
+                        detail: read.detail,
                     },
                     Err(e) => Msg::LoadFailed {
                         seq,
@@ -1466,6 +1493,33 @@ impl App {
             && cur.ttl > 0
         {
             cur.ttl = (cur.ttl - secs).max(0);
+        }
+        // Hash fields with their own expiry count down the same way.
+        if let Some(KeyValue::Rows { rows, total, .. }) = &mut self.value {
+            let mut gone: Vec<String> = Vec::new();
+            for row in rows.iter_mut() {
+                if let Some(ttl) = &mut row.ttl {
+                    *ttl -= secs;
+                    if *ttl <= 0 {
+                        gone.push(row.id.clone());
+                    }
+                }
+            }
+            if !gone.is_empty() {
+                rows.retain(|r| r.ttl.is_none_or(|t| t > 0));
+                *total = total.saturating_sub(gone.len() as u64);
+                match rows.len() {
+                    0 => self.value_state.select(None),
+                    n => {
+                        let at = self.value_state.selected().unwrap_or(0).min(n - 1);
+                        self.value_state.select(Some(at));
+                    }
+                }
+                self.status = match gone.as_slice() {
+                    [one] => format!("Field '{one}' expired"),
+                    many => format!("{} fields expired", many.len()),
+                };
+            }
         }
         let mut expired: Vec<String> = Vec::new();
         for k in &mut self.keys {
@@ -1630,6 +1684,7 @@ impl App {
                 value,
                 notice,
                 coverage,
+                detail,
             } => {
                 if seq != self.value_seq {
                     return;
@@ -1640,6 +1695,21 @@ impl App {
                 self.pending_value = None;
                 self.show_value(info, value);
                 self.value_coverage = coverage;
+                self.value_detail = detail;
+            }
+            Msg::Details { title, body } => {
+                self.modal = Some(match body {
+                    Ok(body) => Modal::Message {
+                        title,
+                        body,
+                        scroll: 0,
+                    },
+                    Err(e) => Modal::Message {
+                        title: "Error".into(),
+                        body: e,
+                        scroll: 0,
+                    },
+                });
             }
             Msg::LoadFailed { seq, error } => {
                 if seq == self.value_seq {
@@ -1932,6 +2002,7 @@ impl App {
     }
 
     fn connections_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let len = self.visible_connections().len();
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -1943,6 +2014,7 @@ impl App {
                     self.clamp_connection_selection();
                 }
             }
+            KeyCode::Char('p') if ctrl => self.open_palette(),
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char('p') => self.open_theme_picker(),
             KeyCode::Char('/') => self.conn_filter = Some(InputBuf::new(&self.conn_query)),
@@ -2229,6 +2301,7 @@ impl App {
     fn browser_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('p') if ctrl => self.open_palette(),
             KeyCode::Char('w') if ctrl => self.prompt_write_unlock(),
             KeyCode::Char('d') if ctrl => self.prompt_select_db(),
             KeyCode::Char('n') if ctrl => self.back_to_connections(),
@@ -2240,7 +2313,9 @@ impl App {
             KeyCode::Esc => {
                 // With the value pane focused, Esc drops the element filter
                 // first, the way it drops the key pattern in the tree.
-                if self.focus == Focus::Value && self.value_window.filter.is_some() {
+                if self.focus == Focus::Value
+                    && (self.value_window.filter.is_some() || self.value_window.similar.is_some())
+                {
                     self.set_element_filter(None);
                 } else if self.pattern != "*" {
                     self.pattern = "*".into();
@@ -2278,6 +2353,11 @@ impl App {
             KeyCode::Char('P') => self.prompt_pubsub(),
             KeyCode::Char('N') => self.watch_keyspace(),
             KeyCode::Char('W') => self.prompt_monitor(),
+            KeyCode::Char('S')
+                if self.current.as_ref().map(|k| k.kind) == Some(KeyType::VectorSet) =>
+            {
+                self.similar_to_selected()
+            }
             KeyCode::Char('S') => self.open_stream_groups(),
             KeyCode::Char('Q') => self.prompt_search(),
             KeyCode::Char('n') => self.prompt_new_key(),
@@ -2348,6 +2428,11 @@ impl App {
                 if self.current.as_ref().map(|c| &c.name) != Some(&k.name) {
                     self.current = Some(k);
                     self.value = None;
+                    // Another key starts at its first element. Left alone, the
+                    // row the last key had selected would carry over, since
+                    // the read that arrives is for the key now current.
+                    self.value_state.select(Some(0));
+                    self.value_scroll = 0;
                     // Any read still in flight is for the key we just left.
                     self.value_seq = self.value_seq.wrapping_add(1);
                     self.value_coverage = Coverage::default();
@@ -2445,6 +2530,9 @@ impl App {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
+            KeyCode::Enter if self.current.as_ref().map(|k| k.kind) == Some(KeyType::VectorSet) => {
+                self.show_vset_element()
+            }
             _ => {}
         }
     }
@@ -2741,6 +2829,26 @@ impl App {
         let Some(k) = self.current.clone() else {
             return;
         };
+        // In the value pane, a hash field gets an expiry of its own.
+        if self.focus == Focus::Value
+            && k.kind == KeyType::Hash
+            && let Some(row) = self.selected_value_row()
+        {
+            let current = row.ttl.map(|t| t.to_string()).unwrap_or_default();
+            self.modal = Some(Modal::Form {
+                title: format!("TTL for field '{}' of '{}'", row.id, k.name),
+                hint: "Seconds, or empty to remove the expiry · needs Redis 7.4+ or Valkey 9"
+                    .into(),
+                fields: vec![Field::text("Seconds", &current)],
+                focus: 0,
+                error: None,
+                action: Action::SetFieldTtl {
+                    key: k.name,
+                    field: row.id.clone(),
+                },
+            });
+            return;
+        }
         let current = if k.ttl < 0 {
             String::new()
         } else {
@@ -2824,6 +2932,19 @@ impl App {
                 focus: 0,
                 error: None,
                 action: Action::TsAdd(name),
+            },
+            KeyType::VectorSet => Modal::Form {
+                title: format!("Add an element to '{name}' (VADD)"),
+                hint: "Values separated by commas or spaces, as many as the set's dimension · an existing element gets the new vector"
+                    .into(),
+                fields: vec![
+                    Field::text("Element", ""),
+                    Field::text("Vector", ""),
+                    Field::text("Attributes (JSON)", ""),
+                ],
+                focus: 0,
+                error: None,
+                action: Action::VsetAdd(name),
             },
             KeyType::String | KeyType::Json | KeyType::Other => Modal::Message {
                 title: "Nothing to add".into(),
@@ -2991,6 +3112,31 @@ impl App {
                 body: "A time-series sample is written by timestamp. Add one with 'a'.".into(),
                 scroll: 0,
             },
+            // The attributes are what can change in place; a new vector for
+            // the same element goes through `a`.
+            KeyType::VectorSet => {
+                let original = row.cells.last().cloned().unwrap_or_default();
+                let text = if original.is_empty() {
+                    String::new()
+                } else {
+                    json::pretty(&original)
+                };
+                let mut ta = TextArea::from(editor_lines(&text));
+                ta.set_cursor_line_style(ratatui::style::Style::default());
+                Modal::Editor {
+                    title: format!("Edit the attributes of '{}' · empty removes them", row.id),
+                    textarea: Box::new(ta),
+                    action: Action::SafeEdit(EditTarget {
+                        key: name,
+                        kind: k.kind,
+                        selector: row.id,
+                        original,
+                        decoded: None,
+                    }),
+                    json: JsonMode::Compact,
+                    error: None,
+                }
+            }
             KeyType::Stream | KeyType::String | KeyType::Json | KeyType::Other => Modal::Message {
                 title: "Not editable".into(),
                 body: "Stream entries are immutable. Add a new entry with 'a', or delete this one with 'x'.".into(),
@@ -3100,6 +3246,13 @@ impl App {
                 Action::StreamDel {
                     key: name,
                     id: row.id,
+                },
+            ),
+            KeyType::VectorSet => (
+                format!("Remove element '{}' from '{name}'?", row.id),
+                Action::VsetDel {
+                    key: name,
+                    element: row.id,
                 },
             ),
             KeyType::TimeSeries => (
@@ -3517,6 +3670,10 @@ impl App {
             self.status = "Select a key first".into();
             return;
         };
+        if k.kind == KeyType::VectorSet {
+            self.prompt_similar();
+            return;
+        }
         if !matches!(
             k.kind,
             KeyType::Hash | KeyType::List | KeyType::Set | KeyType::ZSet | KeyType::Stream
@@ -3543,11 +3700,110 @@ impl App {
         });
     }
 
+    /// Ask what to compare a vector set's elements with: an element already
+    /// in it (the selected one to start with), or a vector typed in.
+    fn prompt_similar(&mut self) {
+        let Some(k) = self.current.as_ref() else {
+            return;
+        };
+        let current = self.value_window.similar.clone();
+        let (element, vector) = match current.as_ref().map(|s| &s.to) {
+            Some(SimilarTo::Element(e)) => (e.clone(), String::new()),
+            Some(SimilarTo::Vector(v)) => (
+                String::new(),
+                v.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            None => (
+                self.selected_value_row()
+                    .map(|r| r.id.clone())
+                    .unwrap_or_default(),
+                String::new(),
+            ),
+        };
+        let filter = current
+            .as_ref()
+            .and_then(|s| s.filter.clone())
+            .unwrap_or_default();
+        let count = current.as_ref().map_or(SIMILAR_COUNT, |s| s.count);
+        self.modal = Some(Modal::Form {
+            title: format!("Similar elements in '{}' (VSIM)", k.name),
+            hint: "An element, or a vector · filter like .year > 2000 · Esc in the value pane lists everything again"
+                .into(),
+            fields: vec![
+                Field::text("Element", &element),
+                Field::text("Or vector", &vector),
+                Field::text("Filter", &filter),
+                Field::text("Count", &count.to_string()),
+            ],
+            focus: 0,
+            error: None,
+            action: Action::SimilarSearch,
+        });
+    }
+
+    /// Show the open vector set's elements most similar to `query`, or list
+    /// them all again.
+    fn set_similar(&mut self, query: Option<Similar>) {
+        self.status = match &query {
+            Some(q) => format!("Showing elements {}", q.describe()),
+            None => "Showing every element".into(),
+        };
+        self.value_window = Window {
+            limit: VALUE_LIMIT,
+            filter: None,
+            similar: query,
+        };
+        if let Some(k) = &self.current {
+            self.value_window_key = Some(k.name.clone());
+        }
+        self.value_state.select(Some(0));
+        self.value_scroll = 0;
+        self.reload_value();
+    }
+
+    /// `S` on a vector set: the elements most like the selected one.
+    fn similar_to_selected(&mut self) {
+        let Some(row) = self.selected_value_row() else {
+            self.status = "Select an element first".into();
+            return;
+        };
+        let query = Similar {
+            to: SimilarTo::Element(row.id.clone()),
+            filter: None,
+            count: SIMILAR_COUNT,
+        };
+        self.set_similar(Some(query));
+    }
+
+    /// `enter` on a vector set element: its vector and attributes in full.
+    fn show_vset_element(&mut self) {
+        let (Some(k), Some(row)) = (self.current.clone(), self.selected_value_row().cloned())
+        else {
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.spawn(async move {
+            let title = format!("'{}' in '{}'", row.id, k.name);
+            let body = match client.vset_element(&k.name, &row.id).await {
+                Ok(Some(e)) => Ok(element_text(&e)),
+                Ok(None) => Err(format!("'{}' is no longer in '{}'", row.id, k.name)),
+                Err(e) => Err(e.to_string()),
+            };
+            Msg::Details { title, body }
+        });
+    }
+
     /// Read the open collection again with `filter`, from the first page.
     fn set_element_filter(&mut self, filter: Option<String>) {
         self.value_window = Window {
             limit: VALUE_LIMIT,
             filter,
+            similar: None,
         };
         if let Some(k) = &self.current {
             self.value_window_key = Some(k.name.clone());
@@ -3588,6 +3844,98 @@ impl App {
             selected,
             options,
         });
+    }
+
+    fn open_palette(&mut self) {
+        let commands = match self.screen {
+            Screen::Browser => crate::palette::BROWSER,
+            Screen::Connections => crate::palette::CONNECTIONS,
+        };
+        let mut state = PaletteState::new(commands);
+        self.refresh_palette(&mut state);
+        self.modal = Some(Modal::Palette(state));
+    }
+
+    /// Rank the palette against what this screen can jump to: the loaded keys
+    /// in the browser, the saved servers on the server list.
+    fn refresh_palette(&self, state: &mut PaletteState) {
+        match self.screen {
+            Screen::Browser => state.refresh(
+                self.keys.iter().map(|k| (k.name.as_str(), k.kind)),
+                std::iter::empty(),
+            ),
+            Screen::Connections => state.refresh(
+                std::iter::empty(),
+                self.store.connections.iter().map(|c| c.name.as_str()),
+            ),
+        }
+    }
+
+    fn palette_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(Modal::Palette(mut state)) = self.modal.take() else {
+            return;
+        };
+        let last = state.hits.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Char('p') if ctrl => return,
+            KeyCode::Down | KeyCode::Tab => state.selected = (state.selected + 1).min(last),
+            KeyCode::Char('j') | KeyCode::Char('n') if ctrl => {
+                state.selected = (state.selected + 1).min(last)
+            }
+            KeyCode::Up | KeyCode::BackTab => state.selected = state.selected.saturating_sub(1),
+            KeyCode::Char('k') if ctrl => state.selected = state.selected.saturating_sub(1),
+            KeyCode::PageDown => state.selected = (state.selected + 10).min(last),
+            KeyCode::PageUp => state.selected = state.selected.saturating_sub(10),
+            KeyCode::Enter => {
+                let query = state.input.value().trim().to_string();
+                match state.selected_hit().map(|h| h.target.clone()) {
+                    Some(Target::Action(i)) => self.on_key(state.commands[i].event()),
+                    Some(Target::Key { name, .. }) => self.jump_to_key(&name),
+                    Some(Target::Server(name)) => {
+                        self.conn_query.clear();
+                        self.focus_connection(&name);
+                        self.connections_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    }
+                    // Nothing loaded matches: ask the server instead, the way
+                    // `/` would.
+                    None if self.screen == Screen::Browser && !query.is_empty() => {
+                        self.pattern = normalize_pattern(&query);
+                        self.expanded.clear();
+                        self.reload_keys();
+                    }
+                    None => {}
+                }
+                return;
+            }
+            _ => {
+                if state.input.handle(key) {
+                    self.refresh_palette(&mut state);
+                }
+            }
+        }
+        self.modal = Some(Modal::Palette(state));
+    }
+
+    /// Select a loaded key in the tree, opening every folder above it.
+    fn jump_to_key(&mut self, name: &str) {
+        let parts: Vec<&str> = name.split(':').collect();
+        for depth in 1..parts.len() {
+            self.expanded.insert(parts[..depth].join(":"));
+        }
+        self.rebuild_rows();
+        let Some(index) = self
+            .rows
+            .iter()
+            .position(|r| r.key.as_ref().is_some_and(|k| k.name == name))
+        else {
+            self.status = format!("'{name}' is no longer loaded");
+            return;
+        };
+        self.focus = Focus::Tree;
+        self.tree_state.select(Some(index));
+        self.on_tree_move();
     }
 
     fn open_theme_picker(&mut self) {
@@ -3688,6 +4036,10 @@ impl App {
             }
             return;
         }
+        if matches!(self.modal, Some(Modal::Palette(_))) {
+            self.palette_key(key);
+            return;
+        }
         // The consumer-group view issues follow-up requests as it is driven,
         // which the borrow of `self.modal` below would rule out.
         if matches!(self.modal, Some(Modal::Groups(_))) {
@@ -3784,14 +4136,20 @@ impl App {
                     let text = textarea.lines().join("\n");
                     // A key that held JSON keeps holding JSON: refuse a broken
                     // edit rather than overwriting the document with garbage.
+                    // Empty vector set attributes are removed, not a broken document.
+                    let clearing = text.trim().is_empty()
+                        && matches!(action, Action::SafeEdit(t) if t.kind == KeyType::VectorSet);
                     if mode.is_json()
+                        && !clearing
                         && let Err(e) = json::check(&text)
                     {
                         *error = Some(e);
                         return;
                     }
                     // Written back in the shape the key already had.
-                    let text = if *mode == JsonMode::Compact {
+                    let text = if clearing {
+                        String::new()
+                    } else if *mode == JsonMode::Compact {
                         json::minify(&text)
                     } else {
                         text
@@ -4178,7 +4536,10 @@ impl App {
                 }
                 _ => {}
             },
-            Modal::Groups(_) | Modal::ThemePicker { .. } | Modal::ViewPicker { .. } => {
+            Modal::Groups(_)
+            | Modal::Palette(_)
+            | Modal::ThemePicker { .. }
+            | Modal::ViewPicker { .. } => {
                 unreachable!("handled above")
             }
         }
@@ -4378,12 +4739,14 @@ impl App {
             | Action::DeleteMarked(_)
             | Action::RenameKey(_)
             | Action::SetTtl(_)
+            | Action::SetFieldTtl { .. }
             | Action::TtlMarked(_)
             | Action::HashDel { .. }
             | Action::ListDel { .. }
             | Action::SetDel { .. }
             | Action::ZsetDel { .. }
             | Action::StreamDel { .. }
+            | Action::VsetDel { .. }
             | Action::TsDel { .. }
             | Action::Import
             | Action::SetConfig(_)
@@ -4580,6 +4943,17 @@ impl App {
                     c.set_ttl(&name, seconds).await
                 });
             }
+            Action::SetFieldTtl { key, field } => {
+                let raw = v(0).trim().to_string();
+                let seconds = if raw.is_empty() {
+                    None
+                } else {
+                    raw.parse::<i64>().ok()
+                };
+                self.mutate("Field TTL updated", move |c| async move {
+                    c.set_field_ttl(&key, &field, seconds).await
+                });
+            }
             Action::TsAdd(name) => {
                 let (ts, value) = (v(0), v(1));
                 self.mutate("Sample added", move |c| async move {
@@ -4764,6 +5138,38 @@ impl App {
                         Err(e) => Msg::Mutated(Err(e.to_string())),
                     }
                 });
+            }
+            Action::VsetAdd(key) => {
+                let element = v(0).trim().to_string();
+                let vector = crate::redis_client::parse_vector(&v(1)).unwrap_or_default();
+                let attributes = v(2).trim().to_string();
+                self.mutate("Element added", move |c| async move {
+                    c.vset_add(&key, &element, &vector, Some(attributes.as_str()))
+                        .await
+                });
+            }
+            Action::VsetDel { key, element } => {
+                self.mutate("Element removed", move |c| async move {
+                    c.vset_remove(&key, &element).await
+                });
+            }
+            Action::SimilarSearch => {
+                let element = v(0).trim().to_string();
+                let to = if !v(1).trim().is_empty() {
+                    match crate::redis_client::parse_vector(&v(1)) {
+                        Ok(values) => SimilarTo::Vector(values),
+                        Err(_) => return,
+                    }
+                } else if !element.is_empty() {
+                    SimilarTo::Element(element)
+                } else {
+                    // Nothing to compare with: list the elements again.
+                    self.set_similar(None);
+                    return;
+                };
+                let filter = Some(v(2).trim().to_string()).filter(|f| !f.is_empty());
+                let count = v(3).trim().parse().unwrap_or(SIMILAR_COUNT).max(1);
+                self.set_similar(Some(Similar { to, filter, count }));
             }
             Action::FilterElements => {
                 let raw = v(0);
@@ -5081,13 +5487,37 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
         Action::NewKey | Action::RenameKey(_) => {
             (get(0).is_empty()).then(|| "Key name is required".into())
         }
-        Action::SetTtl(_) => {
+        Action::SetTtl(_) | Action::SetFieldTtl { .. } => {
             let raw = get(0);
             (!raw.is_empty() && raw.parse::<i64>().is_err())
                 .then(|| "TTL must be a whole number of seconds".into())
         }
         Action::SelectDb => {
             (get(0).parse::<i64>().is_err()).then(|| "DB index must be a number".into())
+        }
+        Action::VsetAdd(_) => {
+            if get(0).is_empty() {
+                return Some("Element is required".into());
+            }
+            if let Err(e) = crate::redis_client::parse_vector(get(1)) {
+                return Some(e);
+            }
+            let attrs = get(2);
+            if !attrs.is_empty()
+                && let Err(e) = json::check(attrs)
+            {
+                return Some(format!("Attributes must be JSON: {e}"));
+            }
+            None
+        }
+        Action::SimilarSearch => {
+            if !get(1).is_empty()
+                && let Err(e) = crate::redis_client::parse_vector(get(1))
+            {
+                return Some(e);
+            }
+            (!get(3).is_empty() && get(3).parse::<usize>().is_err())
+                .then(|| "Count must be a whole number".into())
         }
         Action::ZsetAdd(_) => {
             if get(0).is_empty() {
@@ -5104,6 +5534,29 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
 }
 
 /// A bare word with no glob characters is treated as a substring search.
+/// How many similar elements a query asks for unless told otherwise.
+pub const SIMILAR_COUNT: usize = 20;
+
+/// A vector set element for the details dialog.
+fn element_text(e: &crate::redis_client::VsetElement) -> String {
+    let attributes = match e.attributes.as_deref() {
+        None | Some("") => "(none)".to_string(),
+        Some(a) => json::pretty(a),
+    };
+    let values = e
+        .vector
+        .iter()
+        // Stored as 32-bit floats: printed at that precision, 0.9 reads as
+        // 0.9 rather than 0.8999999761581421.
+        .map(|v| format!("{}", *v as f32))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Attributes\n{attributes}\n\nVector ({} values, as stored after quantization)\n{values}",
+        e.vector.len()
+    )
+}
+
 pub fn normalize_pattern(raw: &str) -> String {
     if raw.is_empty() {
         return "*".into();
@@ -5507,6 +5960,398 @@ mod tests {
         }
     }
 
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn hash_with_field_ttls(ttls: &[Option<i64>]) -> App {
+        let key = KeyInfo {
+            name: "h".into(),
+            kind: KeyType::Hash,
+            ttl: -1,
+        };
+        let mut app = tick_app(vec![key.clone()]);
+        app.current = Some(key);
+        let rows = ttls
+            .iter()
+            .enumerate()
+            .map(|(i, ttl)| crate::redis_client::Row {
+                id: format!("f{i}"),
+                cells: vec![format!("f{i}"), "v".into()],
+                decoding: None,
+                ttl: *ttl,
+            })
+            .collect::<Vec<_>>();
+        app.value = Some(KeyValue::Rows {
+            headers: vec!["field", "value"],
+            total: rows.len() as u64,
+            rows,
+        });
+        app.value_state.select(Some(0));
+        app
+    }
+
+    fn field_ids(app: &App) -> Vec<(String, Option<i64>)> {
+        match &app.value {
+            Some(KeyValue::Rows { rows, .. }) => {
+                rows.iter().map(|r| (r.id.clone(), r.ttl)).collect()
+            }
+            _ => panic!("no rows"),
+        }
+    }
+
+    #[test]
+    fn hash_field_ttls_count_down_and_expired_fields_leave() {
+        let mut app = hash_with_field_ttls(&[Some(5), None, Some(60)]);
+        app.age_ttls(3);
+        assert_eq!(
+            field_ids(&app),
+            vec![
+                ("f0".into(), Some(2)),
+                ("f1".into(), None),
+                ("f2".into(), Some(57))
+            ]
+        );
+        app.age_ttls(2);
+        assert_eq!(
+            field_ids(&app),
+            vec![("f1".into(), None), ("f2".into(), Some(55))]
+        );
+        assert_eq!(app.status, "Field 'f0' expired");
+        let Some(KeyValue::Rows { total, .. }) = &app.value else {
+            unreachable!()
+        };
+        assert_eq!(*total, 2);
+        assert_eq!(app.value_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_last_field_expiring_leaves_nothing_selected() {
+        let mut app = hash_with_field_ttls(&[Some(1)]);
+        app.age_ttls(1);
+        assert!(field_ids(&app).is_empty());
+        assert_eq!(app.value_state.selected(), None);
+    }
+
+    #[test]
+    fn t_in_the_value_pane_sets_the_selected_field_ttl() {
+        let mut app = hash_with_field_ttls(&[None, Some(30)]);
+        app.value_state.select(Some(1));
+        app.focus = Focus::Value;
+        press(&mut app, KeyCode::Char('t'));
+        let Some(Modal::Form { fields, action, .. }) = &app.modal else {
+            panic!("no form");
+        };
+        assert!(
+            matches!(action, Action::SetFieldTtl { key, field } if key == "h" && field == "f1")
+        );
+        assert_eq!(fields[0].value(), "30");
+
+        // In the tree, `t` is still the key's own TTL.
+        app.modal = None;
+        app.focus = Focus::Tree;
+        press(&mut app, KeyCode::Char('t'));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Form { action: Action::SetTtl(k), .. }) if k == "h"
+        ));
+    }
+
+    fn vset_app() -> App {
+        let key = KeyInfo {
+            name: "movies".into(),
+            kind: KeyType::VectorSet,
+            ttl: -1,
+        };
+        let mut app = tick_app(vec![key.clone()]);
+        app.current = Some(key);
+        let row = |id: &str, attrs: &str| crate::redis_client::Row {
+            id: id.into(),
+            cells: vec![id.into(), attrs.into()],
+            ..Default::default()
+        };
+        app.value = Some(KeyValue::Rows {
+            headers: vec!["element", "attributes"],
+            rows: vec![row("amelie", ""), row("heat", r#"{"year":1995}"#)],
+            total: 2,
+        });
+        app.value_state.select(Some(1));
+        app.focus = Focus::Value;
+        app
+    }
+
+    fn form_fields(app: &App) -> Vec<String> {
+        match &app.modal {
+            Some(Modal::Form { fields, .. }) => fields.iter().map(|f| f.value()).collect(),
+            _ => panic!("no form"),
+        }
+    }
+
+    fn set_field(app: &mut App, index: usize, text: &str) {
+        let Some(Modal::Form { fields, .. }) = &mut app.modal else {
+            panic!("no form");
+        };
+        fields[index].input.set(text);
+    }
+
+    #[test]
+    fn f_on_a_vector_set_asks_what_to_compare_with() {
+        let mut app = vset_app();
+        press(&mut app, KeyCode::Char('f'));
+        // The selected element is where a search starts.
+        assert_eq!(form_fields(&app), vec!["heat", "", "", "20"]);
+        set_field(&mut app, 2, ".year > 1990");
+        set_field(&mut app, 3, "5");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.value_window.similar,
+            Some(Similar {
+                to: SimilarTo::Element("heat".into()),
+                filter: Some(".year > 1990".into()),
+                count: 5,
+            })
+        );
+        // Reopening shows the query in force.
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(form_fields(&app), vec!["heat", "", ".year > 1990", "5"]);
+        press(&mut app, KeyCode::Esc);
+
+        // Esc in the value pane lists every element again.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.value_window.similar, None);
+    }
+
+    #[test]
+    fn a_typed_vector_wins_over_the_element_and_is_checked() {
+        let mut app = vset_app();
+        press(&mut app, KeyCode::Char('f'));
+        set_field(&mut app, 1, "[0.1, 0.2 0.3]");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.value_window.similar.as_ref().map(|s| &s.to),
+            Some(&SimilarTo::Vector(vec![0.1, 0.2, 0.3]))
+        );
+
+        press(&mut app, KeyCode::Char('f'));
+        set_field(&mut app, 1, "0.1, banana");
+        press(&mut app, KeyCode::Enter);
+        let Some(Modal::Form { error, .. }) = &app.modal else {
+            panic!("the form should stay open");
+        };
+        assert_eq!(error.as_deref(), Some("'banana' is not a number"));
+    }
+
+    #[test]
+    fn capital_s_on_a_vector_set_finds_elements_like_the_selected_one() {
+        let mut app = vset_app();
+        press(&mut app, KeyCode::Char('S'));
+        assert_eq!(
+            app.value_window.similar.as_ref().map(|s| &s.to),
+            Some(&SimilarTo::Element("heat".into()))
+        );
+        assert!(app.modal.is_none(), "not the consumer-group view");
+    }
+
+    #[test]
+    fn vector_set_attributes_open_in_the_json_editor_and_can_be_cleared() {
+        let mut app = vset_app();
+        press(&mut app, KeyCode::Char('e'));
+        let Some(Modal::Editor {
+            textarea,
+            action,
+            json,
+            ..
+        }) = &app.modal
+        else {
+            panic!("no editor");
+        };
+        assert_eq!(textarea.lines().join("\n"), "{\n  \"year\": 1995\n}");
+        assert!(
+            matches!(action, Action::SafeEdit(t) if t.selector == "heat" && t.original == r#"{"year":1995}"#)
+        );
+        assert_eq!(*json, JsonMode::Compact);
+
+        // Broken JSON is refused; an empty editor removes the attributes.
+        let Some(Modal::Editor { textarea, .. }) = &mut app.modal else {
+            unreachable!()
+        };
+        textarea.select_all();
+        textarea.cut();
+        textarea.insert_str("{");
+        ctrl(&mut app, 's');
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Editor { error: Some(_), .. })
+        ));
+        let Some(Modal::Editor { textarea, .. }) = &mut app.modal else {
+            unreachable!()
+        };
+        textarea.select_all();
+        textarea.cut();
+        ctrl(&mut app, 's');
+        assert!(app.modal.is_none(), "clearing is allowed");
+    }
+
+    #[test]
+    fn vector_set_elements_are_added_with_a_checked_vector_and_removed() {
+        let mut app = vset_app();
+        press(&mut app, KeyCode::Char('a'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Form { action: Action::VsetAdd(k), .. }) if k == "movies")
+        );
+        set_field(&mut app, 0, "drive");
+        set_field(&mut app, 1, "");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Form { error: Some(_), .. })
+        ));
+        set_field(&mut app, 1, "1 0 0");
+        set_field(&mut app, 2, "{broken");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&app.modal, Some(Modal::Form { error: Some(e), .. }) if e.starts_with("Attributes must be JSON"))
+        );
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Confirm { action: Action::VsetDel { key, element }, .. })
+                if key == "movies" && element == "heat"
+        ));
+    }
+
+    #[test]
+    fn element_details_print_vectors_at_their_stored_precision() {
+        let text = element_text(&crate::redis_client::VsetElement {
+            vector: vec![0.8999999761581421, 0.09921259433031082, 0.0],
+            attributes: Some(r#"{"year":1998}"#.into()),
+        });
+        assert!(text.contains("0.9, 0.099212594, 0"), "{text}");
+        assert!(text.contains("\"year\": 1998"), "{text}");
+        let bare = element_text(&crate::redis_client::VsetElement {
+            vector: vec![1.0],
+            attributes: None,
+        });
+        assert!(bare.contains("(none)"), "{bare}");
+    }
+
+    #[test]
+    fn another_key_opens_at_its_first_element() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        let rows = |n: usize| KeyValue::Rows {
+            headers: vec!["member"],
+            rows: (0..n)
+                .map(|i| crate::redis_client::Row {
+                    id: i.to_string(),
+                    cells: vec![i.to_string()],
+                    ..Default::default()
+                })
+                .collect(),
+            total: n as u64,
+        };
+        app.tree_state.select(Some(0));
+        app.on_tree_move();
+        app.on_msg(Msg::Value {
+            info: info("a", -1),
+            value: rows(5),
+        });
+        app.value_state.select(Some(3));
+        // A refresh of the same key keeps the row.
+        app.on_msg(Msg::Value {
+            info: info("a", -1),
+            value: rows(5),
+        });
+        assert_eq!(app.value_state.selected(), Some(3));
+
+        press(&mut app, KeyCode::Down);
+        app.on_msg(Msg::Value {
+            info: info("b", -1),
+            value: rows(5),
+        });
+        assert_eq!(app.current.as_ref().unwrap().name, "b");
+        assert_eq!(app.value_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_palette_jumps_to_a_key_inside_closed_folders() {
+        let mut app = tick_app(vec![
+            info("app:user:42:profile", -1),
+            info("app:user:7:profile", -1),
+            info("other", -1),
+        ]);
+        app.expanded.clear();
+        app.rebuild_rows();
+        ctrl(&mut app, 'p');
+        assert!(matches!(app.modal, Some(Modal::Palette(_))));
+        type_text(&mut app, "u42prof");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.selected_row()
+                .and_then(|r| r.key.as_ref())
+                .map(|k| k.name.as_str()),
+            Some("app:user:42:profile")
+        );
+        assert!(app.expanded.contains("app") && app.expanded.contains("app:user:42"));
+        assert_eq!(app.current.as_ref().unwrap().name, "app:user:42:profile");
+    }
+
+    #[test]
+    fn a_palette_action_runs_the_key_it_is_bound_to() {
+        let mut app = tick_app(vec![info("k", -1)]);
+        ctrl(&mut app, 'p');
+        type_text(&mut app, "keybindings");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.modal, Some(Modal::Help)));
+    }
+
+    #[test]
+    fn a_palette_query_nothing_loaded_matches_searches_the_server() {
+        let mut app = tick_app(vec![info("k", -1)]);
+        ctrl(&mut app, 'p');
+        type_text(&mut app, "zzqx");
+        let Some(Modal::Palette(state)) = &app.modal else {
+            panic!("palette closed")
+        };
+        assert!(state.hits.is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pattern, "*zzqx*");
+    }
+
+    #[test]
+    fn escape_closes_the_palette_without_doing_anything() {
+        let mut app = tick_app(vec![info("a:b", -1)]);
+        let before = app.tree_state.selected();
+        ctrl(&mut app, 'p');
+        type_text(&mut app, "a:b");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        assert_eq!(app.tree_state.selected(), before);
+    }
+
+    #[test]
+    fn ctrl_p_is_not_the_theme_picker() {
+        let mut app = tick_app(vec![]);
+        ctrl(&mut app, 'p');
+        assert!(matches!(app.modal, Some(Modal::Palette(_))));
+        press(&mut app, KeyCode::Esc);
+        type_text(&mut app, "p");
+        assert!(matches!(app.modal, Some(Modal::ThemePicker { .. })));
+    }
+
     #[test]
     fn expired_keys_leave_the_tree_and_persistent_ones_stay() {
         let mut app = tick_app(vec![info("gone", 3), info("stays", -1), info("later", 90)]);
@@ -5668,6 +6513,7 @@ mod tests {
                 id: "1500".into(),
                 cells: vec!["1500".into(), "job-7".into()],
                 decoding: None,
+                ttl: None,
             }],
             total: 3000,
         });
@@ -5705,6 +6551,7 @@ mod tests {
         app.value_window = Window {
             limit: 4 * VALUE_LIMIT,
             filter: Some("*x*".into()),
+            similar: None,
         };
         app.views.insert("k".into(), View::Plain);
         app.connect(crate::config::Connection {
@@ -5925,6 +6772,7 @@ mod tests {
             value: KeyValue::Str("as stored".into()),
             coverage: Coverage::default(),
             notice: None,
+            detail: None,
         });
         app.on_msg(Msg::Loaded {
             seq: 1,
@@ -5932,6 +6780,7 @@ mod tests {
             value: KeyValue::Str("stale decode".into()),
             coverage: Coverage::default(),
             notice: Some("stale notice".into()),
+            detail: None,
         });
         assert!(matches!(app.value, Some(KeyValue::Str(ref s)) if s == "as stored"));
         assert!(!app.status.contains("stale"), "{}", app.status);
@@ -5944,6 +6793,7 @@ mod tests {
             value: KeyValue::Str("x".into()),
             coverage: Coverage::default(),
             notice: Some("2 element(s) could not be read".into()),
+            detail: None,
         });
         assert_eq!(app.status, "2 element(s) could not be read");
     }
@@ -5979,6 +6829,7 @@ mod tests {
             value: KeyValue::Str("late".into()),
             coverage: Coverage::default(),
             notice: None,
+            detail: None,
         });
         assert!(app.value.is_none());
         assert_eq!(app.current.as_ref().unwrap().name, "b");
@@ -6114,6 +6965,7 @@ mod tests {
                 id: cells[0].clone(),
                 cells,
                 decoding,
+                ttl: None,
             }],
             total: 1,
         });

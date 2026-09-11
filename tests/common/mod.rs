@@ -1,5 +1,49 @@
 //! Shared setup for the integration binaries.
 
+// Each test binary compiles this module on its own and uses only part of it.
+#![allow(dead_code)]
+
+/// The server the suite is pointed at, from `REDISCOPE_TEST_FLAVOR`.
+///
+/// The compat job in CI runs the same binaries against Valkey, KeyDB and
+/// Dragonfly. A test that touches something one of them does not do asks
+/// here and skips just that part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flavor {
+    Redis,
+    Valkey,
+    KeyDb,
+    Dragonfly,
+}
+
+/// Defaults to Redis when the variable is unset. An unknown name fails loudly
+/// rather than quietly running the Redis expectations.
+pub fn flavor() -> Flavor {
+    match std::env::var("REDISCOPE_TEST_FLAVOR")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "redis" => Flavor::Redis,
+        "valkey" => Flavor::Valkey,
+        "keydb" => Flavor::KeyDb,
+        "dragonfly" => Flavor::Dragonfly,
+        other => {
+            panic!("REDISCOPE_TEST_FLAVOR={other}: expected redis, valkey, keydb or dragonfly")
+        }
+    }
+}
+
+/// True, after printing why, when the server under test is one of `flavors`.
+pub fn skip_on(flavors: &[Flavor], reason: &str) -> bool {
+    let current = flavor();
+    let skip = flavors.contains(&current);
+    if skip {
+        eprintln!("skipped on {current:?}: {reason}");
+    }
+    skip
+}
+
 /// Point the config directory and the audit log at a scratch directory.
 ///
 /// Every connection appends to `audit.jsonl` and several suites add, reorder or

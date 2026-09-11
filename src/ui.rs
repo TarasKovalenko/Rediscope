@@ -381,6 +381,15 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             let more = !app.value_coverage.complete
                 && app.value_window.limit < crate::redis_client::VALUE_LIMIT_MAX;
             let size = match &app.value {
+                Some(KeyValue::Rows { rows, total, .. })
+                    if let Some(query) = &app.value_window.similar =>
+                {
+                    format!(
+                        "   {}: {} of {total} · esc lists all",
+                        truncate(&query.describe(), 40),
+                        rows.len(),
+                    )
+                }
                 Some(KeyValue::Rows { rows, total, .. }) if app.value_window.filter.is_some() => {
                     let filter = app.value_window.filter.as_deref().unwrap_or_default();
                     let reach = if app.value_coverage.complete {
@@ -436,6 +445,13 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                         Style::new().fg(palette.info).bold(),
                     ),
                     Span::styled(format!("   ttl: {ttl}"), Style::new().fg(palette.dim)),
+                    Span::styled(
+                        app.value_detail
+                            .as_deref()
+                            .map(|d| format!("   {d}"))
+                            .unwrap_or_default(),
+                        Style::new().fg(palette.dim),
+                    ),
                     Span::styled(
                         if app.client.as_ref().is_some_and(|c| {
                             c.conn.deployment == crate::config::Deployment::Cluster
@@ -505,12 +521,27 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             rows: data,
             ..
         }) => {
-            let widths: Vec<Constraint> = match headers.len() {
+            // A TTL column only when some element expires on its own (hash
+            // fields, Redis 7.4+), so every other table keeps its width.
+            let ttl_column = data.iter().any(|r| r.ttl.is_some());
+            let mut widths: Vec<Constraint> = match headers.len() {
                 1 => vec![Constraint::Percentage(100)],
-                _ => vec![Constraint::Percentage(35), Constraint::Percentage(65)],
+                2 => vec![Constraint::Percentage(35), Constraint::Percentage(65)],
+                _ => vec![
+                    Constraint::Percentage(30),
+                    Constraint::Length(12),
+                    Constraint::Min(8),
+                ],
             };
+            let mut titles: Vec<&str> = headers.clone();
+            if ttl_column {
+                widths.pop();
+                widths.push(Constraint::Min(8));
+                widths.push(Constraint::Length(9));
+                titles.push("ttl");
+            }
             let header_row = Row::new(
-                headers
+                titles
                     .iter()
                     .map(|h| Cell::from(Span::styled(*h, Style::new().fg(palette.accent).bold())))
                     .collect::<Vec<_>>(),
@@ -518,12 +549,18 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
             let body: Vec<Row> = data
                 .iter()
                 .map(|r| {
-                    Row::new(
-                        r.cells
-                            .iter()
-                            .map(|c| Cell::from(one_line(c)))
-                            .collect::<Vec<_>>(),
-                    )
+                    let mut cells: Vec<Cell> =
+                        r.cells.iter().map(|c| Cell::from(one_line(c))).collect();
+                    if ttl_column {
+                        cells.push(match r.ttl {
+                            Some(t) => Cell::from(Span::styled(
+                                human_ttl(t),
+                                Style::new().fg(palette.warning),
+                            )),
+                            None => Cell::from(Span::styled("—", Style::new().fg(palette.dim))),
+                        });
+                    }
+                    Row::new(cells)
                 })
                 .collect();
 
@@ -667,8 +704,9 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 title.clone()
             };
             f.render_widget(
+                // Untrimmed: a reply or a document keeps its indentation.
                 Paragraph::new(body.clone())
-                    .wrap(Wrap { trim: true })
+                    .wrap(Wrap { trim: false })
                     .scroll((*scroll, 0))
                     .block(panel(&heading, true, palette)),
                 rect,
@@ -794,6 +832,7 @@ fn modal(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         Modal::Memory(state) => memory_report(f, area, state, palette),
         Modal::Info(state) => server_info(f, area, state, palette),
         Modal::ThemePicker { selected, .. } => theme_picker(f, area, *selected, palette),
+        Modal::Palette(state) => command_palette(f, area, state, palette),
         Modal::ViewPicker {
             key,
             selected,
@@ -992,6 +1031,178 @@ fn theme_picker(f: &mut Frame, area: Rect, selected: usize, palette: Palette) {
         ListItem::new(line)
     });
     f.render_widget(List::new(items), inner);
+}
+
+/// The `ctrl+p` palette: an input line over the ranked actions, keys and
+/// servers, with the characters the query matched picked out.
+fn command_palette(
+    f: &mut Frame,
+    area: Rect,
+    state: &crate::palette::PaletteState,
+    palette: Palette,
+) {
+    use crate::palette::Target;
+    let rect = centered(area, 84, (state.hits.len() as u16 + 5).clamp(8, 24));
+    clear_area(f, rect, palette);
+    let block = panel(
+        "Go to — type to match · ↑↓ choose · enter runs · esc closes",
+        true,
+        palette,
+    );
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    let query = state.input.value();
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("› ", Style::new().fg(palette.accent).bold()),
+            Span::styled(query.clone(), Style::new().fg(palette.foreground)),
+        ])),
+        rows[0],
+    );
+    f.set_cursor_position((
+        cursor_col(rows[0], rows[0].x + 2, state.input.cursor()),
+        rows[0].y,
+    ));
+
+    let summary = if state.hits.is_empty() && !query.trim().is_empty() {
+        "nothing loaded matches · enter searches the server for it".to_string()
+    } else if state.matches > state.hits.len() {
+        format!(
+            "{} matches · showing the best {} · keep typing to narrow",
+            state.matches,
+            state.hits.len()
+        )
+    } else if state.matches == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{} matches", state.matches)
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(summary, Style::new().fg(palette.dim))),
+        rows[1],
+    );
+
+    let width = rows[2].width as usize;
+    let items: Vec<ListItem> = state
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let chosen = i == state.selected;
+            let (tag, tag_style) = match &hit.target {
+                Target::Action(_) => ("›".to_string(), Style::new().fg(palette.accent)),
+                Target::Key { kind, .. } => (
+                    kind.badge().to_string(),
+                    Style::new().fg(type_color(*kind, palette)).bold(),
+                ),
+                Target::Server(_) => ("◆".to_string(), Style::new().fg(palette.info)),
+            };
+            let base = if chosen {
+                Style::new().fg(palette.foreground).bold()
+            } else {
+                Style::new().fg(palette.foreground)
+            };
+            let hot = Style::new().fg(palette.warning).bold();
+            let mut spans = vec![
+                Span::styled(
+                    if chosen { " ▌" } else { "  " },
+                    Style::new().fg(palette.accent),
+                ),
+                Span::styled(format!("{tag} "), tag_style),
+            ];
+            let room = width.saturating_sub(5);
+            let chars: Vec<char> = hit.text.chars().collect();
+            match &hit.target {
+                // An action reads "label  keys": the binding goes on the right.
+                Target::Action(i) => {
+                    let label_len = state.commands[*i].label.chars().count();
+                    let binding: String = chars[label_len..].iter().collect::<String>();
+                    let binding = binding.trim_start();
+                    let binding_at = chars.len() - binding.chars().count();
+                    let binding_w = UnicodeWidthStr::width(binding);
+                    let label_room = room.saturating_sub(binding_w + 2);
+                    let (label_spans, used) =
+                        highlighted(&chars[..label_len], 0, &hit.matched, label_room, base, hot);
+                    spans.extend(label_spans);
+                    if used + binding_w + 2 <= room {
+                        spans.push(Span::raw(" ".repeat(room - used - binding_w)));
+                        let dim = Style::new().fg(palette.dim);
+                        let (b, _) = highlighted(
+                            &chars[binding_at..],
+                            binding_at,
+                            &hit.matched,
+                            binding_w,
+                            dim,
+                            hot,
+                        );
+                        spans.extend(b);
+                    }
+                }
+                _ => spans.extend(highlighted(&chars, 0, &hit.matched, room, base, hot).0),
+            }
+            let line = Line::from(spans);
+            if chosen {
+                ListItem::new(line).style(Style::new().bg(palette.panel))
+            } else {
+                ListItem::new(line)
+            }
+        })
+        .collect();
+    let mut list_state = ratatui::widgets::ListState::default().with_selected(Some(state.selected));
+    f.render_stateful_widget(List::new(items), rows[2], &mut list_state);
+}
+
+/// `chars` as spans, with the characters whose index (plus `offset`) is in
+/// `matched` in the `hot` style, cut to `room` columns. Returns the spans and
+/// the columns they take.
+fn highlighted(
+    chars: &[char],
+    offset: usize,
+    matched: &[usize],
+    room: usize,
+    base: Style,
+    hot: Style,
+) -> (Vec<Span<'static>>, usize) {
+    let mut spans = Vec::new();
+    let mut used = 0;
+    let mut run = String::new();
+    let mut run_hot = false;
+    let total = chars
+        .iter()
+        .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
+        .sum::<usize>();
+    for (i, &ch) in chars.iter().enumerate() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        // Leave a column for the ellipsis when the rest will not fit.
+        if total > room && used + w + 1 > room {
+            if room > used {
+                run.push('…');
+                used += 1;
+            }
+            break;
+        }
+        let is_hot = matched.contains(&(i + offset));
+        if is_hot != run_hot && !run.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                if run_hot { hot } else { base },
+            ));
+        }
+        run_hot = is_hot;
+        run.push(ch);
+        used += w;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if run_hot { hot } else { base }));
+    }
+    (spans, used)
 }
 
 /// The `v` dialog: how to show the open key's bytes.
@@ -1927,6 +2138,7 @@ fn type_color(kind: KeyType, palette: Palette) -> Color {
         KeyType::Stream => palette.red,
         KeyType::Json => palette.accent,
         KeyType::TimeSeries => palette.warning,
+        KeyType::VectorSet => palette.accent,
         KeyType::Other => palette.dim,
     }
 }
@@ -2101,6 +2313,10 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         row("T", "test the connection without opening it"),
         row("/", "filter by name or host · esc clears the filter"),
         row("p", "choose a colour theme (saved for the next run)"),
+        row(
+            "ctrl+p",
+            "go to — every action, key or server by fuzzy name",
+        ),
         head("Navigation"),
         row("j / k  ↑↓", "move        g / G  jump to top / bottom"),
         row("h / l  ←→", "collapse / expand folder"),
@@ -2110,7 +2326,10 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         row("/", "search by pattern (bare words become *word*)"),
         row("esc", "clear the search pattern"),
         row("n", "new key       D  delete key      R  rename key"),
-        row("t", "set or clear TTL"),
+        row(
+            "t",
+            "set or clear TTL · in the value pane, a hash field's own TTL",
+        ),
         row("y", "copy the selected key name to the clipboard"),
         row("m", "mark the key, or every key under the folder"),
         row("u", "clear every mark · D and t then act on the marked set"),
@@ -2132,7 +2351,14 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         ),
         row("a", "add an element (hash / list / set / zset / stream)"),
         row("x", "delete the selected element   v  view as gzip, hex …"),
-        row("f / +", "filter the elements · load more elements or keys"),
+        row(
+            "f / +",
+            "filter the elements (similarity search in a vector set) · load more",
+        ),
+        row(
+            "enter",
+            "in a vector set: the element's vector and attributes",
+        ),
         row("PgUp / PgDn", "scroll the selected JSON / XML preview"),
         head("Server"),
         row(
@@ -2147,7 +2373,11 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
             "P",
             "pub/sub feed    N  keyspace events    W  command monitor",
         ),
-        row("S", "consumer groups of the selected stream"),
+        row(
+            "S",
+            "consumer groups of a stream · elements like the selected one in a vector set",
+        ),
+        row("Q", "run a RediSearch query against an index"),
         row("L", "run a Lua script — marked keys become KEYS[1..]"),
         row(":", "raw command console — tab completes, ctrl+r searches"),
         row("ctrl+d", "switch database (reconnects)"),
@@ -2156,7 +2386,7 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
             "production: unlock writes for 5 minutes, or lock them now",
         ),
         row("ctrl+n", "back to the server list"),
-        row("q", "quit"),
+        row("? / q", "this list · quit"),
     ]
 }
 
@@ -2174,6 +2404,30 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_help_screen_names_every_palette_action() {
+        let text: String = help_text(Theme::Redis.palette())
+            .iter()
+            .map(|line| {
+                let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                format!(" {flat} ")
+            })
+            .collect();
+        for c in crate::palette::BROWSER
+            .iter()
+            .chain(crate::palette::CONNECTIONS)
+        {
+            // Bindings appear as their own word: "  M  ", "w / I", "enter".
+            let word = format!(" {} ", c.keys);
+            assert!(
+                text.contains(&word),
+                "help does not mention {:?} ({})",
+                c.keys,
+                c.label
+            );
+        }
     }
 
     #[test]

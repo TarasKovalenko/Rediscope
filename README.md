@@ -1,8 +1,9 @@
 # rediscope
 
 A terminal UI Redis client. Browse the keyspace as a folder tree, read and edit
-every value type, watch TTLs count down, find out which prefix is eating your
-RAM, and drop into a raw command console. One static binary, no Electron and no
+every value type (Redis 8 vector sets included), watch TTLs count down, find out
+which prefix is eating your RAM, and drop into a raw command console. It works
+with Redis, Valkey, KeyDB and Dragonfly. One static binary, no Electron and no
 Python runtime.
 
 | Key browser | Server list |
@@ -14,11 +15,13 @@ Python runtime.
 | <img src="docs/screenshots/pubsub.svg" alt="The pub/sub feed with a rate sparkline, channel breakdown and a JSON preview"> | <img src="docs/screenshots/editor.svg" alt="Editing a JSON value, checked before it is saved"> |
 | **Compressed values** | **Command monitor** |
 | <img src="docs/screenshots/codecs.svg" alt="A gzipped JSON value, recognised by its header and shown decoded and formatted"> | <img src="docs/screenshots/monitor.svg" alt="The MONITOR feed, grouped by command, with the rate and the traffic too fast to show"> |
+| **Go to anything** | **Vector sets** |
+| <img src="docs/screenshots/palette.svg" alt="The Ctrl+P palette matching keys by a few characters of their names"> | <img src="docs/screenshots/vectors.svg" alt="A Redis 8 vector set ranked by similarity to the selected element, with its attributes below"> |
 
 **[taraskovalenko.github.io/Rediscope](https://taraskovalenko.github.io/Rediscope/)** — install commands, every screen, and the keys worth knowing.
 
 **Contents:** [Install](#install) · [Quick start](#quick-start) ·
-[Features](#features) · [Keybindings](#keybindings) ·
+[Features](#features) · [Compatibility](#compatibility) · [Keybindings](#keybindings) ·
 [Command line](#command-line) · [Connections and secrets](#connections-and-secrets) ·
 [Configuration](#configuration) · [Troubleshooting](#troubleshooting) ·
 [Development](#development)
@@ -150,6 +153,13 @@ rediscope
   key) and `t` sets or clears their TTLs together. `u` clears the marks.
 - **Session memory.** Each profile remembers its database, search pattern, open
   folders and selected key, and reopens where you left it.
+- **Go to anything** (`Ctrl+P`). One input line over every action on the
+  screen and every loaded key, matched as you type: `u42prof` finds
+  `app:user:42:profile`, `mem` finds the memory report. Choosing a key opens
+  the folders above it and selects it; choosing an action runs the key it is
+  bound to, so every confirmation and production check still applies. When
+  nothing loaded matches, `Enter` searches the server for the text instead. On
+  the server list it finds saved servers.
 
 ### Editing
 
@@ -157,6 +167,22 @@ rediscope
   `n`, then add elements with `a`: a field and value for a hash, a value for a
   list (`RPUSH`), a member for a set (`SADD`), a member and score for a sorted
   set (`ZADD`), a field and value for a stream (`XADD *`).
+- **Hash field TTLs** (Redis 7.4+, Valkey 9). Fields with an expiry of their
+  own get a `ttl` column that counts down like the key TTLs, and a field leaves
+  the table the second it expires. `t` with a field selected in the value pane
+  sets its expiry (`HEXPIRE`) or clears it (`HPERSIST`); in the key tree `t` is
+  still the key's own TTL. A hash with no expiring fields looks as it always
+  did, and servers without field expiry are asked once per connection.
+- **Vector sets** (Redis 8). Each element is listed with its JSON attributes,
+  and the header gives the dimension and quantization from `VINFO`. `Enter`
+  shows an element's full vector (`VEMB`). `f` runs a similarity search
+  (`VSIM`) against an element or a vector you type, with an optional `FILTER`
+  expression such as `.year > 2000`, and lists the results with their scores;
+  `S` searches for elements like the selected one, and `Esc` goes back to the
+  listing. `a` adds an element (`VADD`), `x` removes one, and `e` edits its
+  attributes as JSON, through the same conflict check as every other edit.
+  Redis 8.2 and later list elements in order (`VRANGE`); 8.0 can only hand out a
+  random sample, which the header says when the set is bigger than the page.
 - **Strings in a real editor.** Multi-line, with `Ctrl+S` to save and `Esc` to
   back out.
 - **Rows edited in place.** `e` on a hash field, list item, set member,
@@ -325,6 +351,58 @@ rediscope
   or credentials. A write is refused outright if its intent cannot be recorded
   first, so the log cannot silently miss an operation.
 
+### Compatibility
+
+Rediscope speaks the plain Redis protocol, so it works with the servers that
+copy it. These are the versions the integration suites were run against:
+
+| Server | Tested version | Status |
+|---|---|---|
+| Redis | 8.0, 8.10 and 7.2 | Everything works |
+| Valkey | 8.1 and 9.1 | Everything works |
+| KeyDB | 6.3 | Works, with the gaps below |
+| Dragonfly | 1.40 | Works, with the gaps below |
+
+The newer data types depend on the server, not on rediscope:
+
+| Server | Hash field TTLs | Vector sets |
+|---|---|---|
+| Redis 8.2+ | Yes | Yes |
+| Redis 8.0 | Yes | Yes, listed as a random sample past one page |
+| Redis 7.4 | Yes | No |
+| Valkey 9 | Yes | No |
+| Dragonfly | Shown and set, but not cleared (no `HPERSIST`) | No |
+| Valkey 8, KeyDB, Redis before 7.4 | No | No |
+
+What does not work, and why:
+
+- **KeyDB and Dragonfly: renaming a set or sorted-set member.** A rename is an
+  add plus a remove, and rediscope checks both against the ACL before writing
+  either, using a Lua function (`redis.acl_check_cmd`) that arrived in Redis 7.
+  Neither server has it, so the rename is refused and the member is left as it
+  was. Editing a sorted-set score in place still works.
+- **Dragonfly: Lua scripts must declare their keys.** A script that touches a
+  key it was not given in `KEYS` is refused unless Dragonfly runs with
+  `--default_lua_flags=allow-undeclared-keys`.
+- **Dragonfly: keyspace events are expiry only.** The `N` feed shows expired
+  keys once `notify-keyspace-events` is set to `Ex` (the
+  `--notify_keyspace_events=Ex` flag or `CONFIG SET`). Dragonfly refuses every
+  other event class.
+- **Dragonfly: memory numbers are its own.** `MEMORY USAGE` reports Dragonfly's
+  accounting, which packs ASCII strings, so a 400-byte value can show as 384
+  bytes. There is no `OBJECT FREQ`, so the namespace report has no access
+  counts.
+- **Exports between different servers.** An export holds `DUMP` payloads, and a
+  server refuses a payload from a newer RDB format than its own. Moving from an
+  older server to a newer one works; a Redis 8 or Valkey 9 export does not load
+  into any other server in the table, and KeyDB refuses Valkey 8 exports and
+  most Dragonfly ones.
+
+CI runs the integration, codec, monitor, paging, production and newer-type
+suites against each server in the table on every push (the `compat` job), with
+`REDISCOPE_TEST_FLAVOR` naming the server so a test can skip the one part that
+server does not do.
+
 ### Comfort
 
 - **Colour themes** (`p`). Preview and choose Redis, Dracula, Catppuccin Mocha,
@@ -358,6 +436,7 @@ Press `?` in the app for this list at any time.
 | `T` | Test the connection without opening it |
 | `/` | Filter by name or host · `Esc` clears the filter |
 | `p` | Preview and choose a colour theme |
+| `Ctrl+P` | Go to a saved server or run an action by name |
 | `?` / `q` | Help / quit |
 
 ### Key browser
@@ -370,7 +449,7 @@ Press `?` in the app for this list at any time.
 | `/` | Search by pattern. A bare word becomes `*word*` |
 | `Esc` | Clear the search pattern |
 | `n` `D` `R` | New key · delete key · rename key |
-| `t` | Set or clear TTL |
+| `t` | Set or clear TTL. In the value pane, the selected hash field's own TTL |
 | `y` | Copy the selected key name to the clipboard |
 | `m` / `u` | Mark the key or folder · clear every mark |
 | `F` | Find keys whose value contains some text |
@@ -379,23 +458,33 @@ Press `?` in the app for this list at any time.
 | `L` | Run a Lua script (marked keys become `KEYS[1..]`) |
 | `r` | Refresh keys and the open value |
 | `e` | Edit. A string opens the editor, a row opens a form |
-| `a` | Add an element to a hash / list / set / zset / stream |
+| `a` | Add an element to a hash / list / set / zset / stream / vector set |
 | `x` | Delete the selected element |
 | `PgUp` `PgDn` | Scroll the selected JSON or XML preview |
 | `v` | View the value as auto, plain, gzip, zstd, msgpack, hex … or a custom codec |
-| `f` | Filter the open collection's elements · `Esc` in the value pane clears it |
+| `f` | Filter the open collection's elements, or search a vector set by similarity · `Esc` in the value pane clears it |
+| `Enter` | In a vector set's value pane: the selected element's vector and attributes |
 | `+` | Load more: keys with the tree focused, elements with the value pane focused |
 | `i` | Server info |
 | `M` | Namespace memory report |
 | `P` / `N` / `W` | Pub/sub feed · keyspace event feed · command monitor |
-| `S` | Consumer groups of the selected stream |
+| `S` | Consumer groups of the selected stream · elements like the selected one in a vector set |
 | `Q` | Run a RediSearch query |
 | `p` | Colour theme picker |
 | `:` | Raw command console |
+| `Ctrl+P` | Go to any loaded key, or run any action, by fuzzy name |
 | `Ctrl+D` | Switch database (reconnects) |
 | `Ctrl+W` | Unlock production writes for five minutes, or lock them again now |
 | `Ctrl+N` | Back to the server list |
 | `?` / `q` | Help / quit |
+
+### Go to (`Ctrl+P`)
+| Key | Action |
+|---|---|
+| typing | Match actions and loaded keys (saved servers on the server list) |
+| `↑` `↓` / `Tab` / `Ctrl+J` `Ctrl+K` | Choose |
+| `Enter` | Run the action, select the key, or connect. With no match, search the server |
+| `Esc` / `Ctrl+P` | Close |
 
 ### Server info (`i`)
 | Key | Action |
@@ -811,8 +900,12 @@ cargo test                                    # unit, render, and topology proto
 cargo test --test live_topology -- --ignored   # disposable real Cluster/Sentinel smoke test
 redis-server --port 7799 --daemonize yes      # for the integration suite
 REDISCOPE_TEST_PORT=7799 cargo test           # exercises a real server, including tests/production.rs
+REDISCOPE_TEST_FLAVOR=valkey ...              # redis (default), valkey, keydb or dragonfly
 cargo clippy --all-targets -- -D warnings
 ```
+
+`tests/modern_types.rs` covers hash field TTLs and vector sets, and skips each
+part the server does not have, so it passes against Redis 7 as well as 8.
 
 `tests/production.rs` drives the whole safety path against that server: a locked
 production transport, the `Ctrl+W` unlock, typed confirmations, the headless

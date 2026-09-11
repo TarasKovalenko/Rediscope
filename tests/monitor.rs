@@ -17,13 +17,14 @@ use rediscope::redis_client::{Client, parse_monitor_line};
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn monitors(client: &Client) -> usize {
-    client
-        .execute_raw("CLIENT LIST")
-        .await
-        .unwrap()
-        .lines()
-        .filter(|l| l.contains("cmd=monitor"))
-        .count()
+    let list = client.execute_raw("CLIENT LIST").await.unwrap();
+    // Dragonfly's CLIENT LIST has no cmd= field, so a MONITOR connection
+    // cannot be told apart there. Every test here holds SERIAL, which leaves
+    // the connection count moving only with the monitor.
+    if !list.contains(" cmd=") {
+        return list.lines().count();
+    }
+    list.lines().filter(|l| l.contains("cmd=monitor")).count()
 }
 
 fn conn(environment: Environment) -> Option<Connection> {

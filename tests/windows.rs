@@ -30,9 +30,15 @@ async fn clients(db: i64) -> Option<(Client, redis::aio::MultiplexedConnection)>
     })
     .await
     .expect("connect");
+    // The byte-budget test pushes 80 MiB in one pipeline. The crate's default
+    // 500 ms reply timeout is too short for that on some servers (KeyDB in
+    // Docker takes longer), and the fixture should not be what fails.
     let raw = redis::Client::open(format!("redis://127.0.0.1:{port}/{db}"))
         .unwrap()
-        .get_multiplexed_async_connection()
+        .get_multiplexed_async_connection_with_config(
+            &redis::AsyncConnectionConfig::new()
+                .set_response_timeout(Some(std::time::Duration::from_secs(30))),
+        )
         .await
         .unwrap();
     Some((client, raw))
@@ -58,6 +64,7 @@ fn window(limit: usize, filter: Option<&str>) -> Window {
     Window {
         limit,
         filter: filter.map(str::to_string),
+        similar: None,
     }
 }
 

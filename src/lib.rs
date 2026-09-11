@@ -11,6 +11,7 @@ pub mod input;
 pub mod json;
 pub mod memory;
 pub mod osc52;
+pub mod palette;
 pub mod redis_client;
 pub mod secrets;
 pub mod theme;

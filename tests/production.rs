@@ -1,6 +1,7 @@
 //! P0 safety checks. CI supplies a disposable standalone Redis via REDISCOPE_TEST_PORT.
 mod common;
 
+use common::Flavor;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rediscope::{
     app::{App, Modal, Msg, Screen},
@@ -282,6 +283,51 @@ async fn atomic_edits_detect_conflicts_and_preserve_ttls() {
             "old",
             if kind == KeyType::Set { "old" } else { "1.25" },
         );
+        // Renaming a member is an add plus a remove, and the script checks both
+        // against the ACL with redis.acl_check_cmd before writing either. That
+        // Lua function arrived in Redis 7; KeyDB (Redis 6 based) and Dragonfly
+        // do not have it, so there the rename has to be refused untouched.
+        if common::skip_on(
+            &[Flavor::KeyDb, Flavor::Dragonfly],
+            "no redis.acl_check_cmd in Lua, member rename is refused",
+        ) {
+            let err = c
+                .save_edit(&t, &["new".into(), "2.5".into()], false)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Redis 7+"), "{err:#}");
+            let (check, member, absent) = if kind == KeyType::Set {
+                ("SISMEMBER", "(integer) 1", "(integer) 0")
+            } else {
+                ("ZSCORE", "1.25", "(nil)")
+            };
+            assert_eq!(
+                c.execute_raw(&format!("{check} {key} old")).await.unwrap(),
+                member,
+                "the old member is still there"
+            );
+            assert_eq!(
+                c.execute_raw(&format!("{check} {key} new")).await.unwrap(),
+                absent,
+                "and the new one was never added"
+            );
+            assert!(c.key_info(key).await.unwrap().ttl > 0);
+            // A new score for the same member is a single ZADD and needs no
+            // preflight, so that edit still goes through.
+            if kind == KeyType::ZSet {
+                assert_eq!(
+                    c.save_edit(&t, &["old".into(), "2.5".into()], false)
+                        .await
+                        .unwrap(),
+                    EditOutcome::Saved
+                );
+                assert_eq!(
+                    c.execute_raw(&format!("ZSCORE {key} old")).await.unwrap(),
+                    "2.5"
+                );
+            }
+            continue;
+        }
         assert_eq!(
             c.save_edit(&t, &["new".into(), "2.5".into()], false)
                 .await
@@ -409,6 +455,7 @@ async fn add_forms_write_and_editing_a_row_goes_through_conflict_detection() {
                 id: "existing".into(),
                 cells: vec!["existing".into(), "value".into()],
                 decoding: None,
+                ttl: None,
             }],
             total: 1,
         },

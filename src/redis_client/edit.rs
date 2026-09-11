@@ -31,6 +31,10 @@ elseif kind == 'hash' then current = redis.call('HGET', k, selector)
 elseif kind == 'list' then current = redis.call('LINDEX', k, selector)
 elseif kind == 'set' then if redis.call('SISMEMBER', k, selector) == 1 then current = selector end
 elseif kind == 'zset' then current = redis.call('ZSCORE', k, selector)
+elseif kind == 'vectorset' then
+    -- VGETATTR answers nil both for no attributes and for no element; VEMB
+    -- tells them apart.
+    if redis.call('VEMB', k, selector) then current = redis.call('VGETATTR', k, selector) or '' end
 else return redis.error_reply('Unsupported edit type') end
 local equal = current == expected
 if kind == 'zset' and current then equal = tonumber(current) == tonumber(expected) end
@@ -39,6 +43,7 @@ if kind == 'string' then redis.call('SET', k, value, 'KEEPTTL')
 elseif kind == 'ReJSON-RL' then redis.call('JSON.SET', k, '$', value)
 elseif kind == 'hash' then redis.call('HSET', k, selector, value)
 elseif kind == 'list' then redis.call('LSET', k, selector, value)
+elseif kind == 'vectorset' then redis.call('VSETATTR', k, selector, value)
 elseif kind == 'set' or kind == 'zset' then
     if selector ~= value then
         local exists
@@ -92,6 +97,7 @@ impl Client {
             anyhow::ensure!(!score.is_nan(), "Score cannot be NaN");
         }
         if target.kind == KeyType::Json
+            || (target.kind == KeyType::VectorSet && !value.is_empty())
             || (target.kind == KeyType::String && crate::json::mode(&target.original).is_json())
         {
             crate::json::check(value).map_err(anyhow::Error::msg)?;

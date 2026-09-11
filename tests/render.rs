@@ -80,11 +80,13 @@ fn populate(app: &mut App) {
                     id: "name".into(),
                     cells: vec!["name".into(), "ada".into()],
                     decoding: None,
+                    ttl: None,
                 },
                 Row {
                     id: "bio".into(),
                     cells: vec!["bio".into(), "multi\nline\tvalue".into()],
                     decoding: None,
+                    ttl: None,
                 },
             ],
             total: 2,
@@ -167,8 +169,22 @@ async fn renders_every_screen_and_modal_at_any_size() {
     render_all_sizes(&mut a);
     press(&mut a, KeyCode::Esc);
 
+    app_ctrl(&mut a, 'p'); // palette over the server list
+    render_all_sizes(&mut a);
+    type_str(&mut a, "prd");
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
+
     populate(&mut a);
     render_all_sizes(&mut a); // browser with a hash selected
+
+    app_ctrl(&mut a, 'p'); // palette: every action, then keys as you type
+    render_all_sizes(&mut a);
+    type_str(&mut a, "usr");
+    render_all_sizes(&mut a);
+    type_str(&mut a, "zzzz"); // nothing matches
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Esc);
 
     for opener in [':', 'n', 't', 'a', 'e', 'x', 'R'] {
         press(&mut a, KeyCode::Char(opener));
@@ -233,6 +249,27 @@ async fn renders_every_screen_and_modal_at_any_size() {
 }
 
 #[tokio::test]
+async fn the_palette_marks_what_the_query_matched() {
+    let mut a = app();
+    populate(&mut a);
+    app_ctrl(&mut a, 'p');
+    let screen = render_text(&mut a, 100, 30);
+    assert!(screen.contains("Go to"), "{screen}");
+    assert!(screen.contains("Search keys by pattern"), "{screen}");
+    assert!(
+        screen.contains(&format!("{} matches", rediscope::palette::BROWSER.len())),
+        "{screen}"
+    );
+    type_str(&mut a, "user2");
+    let screen = render_text(&mut a, 100, 30);
+    assert!(screen.contains("H app:user:2"), "{screen}");
+    assert!(
+        screen.contains("1 match\n") || screen.contains("1 match "),
+        "{screen}"
+    );
+}
+
+#[tokio::test]
 async fn previews_structured_list_values_and_handles_long_editor_titles() {
     let mut a = app();
     a.screen = rediscope::app::Screen::Browser;
@@ -248,6 +285,7 @@ async fn previews_structured_list_values_and_handles_long_editor_titles() {
                     "<key id=\"abc\"><creationDate>2026-09-04</creationDate><descriptor><masterKey requiresEncryption=\"true\"><value>protected</value></masterKey></descriptor></key>".into(),
                 ],
                 decoding: None,
+                ttl: None,
             }],
             total: 1,
         },
@@ -532,6 +570,90 @@ async fn the_memory_report_renders_while_it_is_still_scanning() {
 }
 
 #[tokio::test]
+async fn hash_field_ttls_get_a_column_that_counts_down() {
+    let mut a = app();
+    populate(&mut a);
+    let field = |id: &str, ttl: Option<i64>| Row {
+        id: id.into(),
+        cells: vec![id.into(), "v".into()],
+        decoding: None,
+        ttl,
+    };
+    a.on_msg(Msg::Value {
+        info: key("app:user:2", KeyType::Hash, -1),
+        value: KeyValue::Rows {
+            headers: vec!["field", "value"],
+            rows: vec![field("session", Some(90)), field("name", None)],
+            total: 2,
+        },
+    });
+    let screen = render_text(&mut a, 100, 20);
+    assert!(screen.contains("ttl"), "{screen}");
+    assert!(screen.contains("1m30s"), "{screen}");
+    a.age_ttls(31);
+    let screen = render_text(&mut a, 100, 20);
+    assert!(screen.contains("59s"), "{screen}");
+    render_all_sizes(&mut a);
+
+    // Without field TTLs, no column.
+    populate(&mut a);
+    let screen = render_text(&mut a, 100, 20);
+    assert!(!screen.contains("  ttl  "), "{screen}");
+}
+
+#[tokio::test]
+async fn vector_sets_render_their_listing_and_similarity_results() {
+    let mut a = app();
+    populate(&mut a);
+    let vset = key("emb:movies", KeyType::VectorSet, -1);
+    a.on_msg(Msg::Value {
+        info: vset.clone(),
+        value: KeyValue::Rows {
+            headers: vec!["element", "attributes"],
+            rows: vec![Row {
+                id: "heat".into(),
+                cells: vec!["heat".into(), r#"{"year":1995}"#.into()],
+                ..Default::default()
+            }],
+            total: 1,
+        },
+    });
+    let screen = render_text(&mut a, 110, 30);
+    assert!(screen.contains("vectorset"), "{screen}");
+    assert!(
+        screen.contains("Selected JSON"),
+        "attributes preview: {screen}"
+    );
+    render_all_sizes(&mut a);
+
+    a.value_window.similar = Some(rediscope::redis_client::Similar {
+        to: rediscope::redis_client::SimilarTo::Element("heat".into()),
+        filter: Some(".year > 1990".into()),
+        count: 20,
+    });
+    a.on_msg(Msg::Value {
+        info: vset,
+        value: KeyValue::Rows {
+            headers: vec!["element", "similarity", "attributes"],
+            rows: vec![Row {
+                id: "ronin".into(),
+                cells: vec!["ronin".into(), "0.9876".into(), r#"{"year":1998}"#.into()],
+                ..Default::default()
+            }],
+            total: 3,
+        },
+    });
+    let screen = render_text(&mut a, 110, 30);
+    assert!(
+        screen.contains("similar to 'heat' where .year > 1990"),
+        "{screen}"
+    );
+    assert!(screen.contains("0.9876"), "{screen}");
+    assert!(screen.contains("similarity"), "{screen}");
+    render_all_sizes(&mut a);
+}
+
+#[tokio::test]
 async fn the_new_panes_render_at_any_size() {
     let mut a = app();
     populate(&mut a);
@@ -813,6 +935,7 @@ async fn decoded_values_and_the_view_picker_render_at_any_size() {
                     id: "doc".into(),
                     cells: vec!["doc".into(), "{\"a\":1}".into()],
                     decoding: Some(gzip.clone()),
+                    ttl: None,
                 },
                 Row {
                     id: "bin".into(),
@@ -821,6 +944,7 @@ async fn decoded_values_and_the_view_picker_render_at_any_size() {
                         read_only: Some("not text".into()),
                         ..gzip.clone()
                     }),
+                    ttl: None,
                 },
             ],
             total: 2,
@@ -857,6 +981,7 @@ async fn the_monitor_feed_and_filtered_collections_render_at_any_size() {
                 id: "user:1".into(),
                 cells: vec!["user:1".into(), "ada".into()],
                 decoding: None,
+                ttl: None,
             }],
             total: 250_000,
         },
