@@ -841,3 +841,65 @@ async fn decoded_values_and_the_view_picker_render_at_any_size() {
     assert!(a.modal.is_none());
     assert!(render_text(&mut a, 120, 40).contains("plain"));
 }
+
+#[tokio::test]
+async fn the_monitor_feed_and_filtered_collections_render_at_any_size() {
+    let mut a = app();
+    populate(&mut a);
+
+    // A filtered hash that has not been searched to the end.
+    a.value_window.filter = Some("user:*".into());
+    a.on_msg(Msg::Value {
+        info: key("app:user:2", KeyType::Hash, 3600),
+        value: KeyValue::Rows {
+            headers: vec!["field", "value"],
+            rows: vec![Row {
+                id: "user:1".into(),
+                cells: vec!["user:1".into(), "ada".into()],
+                decoding: None,
+            }],
+            total: 250_000,
+        },
+    });
+    a.value_coverage = rediscope::redis_client::Coverage {
+        filtered: true,
+        complete: false,
+        examined: 100_000,
+    };
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 140, 40);
+    assert!(screen.contains("filter user:*: 1 match(es)"), "{screen}");
+    assert!(screen.contains("searched 100000 of 250000"), "{screen}");
+
+    // An unfiltered first page offers more.
+    a.value_window.filter = None;
+    a.value_coverage = rediscope::redis_client::Coverage::default();
+    render_all_sizes(&mut a);
+    assert!(render_text(&mut a, 140, 40).contains("showing 1 of 250000 · + loads more"));
+
+    // The tree says more keys can be loaded.
+    a.truncated = true;
+    a.pattern = "*".into();
+    assert!(render_text(&mut a, 160, 40).contains("TRUNCATED (+ more)"));
+
+    // The command monitor, with a burst it could not keep up with.
+    let mut feed = rediscope::app::PubSubState::monitor(vec!["user:*".into()]);
+    feed.push(
+        "SET".into(),
+        "db0 10.0.0.7:51234  \"user:1\" \"ada\"".into(),
+    );
+    feed.push("GET".into(), "db0 10.0.0.7:51234  \"user:1\"".into());
+    feed.push_dropped(1_234);
+    a.modal = Some(Modal::PubSub(feed));
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 140, 40);
+    assert!(screen.contains("Command monitor"), "{screen}");
+    assert!(screen.contains("cmd/s"), "{screen}");
+    assert!(screen.contains("1234 too fast to show"), "{screen}");
+    assert!(screen.contains("Commands"), "{screen}");
+
+    // An empty monitor explains what it is waiting for.
+    a.modal = Some(Modal::PubSub(rediscope::app::PubSubState::monitor(vec![])));
+    render_all_sizes(&mut a);
+    assert!(render_text(&mut a, 140, 40).contains("waiting for commands"));
+}

@@ -117,12 +117,26 @@ rediscope
 
 - **Namespace tree.** Keys grouped by `:` into collapsible folders, with a
   per-folder key count and a type badge on every leaf.
-- **Safe listing.** `SCAN` in batches, never `KEYS *`, capped at 5,000 keys per
-  view. The header says so when a result was truncated, so you know to narrow
-  the pattern rather than trusting a short list.
+- **Safe listing.** `SCAN` in batches, never `KEYS *`, 5,000 keys per view to
+  start with. The header says so when a result was truncated, and `+` loads
+  5,000 more, up to 50,000, rescanning so a refresh stays consistent.
 - **Bounded value reads.** Collections are read through `HSCAN`/`SSCAN` or a
   ranged `LRANGE`/`ZRANGE`, up to 1,000 elements, while still reporting the true
   total ("showing 1000 of 4.2M"). A million-element list will not stall the UI.
+  With the value pane focused, `+` loads another 1,000, up to 10,000.
+- **Filter inside a collection** (`f`). Type a glob, or a bare word that becomes
+  `*word*`, to keep only the matching elements of the open key. Hash fields and
+  set and sorted-set members are matched by the server with `HSCAN`/`SSCAN`/`ZSCAN
+  MATCH`; list items and stream field names and values are walked in chunks
+  and matched locally with the same rules. Patterns match the stored bytes.
+  Each read looks at up to 100,000 elements, and a list or stream walk pulls at
+  most 64 MiB, in chunks that shrink when items are large (both grow as `+`
+  raises the limit). The header says how many elements it searched and
+  whether it reached the end. A filtered sorted set shows the lowest scores
+  among the matches it examined. List rows keep their real index, and deleting
+  one checks that the index still holds the item you saw, so a queue that
+  moved in the meantime loses nothing it shouldn't. `Esc` in the value pane
+  clears the filter.
 - **Live TTLs.** Expiries count down in place, and a key leaves the tree the
   second it expires, so nothing stale sits in the view between scans.
 - **Search.** `/` filters by glob against the server, not just what's on screen.
@@ -226,6 +240,16 @@ rediscope
   which channels the traffic is on, each in its own colour; selecting a JSON or
   XML message pretty-prints it below the feed. `w` publishes one, `f` follows
   the tail, `y` copies the feed.
+- **Command monitor** (`W`). `MONITOR` in the same feed: every command the
+  server runs, grouped by command name, with the rate and a filter (`s`) that
+  keeps commands whose name or arguments match. A busy server runs more
+  commands than a terminal can show, so the feed takes at most 500 every
+  100 ms and counts the rest as "too fast to show" instead of queueing them,
+  and keeps the first 2 KiB of each command's arguments. The `MONITOR`
+  connection closes with the feed, however the feed goes away.
+  A production profile asks before starting it, because `MONITOR` costs the
+  server real throughput while it runs; `Esc` stops it. Standalone profiles
+  only for now, like pub/sub.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
   evicted live. Needs `notify-keyspace-events` set on the server.
@@ -357,9 +381,11 @@ Press `?` in the app for this list at any time.
 | `x` | Delete the selected element |
 | `PgUp` `PgDn` | Scroll the selected JSON or XML preview |
 | `v` | View the value as auto, plain, gzip, zstd, msgpack, hex … or a custom codec |
+| `f` | Filter the open collection's elements · `Esc` in the value pane clears it |
+| `+` | Load more: keys with the tree focused, elements with the value pane focused |
 | `i` | Server info |
 | `M` | Namespace memory report |
-| `P` / `N` | Pub/sub feed · keyspace event feed |
+| `P` / `N` / `W` | Pub/sub feed · keyspace event feed · command monitor |
 | `S` | Consumer groups of the selected stream |
 | `Q` | Run a RediSearch query |
 | `p` | Colour theme picker |
@@ -394,7 +420,7 @@ Press `?` in the app for this list at any time.
 ### Pub/Sub and keyspace events (`P` / `N`)
 | Key | Action |
 |---|---|
-| `s` | Change what the feed is subscribed to |
+| `s` | Change what the feed is subscribed to · in the command monitor, change its filter |
 | `w` | Publish a message |
 | `f` | Follow the newest message · `↑` `↓` `PgUp` `PgDn` scroll back |
 | `c` / `y` | Clear the feed and its statistics · copy it |
