@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in rediscope doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please leave out passwords, hostnames and real data.
+        Security problems go through [private reporting](https://github.com/TarasKovalenko/Rediscope/security/advisories/new), not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Ideally against a throwaway local server.
+      placeholder: |
+        1. redis-server --port 6379
+        2. rediscope --url redis://127.0.0.1:6379
+        3. press ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: rediscope version
+      description: Output of `rediscope --version`.
+      placeholder: rediscope 0.13.0
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Server
+      description: Which server and version, and the topology if it isn't a single node.
+      placeholder: Redis 8.2, cluster with 3 primaries
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and terminal
+      placeholder: macOS 26, iTerm2 inside tmux
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Error messages, a screenshot, or the part of `connections.json` involved (with secrets removed).
+      render: text
