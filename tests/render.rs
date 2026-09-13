@@ -364,6 +364,7 @@ async fn form_validation_blocks_submit_and_keeps_the_modal_open() {
     assert!(a.modal.is_some(), "invalid form stays open");
 
     type_str(&mut a, "srv"); // focus starts on Name, not the section heading
+    press(&mut a, KeyCode::Tab); // group
     press(&mut a, KeyCode::Tab); // host
     press(&mut a, KeyCode::Tab); // port
     type_str(&mut a, "notaport");
@@ -396,6 +397,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
 
     let inputs = [
         "edge",           // Name
+        "checkout",       // Group
         "cache.example",  // Host
         "6380",           // Port
         "3",              // Database
@@ -414,7 +416,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         "",               // SSH key
     ];
     for (i, value) in inputs.iter().enumerate() {
-        if i == 8 {
+        if i == 9 {
             press(&mut a, KeyCode::Char(' ')); // switch TLS on
         } else if !value.is_empty() {
             app_ctrl(&mut a, 'u');
@@ -433,6 +435,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         .iter()
         .find(|c| c.name == "edge")
         .unwrap();
+    assert_eq!(c.group.as_deref(), Some("checkout"));
     assert_eq!(c.host, "cache.example");
     assert_eq!(c.port, 6380);
     assert_eq!(c.db, 3);
@@ -453,7 +456,7 @@ async fn certificate_files_require_tls() {
     let mut a = app();
     press(&mut a, KeyCode::Char('n'));
     type_str(&mut a, "certs-only");
-    for _ in 0..9 {
+    for _ in 0..10 {
         press(&mut a, KeyCode::Tab); // walk to the CA certificate field
     }
     type_str(&mut a, "/tmp/ca.pem");
@@ -816,12 +819,12 @@ async fn sentinel_form_persists_discovery_fields() {
     };
     let mut inputs: Vec<_> = fields.iter_mut().filter(|f| f.is_input()).collect();
     inputs[0].input.set("sentinel-profile");
-    inputs[2].input.set("26379");
-    inputs[17].choice = 2;
-    inputs[18].input.set("[::1]:26380,redis-b:26379");
-    inputs[19].input.set("primary-service");
-    inputs[20].input.set("sentinel-reader");
-    inputs[21].input.set("${SENTINEL_PASSWORD}");
+    inputs[3].input.set("26379");
+    inputs[18].choice = 2;
+    inputs[19].input.set("[::1]:26380,redis-b:26379");
+    inputs[20].input.set("primary-service");
+    inputs[21].input.set("sentinel-reader");
+    inputs[22].input.set("${SENTINEL_PASSWORD}");
     press(&mut a, KeyCode::Enter);
     assert!(a.modal.is_none());
     let saved = a
@@ -1027,4 +1030,47 @@ async fn the_monitor_feed_and_filtered_collections_render_at_any_size() {
     a.modal = Some(Modal::PubSub(rediscope::app::PubSubState::monitor(vec![])));
     render_all_sizes(&mut a);
     assert!(render_text(&mut a, 140, 40).contains("waiting for commands"));
+}
+
+/// The footer drops whole hints when it runs out of room, never help and
+/// quit, which stay pinned to the right on both screens. `v` is only offered
+/// once some profile has a group.
+#[tokio::test]
+async fn the_footer_keeps_help_and_quit_at_any_width() {
+    let footer = |a: &mut App, w: u16| {
+        render_text(a, w, 24)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut a = app();
+    for w in [80, 120] {
+        let line = footer(&mut a, w);
+        assert!(
+            line.trim_end().ends_with("?  help   q  quit"),
+            "{w}: {line:?}"
+        );
+        assert!(line.contains(" connect "), "{w}: {line:?}");
+        assert!(!line.contains("group/flat"), "no groups yet: {line:?}");
+        // A hint is shown whole or not at all.
+        assert!(
+            !line.contains(" reord ") && !line.contains(" them "),
+            "{line:?}"
+        );
+    }
+    a.store.connections[1].group = Some("prod".into());
+    assert!(footer(&mut a, 160).contains(" v  group/flat"));
+
+    populate(&mut a);
+    for w in [80, 120] {
+        let line = footer(&mut a, w);
+        assert!(
+            line.trim_end().ends_with("?  help   q  quit"),
+            "{w}: {line:?}"
+        );
+        assert!(line.contains(" search "), "{w}: {line:?}");
+    }
+    // Narrower than the pinned pair itself: no panic.
+    render_all_sizes(&mut a);
 }
