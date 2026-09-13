@@ -12,6 +12,8 @@ use crate::app::{
     App, ConsoleState, Field, FieldKind, Focus, GroupPane, GroupsState, INFO_TABS, InfoRow,
     InfoState, MemoryState, Modal, PubSubState, Screen,
 };
+use crate::config::{Connection, ConnectionView};
+use crate::conn_list::{self, ConnRow};
 use crate::json::{self, Token};
 use crate::memory::human_bytes;
 use crate::redis_client::{KeyType, KeyValue};
@@ -131,7 +133,7 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                 Span::raw(buf.value()),
             ]))
             .block(panel(
-                "Filter by name or host (Enter keeps it, Esc closes)",
+                "Filter by name, host or group (Enter keeps it, Esc closes)",
                 true,
                 palette,
             )),
@@ -143,76 +145,65 @@ fn connections(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         ));
     }
 
-    let visible = app.visible_connections();
-    let items: Vec<ListItem> = visible
+    let rows_now = app.connection_rows();
+    let shown = rows_now
         .iter()
-        .map(|i| {
-            let c = &app.store.connections[*i];
-            let mut spans = vec![
-                Span::styled(
-                    format!("{:<16}", truncate(&c.name, 16)),
-                    Style::new().bold(),
-                ),
-                Span::styled(
-                    format!(
-                        "{}://{}:{}/{}",
-                        if c.tls { "rediss" } else { "redis" },
-                        c.host,
-                        c.port,
-                        c.db
+        .filter(|r| r.connection_index().is_some())
+        .count();
+    // What a header line has left once the borders, the highlight symbol and
+    // the glyph are drawn.
+    let label_width = usize::from(rows[1].width).saturating_sub(5);
+    let items: Vec<ListItem> = rows_now
+        .iter()
+        .map(|r| match r {
+            ConnRow::Group {
+                name,
+                count,
+                expanded,
+            } => {
+                let count = format!("  ({count})");
+                let room = label_width.saturating_sub(UnicodeWidthStr::width(count.as_str()));
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if *expanded { "▾ " } else { "▸ " },
+                        Style::new().fg(palette.dim),
                     ),
-                    Style::new().fg(palette.dim),
-                ),
-            ];
-            if c.environment != crate::config::Environment::Development {
-                spans.push(Span::styled(
-                    format!("  {}", c.environment.name().to_uppercase()),
-                    Style::new().fg(palette.red).bold(),
+                    Span::styled(
+                        truncate(name, room),
+                        Style::new().fg(palette.foreground).bold(),
+                    ),
+                    Span::styled(count, Style::new().fg(palette.dim)),
+                ]))
+            }
+            ConnRow::Connection { index, depth } => {
+                let mut spans = vec![Span::raw("  ".repeat(usize::from(*depth)))];
+                spans.extend(connection_line(
+                    &app.store.connections[*index],
+                    app,
+                    palette,
                 ));
+                ListItem::new(Line::from(spans))
             }
-            if c.tls {
-                spans.push(Span::styled("  TLS", Style::new().fg(palette.success)));
-            }
-            if c.tls_insecure {
-                spans.push(Span::styled(
-                    "  no-verify",
-                    Style::new().fg(palette.warning),
-                ));
-            }
-            if c.use_keychain {
-                spans.push(Span::styled("  keychain", Style::new().fg(palette.info)));
-            }
-            if c.deployment != crate::config::Deployment::Standalone {
-                spans.push(Span::styled(
-                    format!("  {}", c.deployment.name()),
-                    Style::new().fg(palette.info),
-                ));
-            }
-            if c.read_only || c.deployment != crate::config::Deployment::Standalone {
-                spans.push(Span::styled(
-                    "  read-only",
-                    Style::new().fg(palette.warning),
-                ));
-            }
-            if c.uses_ssh() {
-                spans.push(Span::styled("  ssh", Style::new().fg(palette.magenta)));
-            }
-            if app.testing.as_deref() == Some(c.name.as_str()) {
-                spans.push(Span::styled("  testing…", Style::new().fg(palette.accent)));
-            }
-            ListItem::new(Line::from(spans))
         })
         .collect();
 
     let total = app.store.connections.len();
-    let title = if app.conn_query.is_empty() {
-        format!("Saved connections ({total})")
-    } else {
+    let groups = match app.store.connection_view {
+        ConnectionView::Grouped => conn_list::group_count(&app.store.connections),
+        ConnectionView::Flat => 0,
+    };
+    let title = if !app.conn_query.is_empty() {
         format!(
-            "Saved connections — {} of {total} match '{}'",
-            visible.len(),
+            "Saved connections — {shown} of {total} match '{}'",
             app.conn_query
         )
+    } else if groups > 0 {
+        format!(
+            "Saved connections ({total} · {groups} group{})",
+            if groups == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("Saved connections ({total})")
     };
     let empty = items.is_empty();
     let list = List::new(items)
@@ -244,6 +235,64 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(area);
     key_panel(f, cols[0], app, palette);
     value_panel(f, cols[1], app, palette);
+}
+
+/// One saved profile in the server list: name, address and badges. Shared by
+/// the flat list and the members under a group header.
+fn connection_line(c: &Connection, app: &App, palette: Palette) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{:<16}", truncate(&c.name, 16)),
+            Style::new().bold(),
+        ),
+        Span::styled(
+            format!(
+                "{}://{}:{}/{}",
+                if c.tls { "rediss" } else { "redis" },
+                c.host,
+                c.port,
+                c.db
+            ),
+            Style::new().fg(palette.dim),
+        ),
+    ];
+    if c.environment != crate::config::Environment::Development {
+        spans.push(Span::styled(
+            format!("  {}", c.environment.name().to_uppercase()),
+            Style::new().fg(palette.red).bold(),
+        ));
+    }
+    if c.tls {
+        spans.push(Span::styled("  TLS", Style::new().fg(palette.success)));
+    }
+    if c.tls_insecure {
+        spans.push(Span::styled(
+            "  no-verify",
+            Style::new().fg(palette.warning),
+        ));
+    }
+    if c.use_keychain {
+        spans.push(Span::styled("  keychain", Style::new().fg(palette.info)));
+    }
+    if c.deployment != crate::config::Deployment::Standalone {
+        spans.push(Span::styled(
+            format!("  {}", c.deployment.name()),
+            Style::new().fg(palette.info),
+        ));
+    }
+    if c.read_only || c.deployment != crate::config::Deployment::Standalone {
+        spans.push(Span::styled(
+            "  read-only",
+            Style::new().fg(palette.warning),
+        ));
+    }
+    if c.uses_ssh() {
+        spans.push(Span::styled("  ssh", Style::new().fg(palette.magenta)));
+    }
+    if app.testing.as_deref() == Some(c.name.as_str()) {
+        spans.push(Span::styled("  testing…", Style::new().fg(palette.accent)));
+    }
+    spans
 }
 
 fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
@@ -618,53 +667,91 @@ fn status_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
     );
 }
 
+/// A footer hint: the key, then what it does.
+type Hint = (&'static str, &'static str);
+
 fn footer(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
-    let keys: &[(&str, &str)] = match (app.screen, app.modal.is_some()) {
-        (_, true) => &[("esc", "close"), ("enter", "confirm")],
-        (Screen::Connections, _) => &[
-            ("↑↓", "move"),
-            ("enter", "connect"),
-            ("n", "new"),
-            ("e", "edit"),
-            ("c", "copy"),
-            ("d", "delete"),
-            ("J/K", "reorder"),
-            ("T", "test"),
-            ("/", "filter"),
-            ("p", "theme"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        (Screen::Browser, _) => &[
-            ("/", "search"),
-            ("F", "find value"),
-            ("tab", "pane"),
-            ("n", "new key"),
-            ("e", "edit"),
-            ("a", "add"),
-            ("m", "mark"),
-            ("D", "del"),
-            ("C", "copy"),
-            ("t", "ttl"),
-            (":", "console"),
-            ("i", "info"),
-            ("P", "pub/sub"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
+    // Hints in priority order: when the line is too narrow, the ones that do
+    // not fit are dropped whole, and help and quit stay pinned to the right.
+    let (hints, pinned): (Vec<Hint>, &[Hint]) = match (app.screen, app.modal.is_some()) {
+        (_, true) => (vec![("esc", "close"), ("enter", "confirm")], &[]),
+        (Screen::Connections, _) => {
+            let mut hints = vec![
+                ("↑↓", "move"),
+                ("enter", "connect"),
+                ("n", "new"),
+                ("e", "edit"),
+                ("c", "copy"),
+                ("d", "delete"),
+                ("J/K", "reorder"),
+                ("T", "test"),
+                ("/", "filter"),
+            ];
+            // Nothing to switch between until some profile has a group.
+            if conn_list::group_count(&app.store.connections) > 0 {
+                hints.push(("v", "group/flat"));
+            }
+            hints.push(("p", "theme"));
+            (hints, &[("?", "help"), ("q", "quit")])
+        }
+        (Screen::Browser, _) => (
+            vec![
+                ("/", "search"),
+                ("F", "find value"),
+                ("tab", "pane"),
+                ("n", "new key"),
+                ("e", "edit"),
+                ("a", "add"),
+                ("m", "mark"),
+                ("D", "del"),
+                ("C", "copy"),
+                ("t", "ttl"),
+                (":", "console"),
+                ("i", "info"),
+                ("P", "pub/sub"),
+            ],
+            &[("?", "help"), ("q", "quit")],
+        ),
     };
-    let mut spans = Vec::new();
-    for (k, label) in keys {
-        spans.push(Span::styled(
-            format!(" {k} "),
-            Style::new().bg(palette.panel).fg(palette.foreground).bold(),
-        ));
-        spans.push(Span::styled(
-            format!(" {label}  "),
-            Style::new().fg(palette.dim),
-        ));
+    let key_style = Style::new().bg(palette.panel).fg(palette.foreground).bold();
+    let label_style = Style::new().fg(palette.dim);
+    // " k " then " label  ".
+    let width = |(k, label): &Hint| k.width() + label.width() + 5;
+    let hint = |spans: &mut Vec<Span<'static>>, (k, label): &Hint| {
+        spans.push(Span::styled(format!(" {k} "), key_style));
+        spans.push(Span::styled(format!(" {label}  "), label_style));
+    };
+
+    // The pinned group loses its trailing gap so it sits flush right.
+    let pinned_width = pinned.iter().map(width).sum::<usize>().saturating_sub(2);
+    let total = usize::from(area.width);
+    let room = total.saturating_sub(pinned_width);
+    let mut left = Vec::new();
+    let mut used = 0;
+    for h in &hints {
+        if used + width(h) <= room {
+            hint(&mut left, h);
+            used += width(h);
+        }
     }
-    f.render_widget(Line::from(spans), area);
+    f.render_widget(Line::from(left), area);
+
+    if !pinned.is_empty() {
+        let mut right = Vec::new();
+        for h in pinned {
+            hint(&mut right, h);
+        }
+        if let Some(last) = right.last_mut() {
+            last.content = last.content.trim_end().to_string().into();
+        }
+        let w = pinned_width.min(total) as u16;
+        let at = Rect {
+            x: area.x + area.width - w,
+            width: w,
+            ..area
+        };
+        f.render_widget(Line::from(right), at);
+    }
 }
 
 // ---- modals -------------------------------------------------------------
@@ -2311,7 +2398,13 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         ),
         row("d", "delete         J / K  move the profile down / up"),
         row("T", "test the connection without opening it"),
-        row("/", "filter by name or host · esc clears the filter"),
+        row("/", "filter by name, host or group · esc clears the filter"),
+        row("v", "switch between the grouped and the flat list"),
+        row("space  enter", "on a group header: collapse or expand it"),
+        row(
+            "h / l  ←→",
+            "collapse / expand group · h on a member: its header",
+        ),
         row("p", "choose a colour theme (saved for the next run)"),
         row(
             "ctrl+p",

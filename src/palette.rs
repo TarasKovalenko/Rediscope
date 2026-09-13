@@ -104,7 +104,8 @@ pub const CONNECTIONS: &[Command] = &[
     Command::key("T", 'T', "Test the connection without opening it"),
     Command::key("J", 'J', "Move the connection down"),
     Command::key("K", 'K', "Move the connection up"),
-    Command::key("/", '/', "Filter servers by name or host"),
+    Command::key("/", '/', "Filter servers by name, host or group"),
+    Command::key("v", 'v', "Toggle grouped / flat server list"),
     Command::key("p", 'p', "Colour theme"),
     Command::key("?", '?', "Keybindings"),
     Command::key("q", 'q', "Quit"),
@@ -156,11 +157,11 @@ impl PaletteState {
     }
 
     /// Re-rank against the current query. `keys` are the loaded key names and
-    /// types, `servers` the saved profile names.
+    /// types, `servers` the saved profile names with their group, if any.
     pub fn refresh<'a>(
         &mut self,
         keys: impl IntoIterator<Item = (&'a str, KeyType)>,
-        servers: impl IntoIterator<Item = &'a str>,
+        servers: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     ) {
         let query = self.input.value();
         let query = query.trim();
@@ -197,11 +198,16 @@ impl PaletteState {
                 }
             }
         }
-        for name in servers {
-            if let Some((score, matched)) = fuzzy(query, name) {
+        for (name, group) in servers {
+            // The group is part of the text, so a query can hit either half.
+            let text = match group {
+                Some(group) => format!("{group} › {name}"),
+                None => name.to_string(),
+            };
+            if let Some((score, matched)) = fuzzy(query, &text) {
                 hits.push(Hit {
                     target: Target::Server(name.to_string()),
-                    text: name.to_string(),
+                    text,
                     matched,
                     score,
                 });
@@ -418,10 +424,36 @@ mod tests {
     fn saved_servers_are_listed_on_the_server_screen() {
         let mut p = PaletteState::new(CONNECTIONS);
         p.input.set("prd");
-        p.refresh([], ["local", "production"]);
+        p.refresh([], [("local", None), ("production", None)]);
         assert_eq!(
             p.selected_hit().unwrap().target,
             Target::Server("production".into())
+        );
+    }
+
+    #[test]
+    fn a_group_name_finds_its_servers() {
+        let mut p = PaletteState::new(CONNECTIONS);
+        p.input.set("checkout");
+        p.refresh(
+            [],
+            [
+                ("prod", Some("checkout")),
+                ("dev", Some("checkout")),
+                ("local", None),
+            ],
+        );
+        let servers: Vec<&Hit> = p
+            .hits
+            .iter()
+            .filter(|h| matches!(h.target, Target::Server(_)))
+            .collect();
+        assert_eq!(servers.len(), 2, "{servers:?}");
+        assert_eq!(servers[0].text, "checkout › prod");
+        assert!(
+            servers
+                .iter()
+                .all(|h| h.target != Target::Server("local".into()))
         );
     }
 

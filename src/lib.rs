@@ -4,6 +4,7 @@
 pub mod app;
 pub mod codec;
 pub mod config;
+pub mod conn_list;
 pub mod glob;
 pub mod headless;
 pub mod history;

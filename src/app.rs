@@ -11,7 +11,8 @@ use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::codec::View;
-use crate::config::{Connection, Store};
+use crate::config::{Connection, ConnectionView, Store};
+use crate::conn_list::{self, ConnRow};
 use crate::history::History;
 use crate::input::{Completion, InputBuf, ReverseSearch, complete};
 use crate::json::{self, JsonMode};
@@ -1252,9 +1253,17 @@ pub struct App {
 impl App {
     pub fn new(store: Store, tx: UnboundedSender<Msg>) -> Self {
         let mut conn_state = ListState::default();
-        if !store.connections.is_empty() {
-            conn_state.select(Some(0));
-        }
+        // The first profile rather than the first row, which may be a group
+        // header: Enter at startup still connects.
+        let all: Vec<usize> = (0..store.connections.len()).collect();
+        let rows = conn_list::build_rows(
+            &store.connections,
+            &all,
+            store.connection_view,
+            &store.collapsed_groups.iter().cloned().collect(),
+            false,
+        );
+        conn_state.select(conn_list::first_connection_row(&rows));
         Self {
             edit_session: 0,
             store,
@@ -2003,7 +2012,17 @@ impl App {
 
     fn connections_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let len = self.visible_connections().len();
+        let len = self.connection_rows().len();
+        let row = self.selected_conn_row();
+        let grouped = self.store.connection_view == ConnectionView::Grouped;
+        // Header-only keys. A filter holds matching groups open, so folding
+        // one then would change nothing visible.
+        let header = match &row {
+            Some(ConnRow::Group { name, expanded, .. }) => Some((name.clone(), *expanded)),
+            _ => None,
+        };
+        let can_fold = header.is_some() && self.conn_query.is_empty();
+        let on_header = header.is_some();
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
@@ -2020,14 +2039,62 @@ impl App {
             KeyCode::Char('/') => self.conn_filter = Some(InputBuf::new(&self.conn_query)),
             KeyCode::Down | KeyCode::Char('j') => move_sel(&mut self.conn_state, len, 1),
             KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.conn_state, len, -1),
+            KeyCode::Char('v') => self.toggle_connection_view(),
+            KeyCode::Char(' ') | KeyCode::Enter if can_fold => {
+                if let Some((name, expanded)) = header {
+                    self.set_group_expanded(&name, !expanded);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') if can_fold => {
+                if let Some((name, _)) = header {
+                    self.set_group_expanded(&name, true);
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') if can_fold => {
+                if let Some((name, _)) = header {
+                    self.set_group_expanded(&name, false);
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(pos) = self
+                    .conn_state
+                    .selected()
+                    .and_then(|r| conn_list::header_of(&self.connection_rows(), r))
+                {
+                    self.conn_state.select(Some(pos));
+                }
+            }
+            KeyCode::Char('J') | KeyCode::Char('K') if on_header => {
+                self.status = "Groups are sorted by name".into();
+            }
+            KeyCode::Char('e' | 'd' | 'c' | 'T') if on_header => {
+                self.status = "Select a connection".into();
+            }
+            KeyCode::Enter if on_header => {
+                self.status = "Clear the filter (esc) to fold groups".into();
+            }
             KeyCode::Char('J') => self.reorder_connection(1),
             KeyCode::Char('K') => self.reorder_connection(-1),
             KeyCode::Char('c') => self.duplicate_connection(),
             KeyCode::Char('T') => self.test_connection(),
-            KeyCode::Char('n') => self.open_connection_form(None),
+            KeyCode::Char('n') => {
+                // A new profile lands in the group the cursor is in.
+                let group = if grouped {
+                    match &row {
+                        Some(ConnRow::Group { name, .. }) => Some(name.clone()),
+                        Some(ConnRow::Connection { index, .. }) => self.store.connections[*index]
+                            .group_name()
+                            .map(str::to_string),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                self.open_connection_form(None, group);
+            }
             KeyCode::Char('e') => {
                 if let Some(c) = self.selected_connection() {
-                    self.open_connection_form(Some(c));
+                    self.open_connection_form(Some(c), None);
                 }
             }
             KeyCode::Char('d') => {
@@ -2049,7 +2116,7 @@ impl App {
                     }
                     self.connect(c);
                 } else {
-                    self.open_connection_form(None);
+                    self.open_connection_form(None, None);
                 }
             }
             _ => {}
@@ -2067,16 +2134,35 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, c)| {
-                c.name.to_lowercase().contains(&needle) || c.host.to_lowercase().contains(&needle)
+                c.name.to_lowercase().contains(&needle)
+                    || c.host.to_lowercase().contains(&needle)
+                    || c.group_name()
+                        .is_some_and(|g| g.to_lowercase().contains(&needle))
             })
             .map(|(i, _)| i)
             .collect()
     }
 
+    /// The server list as drawn: group headers and profiles, filtered.
+    /// `conn_state` indexes into this.
+    pub fn connection_rows(&self) -> Vec<ConnRow> {
+        conn_list::build_rows(
+            &self.store.connections,
+            &self.visible_connections(),
+            self.store.connection_view,
+            &self.store.collapsed_groups.iter().cloned().collect(),
+            !self.conn_query.is_empty(),
+        )
+    }
+
+    fn selected_conn_row(&self) -> Option<ConnRow> {
+        let selected = self.conn_state.selected()?;
+        self.connection_rows().into_iter().nth(selected)
+    }
+
+    /// The profile under the cursor. `None` on a group header.
     fn selected_index(&self) -> Option<usize> {
-        self.visible_connections()
-            .get(self.conn_state.selected()?)
-            .copied()
+        self.selected_conn_row()?.connection_index()
     }
 
     fn selected_connection(&self) -> Option<Connection> {
@@ -2084,7 +2170,7 @@ impl App {
     }
 
     fn clamp_connection_selection(&mut self) {
-        let len = self.visible_connections().len();
+        let len = self.connection_rows().len();
         self.conn_state.select(if len == 0 {
             None
         } else {
@@ -2092,16 +2178,140 @@ impl App {
         });
     }
 
-    /// Put the cursor back on a profile by name after a save or duplicate.
+    /// Put the cursor back on a profile by name after a save, a duplicate or
+    /// a palette jump, opening its group first so the cursor is not hidden.
     fn focus_connection(&mut self, name: &str) {
-        let pos = self
-            .visible_connections()
+        if self.unfold_group_of(name)
+            && let Err(e) = self.store.save()
+        {
+            self.status = format!("Could not save connections: {e}");
+        }
+        self.select_connection(name);
+    }
+
+    /// Open the folded group holding `name`, in memory only; the caller saves.
+    /// Returns whether anything changed.
+    ///
+    /// Flat view shows every profile, and a filter already holds matching
+    /// groups open, so in either case there is nothing to open, and opening
+    /// anyway would silently forget a fold the user chose.
+    fn unfold_group_of(&mut self, name: &str) -> bool {
+        if self.store.connection_view != ConnectionView::Grouped || !self.conn_query.is_empty() {
+            return false;
+        }
+        let Some(group) = self
+            .store
+            .connections
             .iter()
-            .position(|i| self.store.connections[*i].name == name);
+            .find(|c| c.name == name)
+            .and_then(Connection::group_name)
+        else {
+            return false;
+        };
+        let before = self.store.collapsed_groups.len();
+        let group = group.to_string();
+        self.store.collapsed_groups.retain(|g| *g != group);
+        self.store.collapsed_groups.len() != before
+    }
+
+    /// Put the cursor on the row showing `name`, or clamp it when that row is
+    /// hidden.
+    fn select_connection(&mut self, name: &str) {
+        let pos = self
+            .store
+            .connections
+            .iter()
+            .position(|c| c.name == name)
+            .and_then(|index| conn_list::row_of_connection(&self.connection_rows(), index));
         match pos {
             Some(p) => self.conn_state.select(Some(p)),
             None => self.clamp_connection_selection(),
         }
+    }
+
+    /// Fold or unfold a group, remember it for the next run, and keep the
+    /// cursor on the same profile, or on the header when its group folded.
+    fn set_group_expanded(&mut self, name: &str, expanded: bool) {
+        let before = self.selected_conn_row();
+        let rows = self.connection_rows();
+        let in_group = self
+            .conn_state
+            .selected()
+            .and_then(|r| conn_list::header_of(&rows, r))
+            .and_then(|h| rows[h].group())
+            == Some(name);
+
+        let collapsed = &mut self.store.collapsed_groups;
+        let was_expanded = !collapsed.iter().any(|g| g == name);
+        if was_expanded == expanded {
+            return;
+        }
+        if expanded {
+            collapsed.retain(|g| g != name);
+        } else {
+            collapsed.push(name.to_string());
+        }
+        // Forget groups no profile names any more.
+        let conns = &self.store.connections;
+        collapsed.retain(|g| conns.iter().any(|c| c.group_name() == Some(g.as_str())));
+        collapsed.sort();
+        if let Err(e) = self.store.save() {
+            self.status = format!("Could not save connections: {e}");
+        }
+
+        let rows = self.connection_rows();
+        let pos = if !expanded && in_group {
+            conn_list::row_of_group(&rows, name)
+        } else {
+            match before {
+                Some(ConnRow::Connection { index, .. }) => {
+                    conn_list::row_of_connection(&rows, index)
+                }
+                Some(ConnRow::Group { name, .. }) => conn_list::row_of_group(&rows, &name),
+                None => None,
+            }
+        };
+        match pos {
+            Some(p) => self.conn_state.select(Some(p)),
+            None => self.clamp_connection_selection(),
+        }
+    }
+
+    /// Switch between the grouped and the flat server list, keeping the same
+    /// profile selected. From a header, the cursor goes to its first member.
+    fn toggle_connection_view(&mut self) {
+        let target = match self.selected_conn_row() {
+            Some(ConnRow::Connection { index, .. }) => Some(index),
+            Some(ConnRow::Group { name, .. }) => self
+                .visible_connections()
+                .into_iter()
+                .find(|i| self.store.connections[*i].group_name() == Some(name.as_str())),
+            None => None,
+        };
+        let group = target.and_then(|i| self.store.connections[i].group_name().map(str::to_string));
+        self.store.connection_view = match self.store.connection_view {
+            ConnectionView::Grouped => ConnectionView::Flat,
+            ConnectionView::Flat => ConnectionView::Grouped,
+        };
+        self.status = match self.store.save() {
+            Ok(()) => match self.store.connection_view {
+                ConnectionView::Grouped => "Grouped server list".into(),
+                ConnectionView::Flat => "Flat server list".into(),
+            },
+            Err(e) => format!("Could not save connections: {e}"),
+        };
+        // Switching views never unfolds anything: a profile inside a folded
+        // group leaves the cursor on that group's header instead.
+        let rows = self.connection_rows();
+        let pos = target
+            .and_then(|index| conn_list::row_of_connection(&rows, index))
+            .or_else(|| {
+                group
+                    .as_deref()
+                    .and_then(|g| conn_list::row_of_group(&rows, g))
+            })
+            .or_else(|| conn_list::first_connection_row(&rows));
+        self.conn_state.select(pos);
     }
 
     fn duplicate_connection(&mut self) {
@@ -2129,13 +2339,25 @@ impl App {
         let Some(index) = self.selected_index() else {
             return;
         };
-        let moved = self.store.move_by(index, delta);
+        let grouped = self.store.connection_view == ConnectionView::Grouped;
+        // Grouped, the neighbour on screen is the next member of the same
+        // group, which need not be the next profile in the file.
+        let moved = if grouped {
+            self.store.move_within_group(index, delta)
+        } else {
+            self.store.move_by(index, delta)
+        };
         if moved != index {
             if let Err(e) = self.store.save() {
                 self.status = format!("Could not save connections: {e}");
                 return;
             }
-            self.conn_state.select(Some(moved));
+            if grouped {
+                let name = self.store.connections[moved].name.clone();
+                self.focus_connection(&name);
+            } else {
+                self.conn_state.select(Some(moved));
+            }
         }
     }
 
@@ -2211,8 +2433,13 @@ impl App {
         });
     }
 
-    fn open_connection_form(&mut self, existing: Option<Connection>) {
-        let c = existing.clone().unwrap_or_default();
+    /// `group` prefills the group of a new profile; an existing one keeps its
+    /// own.
+    fn open_connection_form(&mut self, existing: Option<Connection>, group: Option<String>) {
+        let c = existing.clone().unwrap_or(Connection {
+            group,
+            ..Default::default()
+        });
         let keychain_label = match crate::secrets::unavailable_reason() {
             None => "Store the password in the OS keychain".to_string(),
             Some(_) => "Store in the OS keychain (unavailable on this machine)".to_string(),
@@ -2234,6 +2461,7 @@ impl App {
             fields: vec![
                 Field::section("Server"),
                 Field::text("Name", &c.name),
+                Field::text("Group (optional)", c.group_name().unwrap_or_default()),
                 Field::text("Host", &c.host),
                 Field::text("Port", &c.port.to_string()),
                 Field::text("Database", &c.db.to_string()),
@@ -3866,7 +4094,10 @@ impl App {
             ),
             Screen::Connections => state.refresh(
                 std::iter::empty(),
-                self.store.connections.iter().map(|c| c.name.as_str()),
+                self.store
+                    .connections
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.group_name())),
             ),
         }
     }
@@ -4816,52 +5047,54 @@ impl App {
                 self.run_action_inner(*action, pending);
             }
             Action::SaveConnection { replacing } => {
+                use conn_field as f;
                 let previous = replacing
                     .as_deref()
                     .and_then(|n| self.store.connections.iter().find(|c| c.name == n))
                     .cloned();
-                let typed_password = v(6);
-                let use_keychain = v(7) == "true";
+                let typed_password = v(f::PASSWORD);
+                let use_keychain = v(f::KEYCHAIN) == "true";
                 let conn = Connection {
-                    name: v(0).trim().to_string(),
+                    name: v(f::NAME).trim().to_string(),
+                    group: Some(v(f::GROUP).trim().to_string()).filter(|g| !g.is_empty()),
                     host: {
-                        let h = v(1).trim().to_string();
+                        let h = v(f::HOST).trim().to_string();
                         if h.is_empty() { "127.0.0.1".into() } else { h }
                     },
-                    port: v(2).trim().parse().unwrap_or(6379),
-                    db: v(3).trim().parse().unwrap_or(0),
-                    read_only: v(4) == "true",
-                    username: v(5).trim().to_string(),
+                    port: v(f::PORT).trim().parse().unwrap_or(6379),
+                    db: v(f::DATABASE).trim().parse().unwrap_or(0),
+                    read_only: v(f::READ_ONLY) == "true",
+                    username: v(f::USERNAME).trim().to_string(),
                     password: if use_keychain {
                         String::new()
                     } else {
                         typed_password.clone()
                     },
                     use_keychain,
-                    tls: v(8) == "true",
-                    tls_ca_file: v(9).trim().to_string(),
-                    tls_cert_file: v(10).trim().to_string(),
-                    tls_key_file: v(11).trim().to_string(),
-                    tls_insecure: v(12) == "true",
-                    ssh_host: v(13).trim().to_string(),
-                    ssh_user: v(14).trim().to_string(),
-                    ssh_port: v(15).trim().parse().unwrap_or(22),
-                    ssh_key_file: v(16).trim().to_string(),
-                    deployment: match v(17).as_str() {
+                    tls: v(f::TLS) == "true",
+                    tls_ca_file: v(f::TLS_CA).trim().to_string(),
+                    tls_cert_file: v(f::TLS_CERT).trim().to_string(),
+                    tls_key_file: v(f::TLS_KEY).trim().to_string(),
+                    tls_insecure: v(f::TLS_INSECURE) == "true",
+                    ssh_host: v(f::SSH_HOST).trim().to_string(),
+                    ssh_user: v(f::SSH_USER).trim().to_string(),
+                    ssh_port: v(f::SSH_PORT).trim().parse().unwrap_or(22),
+                    ssh_key_file: v(f::SSH_KEY).trim().to_string(),
+                    deployment: match v(f::DEPLOYMENT).as_str() {
                         "cluster" => crate::config::Deployment::Cluster,
                         "sentinel" => crate::config::Deployment::Sentinel,
                         _ => crate::config::Deployment::Standalone,
                     },
-                    seeds: v(18)
+                    seeds: v(f::SEEDS)
                         .split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string)
                         .collect(),
-                    sentinel_master: v(19).trim().to_string(),
-                    sentinel_username: v(20).trim().to_string(),
-                    sentinel_password: v(21),
-                    environment: match v(22).as_str() {
+                    sentinel_master: v(f::SENTINEL_MASTER).trim().to_string(),
+                    sentinel_username: v(f::SENTINEL_USERNAME).trim().to_string(),
+                    sentinel_password: v(f::SENTINEL_PASSWORD),
+                    environment: match v(f::ENVIRONMENT).as_str() {
                         "production" => crate::config::Environment::Production,
                         "staging" => crate::config::Environment::Staging,
                         _ => crate::config::Environment::Development,
@@ -4869,6 +5102,9 @@ impl App {
                 };
                 let new_name = conn.name.clone();
                 self.store.upsert(conn, replacing.as_deref());
+                // Show the saved profile even in a folded group, in the same
+                // write, so "Connection saved" is the status that stays.
+                self.unfold_group_of(&new_name);
                 match self.store.save() {
                     Err(e) => {
                         self.status = format!("Could not save connections: {e}");
@@ -4878,7 +5114,7 @@ impl App {
                     }
                 }
                 self.sync_keychain(previous, new_name.clone(), typed_password, use_keychain);
-                self.focus_connection(&new_name);
+                self.select_connection(&new_name);
             }
             Action::DeleteConnection(name) => {
                 let had_keychain = self
@@ -4898,12 +5134,8 @@ impl App {
                         }
                     });
                 }
-                let len = self.visible_connections().len();
-                self.conn_state.select(if len == 0 {
-                    None
-                } else {
-                    Some(self.conn_state.selected().unwrap_or(0).min(len - 1))
-                });
+                // A group whose last member went takes its header with it.
+                self.clamp_connection_selection();
             }
             Action::NewKey => {
                 let name = v(0).trim().to_string();
@@ -5418,6 +5650,36 @@ impl App {
     }
 }
 
+/// Where each value of the connection form lands, counting input fields only
+/// (section headings carry no value). The form, the save and the validation
+/// all read these, so a new field cannot shift one of them out of step.
+mod conn_field {
+    pub const NAME: usize = 0;
+    pub const GROUP: usize = 1;
+    pub const HOST: usize = 2;
+    pub const PORT: usize = 3;
+    pub const DATABASE: usize = 4;
+    pub const READ_ONLY: usize = 5;
+    pub const USERNAME: usize = 6;
+    pub const PASSWORD: usize = 7;
+    pub const KEYCHAIN: usize = 8;
+    pub const TLS: usize = 9;
+    pub const TLS_CA: usize = 10;
+    pub const TLS_CERT: usize = 11;
+    pub const TLS_KEY: usize = 12;
+    pub const TLS_INSECURE: usize = 13;
+    pub const SSH_HOST: usize = 14;
+    pub const SSH_USER: usize = 15;
+    pub const SSH_PORT: usize = 16;
+    pub const SSH_KEY: usize = 17;
+    pub const DEPLOYMENT: usize = 18;
+    pub const SEEDS: usize = 19;
+    pub const SENTINEL_MASTER: usize = 20;
+    pub const SENTINEL_USERNAME: usize = 21;
+    pub const SENTINEL_PASSWORD: usize = 22;
+    pub const ENVIRONMENT: usize = 23;
+}
+
 /// Field-level validation that must happen before the modal closes.
 fn validate(action: &Action, values: &[String]) -> Option<String> {
     let get = |i: usize| values.get(i).map(|s| s.trim()).unwrap_or("");
@@ -5438,48 +5700,62 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
             Some("Type the exact profile name".into())
         }
         Action::SaveConnection { .. } => {
-            if get(0).is_empty() {
+            use conn_field as f;
+            if get(f::NAME).is_empty() {
                 return Some("Name is required".into());
             }
-            if get(2).parse::<u16>().is_err() {
+            if get(f::PORT).parse::<u16>().is_err() {
                 return Some("Port must be a number between 0 and 65535".into());
             }
-            if get(3).parse::<i64>().is_err() {
+            if get(f::DATABASE).parse::<i64>().is_err() {
                 return Some("Database must be a number".into());
             }
-            if get(17) == "cluster" && get(3) != "0" {
+            if get(f::DEPLOYMENT) == "cluster" && get(f::DATABASE) != "0" {
                 return Some("Cluster supports database 0 only".into());
             }
-            if get(17) == "sentinel" && get(19).is_empty() {
+            if get(f::DEPLOYMENT) == "sentinel" && get(f::SENTINEL_MASTER).is_empty() {
                 return Some("Sentinel service name is required".into());
             }
-            if matches!(get(17), "cluster" | "sentinel") && !get(13).is_empty() {
+            if matches!(get(f::DEPLOYMENT), "cluster" | "sentinel") && !get(f::SSH_HOST).is_empty()
+            {
                 return Some(
                     "Topology discovery requires direct access to advertised nodes".into(),
                 );
             }
-            for seed in get(18).split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for seed in get(f::SEEDS)
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 if let Err(e) = crate::config::parse_endpoint(seed) {
                     return Some(format!("Invalid seed: {e}"));
                 }
             }
             // Opting into the keychain on a machine without one would silently
             // lose the password.
-            if get(7) == "true"
+            if get(f::KEYCHAIN) == "true"
                 && let Some(reason) = crate::secrets::unavailable_reason()
             {
                 return Some(format!("No OS keychain available here: {reason}"));
             }
-            if get(8) != "true" && [9, 10, 11].iter().any(|i| !get(*i).is_empty()) {
+            if get(f::TLS) != "true"
+                && [f::TLS_CA, f::TLS_CERT, f::TLS_KEY]
+                    .iter()
+                    .any(|i| !get(*i).is_empty())
+            {
                 return Some("Certificate files need TLS switched on".into());
             }
-            if get(10).is_empty() != get(11).is_empty() {
+            if get(f::TLS_CERT).is_empty() != get(f::TLS_KEY).is_empty() {
                 return Some("Mutual TLS needs both a client certificate and a key".into());
             }
-            if get(15).parse::<u16>().is_err() {
+            if get(f::SSH_PORT).parse::<u16>().is_err() {
                 return Some("SSH port must be a number between 0 and 65535".into());
             }
-            if get(13).is_empty() && [14, 16].iter().any(|i| !get(*i).is_empty()) {
+            if get(f::SSH_HOST).is_empty()
+                && [f::SSH_USER, f::SSH_KEY]
+                    .iter()
+                    .any(|i| !get(*i).is_empty())
+            {
                 return Some("SSH settings need an SSH host".into());
             }
             None
@@ -5848,10 +6124,33 @@ mod tests {
     #[test]
     fn connection_form_rejects_bad_port() {
         let action = Action::SaveConnection { replacing: None };
-        let vals = ["srv".into(), "h".into(), "nope".into(), "0".into()];
+        let vals = [
+            "srv".into(),
+            "".into(),
+            "h".into(),
+            "nope".into(),
+            "0".into(),
+        ];
         assert!(validate(&action, &vals).unwrap().contains("Port"));
-        let vals = ["".into(), "h".into(), "6379".into(), "0".into()];
+        let vals = ["".into(), "".into(), "h".into(), "6379".into(), "0".into()];
         assert!(validate(&action, &vals).unwrap().contains("Name"));
+    }
+
+    /// The group sits between Name and Host; a number typed there must not
+    /// be read as the port, and any text in it is fine.
+    #[test]
+    fn connection_form_group_is_its_own_slot() {
+        let action = Action::SaveConnection { replacing: None };
+        let mut vals: Vec<String> = vec![String::new(); conn_field::ENVIRONMENT + 1];
+        vals[conn_field::NAME] = "srv".into();
+        vals[conn_field::GROUP] = "not a port / any text".into();
+        vals[conn_field::HOST] = "h".into();
+        vals[conn_field::PORT] = "6379".into();
+        vals[conn_field::DATABASE] = "0".into();
+        vals[conn_field::SSH_PORT] = "22".into();
+        assert_eq!(validate(&action, &vals), None);
+        vals[conn_field::PORT] = "70000".into();
+        assert!(validate(&action, &vals).unwrap().contains("Port"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ Python runtime.
 
 | Key browser | Server list |
 |---|---|
-| <img src="docs/screenshots/browser.svg" alt="Browsing the keyspace as a tree, with a JSON value open"> | <img src="docs/screenshots/connections.svg" alt="The saved connection list, showing TLS, keychain, read-only and SSH profiles"> |
+| <img src="docs/screenshots/browser.svg" alt="Browsing the keyspace as a tree, with a JSON value open"> | <img src="docs/screenshots/connections.svg" alt="The saved connection list, grouped into folders, showing TLS, read-only and SSH profiles"> |
 | **Server info** | **Namespace memory** |
 | <img src="docs/screenshots/server-info.svg" alt="The server info dialog with its section tabs"> | <img src="docs/screenshots/memory.svg" alt="The namespace memory report, showing which prefixes hold the RAM"> |
 | **Pub/Sub feed** | **Value editor** |
@@ -299,6 +299,10 @@ rediscope
 - **Connection manager.** Add, edit, duplicate (`c`), reorder (`J`/`K`), filter
   (`/`), and test (`T`) saved servers. A test reports round-trip latency, the
   server version and its key count without opening the connection.
+- **Connection groups.** Give profiles a group, say `checkout` for its dev,
+  staging and prod servers, and the list shows them under one collapsible
+  header. Folded groups stay folded next run, a filter still finds servers
+  inside them, and `v` switches back to the flat list.
 - **TLS.** A private CA, mutual TLS with a client certificate and key, or an
   explicit skip-verify for a self-signed dev server. Profiles show `TLS`,
   `no-verify` and `keychain` badges in the list.
@@ -429,12 +433,14 @@ Press `?` in the app for this list at any time.
 | Key | Action |
 |---|---|
 | `↑` `↓` / `k` `j` | Move |
-| `Enter` | Connect |
-| `n` / `e` / `d` | New / edit / delete connection |
+| `Enter` | Connect · on a group header, collapse or expand it |
+| `Space` / `→` `l` / `←` `h` | Toggle / expand / collapse a group · `←` `h` on a member jumps to its header |
+| `n` / `e` / `d` | New / edit / delete connection. In the grouped view, `n` fills in the group the cursor is in |
 | `c` | Duplicate the selected connection |
-| `J` / `K` | Move the connection down / up |
+| `J` / `K` | Move the connection down / up (within its group in the grouped view) |
 | `T` | Test the connection without opening it |
-| `/` | Filter by name or host · `Esc` clears the filter |
+| `/` | Filter by name, host or group · `Esc` clears the filter |
+| `v` | Switch between the grouped and the flat list |
 | `p` | Preview and choose a colour theme |
 | `Ctrl+P` | Go to a saved server or run an action by name |
 | `?` / `q` | Help / quit |
@@ -634,11 +640,12 @@ rediscope --profile prod import --file users.json \
 
 ## Connections and secrets
 
-A connection profile holds the server address, database index, optional ACL
-username, TLS settings, a read-only switch, an optional SSH jump host, and how
-to find its password. The editor is one form with `Server`, `Authentication`,
-`TLS` and `SSH tunnel` sections; `Tab` moves between fields, `Space` toggles a
-switch, and the form scrolls when the terminal is short.
+A connection profile holds the server address, an optional group, database
+index, optional ACL username, TLS settings, a read-only switch, an optional SSH
+jump host, and how to find its password. The editor is one form with `Server`,
+`Authentication`, `TLS` and `SSH tunnel` sections (the group is set under
+`Server`); `Tab` moves between fields, `Space` toggles a switch, and the form
+scrolls when the terminal is short.
 
 Passwords resolve in one of three ways:
 
@@ -725,6 +732,34 @@ rediscope --config-path
 The same file keeps your theme, so the colours come back on the next run, and
 one entry per profile recording where you left it — database, search pattern,
 open folders and selected key.
+
+### Connection groups
+
+A profile's optional `group` puts it under a header of that name in the server
+list. There is one level, names match exactly, and a group exists for as long
+as a profile names it. Profile names stay unique across groups, since
+`--profile`, sessions and the keychain all go by name. The file also remembers
+the list layout: `connection_view` is `"grouped"` (the default) or `"flat"`,
+and `collapsed_groups` lists the groups folded shut. All three keys are left
+out until they are used (`connection_view` only once you pick flat), so a file
+without groups is written exactly as before. A view name this version does not
+know reads as grouped.
+
+```json
+{
+  "collapsed_groups": ["billing"],
+  "connections": [
+    { "name": "checkout-dev", "group": "checkout", "host": "10.0.1.5", "port": 6379 },
+    { "name": "checkout-prod", "group": "checkout", "host": "cache.prod", "port": 6380, "tls": true },
+    { "name": "billing-prod", "group": "billing", "host": "billing.prod", "port": 6379 },
+    { "name": "local", "host": "127.0.0.1", "port": 6379 }
+  ]
+}
+```
+
+Headers are sorted by name, ignoring case, with each group's profiles in saved
+order beneath, and ungrouped profiles follow at the root. With no groups at all
+the grouped list is the flat list.
 
 The file is written atomically: a scratch file renamed over the old one, with
 the previous version kept as `connections.json.bak`, so an interrupted save

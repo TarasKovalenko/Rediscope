@@ -72,10 +72,58 @@ impl Environment {
     }
 }
 
+/// How the server list arranges saved profiles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionView {
+    /// Every profile in stored order, the way the list has always looked.
+    Flat,
+    /// Profiles that name a group sit under a collapsible header. With no
+    /// groups at all this is the same list as [`ConnectionView::Flat`].
+    /// Also what a view name from a newer version reads as, which is why it
+    /// is the last variant.
+    #[default]
+    #[serde(other)]
+    Grouped,
+}
+
+impl ConnectionView {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Read `connection_view` without ever failing the file: a layout preference
+/// that does not parse must not hide every saved profile.
+fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ConnectionView, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// Read `collapsed_groups` without ever failing the file. Names are trimmed
+/// the way group names are, and anything that is not a name is skipped.
+fn lenient_group_names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let serde_json::Value::Array(items) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// A single saved server profile.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
     pub name: String,
+    /// The server-list group this profile is shown under. One level only, and
+    /// absent from the file for ungrouped profiles so older files round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(default)]
     pub environment: Environment,
     #[serde(default)]
@@ -145,6 +193,7 @@ impl Default for Connection {
     fn default() -> Self {
         Self {
             name: String::new(),
+            group: None,
             environment: Environment::default(),
             deployment: Deployment::Standalone,
             seeds: Vec::new(),
@@ -189,6 +238,14 @@ impl Connection {
             parse_endpoint(seed)?;
         }
         Ok(())
+    }
+
+    /// The group this profile belongs to: trimmed, and `None` when blank.
+    pub fn group_name(&self) -> Option<&str> {
+        self.group
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
     }
 
     /// True when this profile reaches the server through an SSH tunnel.
@@ -305,6 +362,21 @@ pub struct Store {
     /// without any are written exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codecs: Vec<crate::codec::CustomCodec>,
+    /// Grouped or flat server list. Written only once someone picks flat.
+    #[serde(
+        default,
+        deserialize_with = "lenient_view",
+        skip_serializing_if = "ConnectionView::is_default"
+    )]
+    pub connection_view: ConnectionView,
+    /// Groups folded shut in the server list. Every group starts expanded,
+    /// so a group nobody collapsed never appears here.
+    #[serde(
+        default,
+        deserialize_with = "lenient_group_names",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub collapsed_groups: Vec<String>,
     /// Set when the file exists but could not be read. Saving is refused while
     /// it is set, so a bad read can never overwrite good profiles with an
     /// empty list.
@@ -327,14 +399,11 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (
                     Self {
-                        theme: Theme::default(),
                         connections: vec![Connection {
                             name: "local".into(),
                             ..Default::default()
                         }],
-                        sessions: Default::default(),
-                        codecs: Vec::new(),
-                        read_error: None,
+                        ..Default::default()
                     },
                     None,
                 );
@@ -343,11 +412,8 @@ impl Store {
                 let notice = format!("Cannot read {}: {e}", path.display());
                 return (
                     Self {
-                        theme: Theme::default(),
-                        connections: Vec::new(),
-                        sessions: Default::default(),
-                        codecs: Vec::new(),
                         read_error: Some(notice.clone()),
+                        ..Default::default()
                     },
                     Some(format!("{notice} — saving is disabled so nothing is lost")),
                 );
@@ -369,11 +435,8 @@ impl Store {
                     let notice = format!("{} did not parse ({e})", path.display());
                     (
                         Self {
-                            theme: Theme::default(),
-                            connections: Vec::new(),
-                            sessions: Default::default(),
-                            codecs: Vec::new(),
                             read_error: Some(notice.clone()),
+                            ..Default::default()
                         },
                         Some(format!(
                             "{notice}; could not set it aside ({move_err}) — saving is disabled"
@@ -412,6 +475,19 @@ impl Store {
                 .collect(),
             sessions: self.sessions.clone(),
             codecs: self.codecs.clone(),
+            connection_view: self.connection_view,
+            // A group whose last profile was deleted or moved is gone; its
+            // collapsed state must not linger for a future group of that name.
+            collapsed_groups: self
+                .collapsed_groups
+                .iter()
+                .filter(|g| {
+                    self.connections
+                        .iter()
+                        .any(|c| c.group_name() == Some(g.as_str()))
+                })
+                .cloned()
+                .collect(),
             read_error: None,
         };
         let text = serde_json::to_string_pretty(&sanitized)?;
@@ -488,6 +564,38 @@ impl Store {
             self.connections.swap(index, target);
         }
         target
+    }
+
+    /// Swap a profile with the nearest profile in the same group, in the
+    /// direction of `delta`: the grouped list shows each group's members, and
+    /// the ungrouped profiles, in stored order, so that is the neighbour the
+    /// user sees. Clamps at either end. Returns the index it ended up at.
+    pub fn move_within_group(&mut self, index: usize, delta: isize) -> usize {
+        let Some(group) = self
+            .connections
+            .get(index)
+            .map(|c| c.group_name().map(str::to_string))
+        else {
+            return index;
+        };
+        let same = |c: &Connection| c.group_name() == group.as_deref();
+        let target = if delta < 0 {
+            self.connections[..index].iter().rposition(same)
+        } else if delta > 0 {
+            self.connections[index + 1..]
+                .iter()
+                .position(same)
+                .map(|p| index + 1 + p)
+        } else {
+            None
+        };
+        match target {
+            Some(t) => {
+                self.connections.swap(index, t);
+                t
+            }
+            None => index,
+        }
     }
 }
 
@@ -748,11 +856,8 @@ mod tests {
     #[test]
     fn a_store_that_failed_to_load_refuses_to_save() {
         let store = Store {
-            theme: Theme::default(),
-            connections: Vec::new(),
-            sessions: Default::default(),
-            codecs: Vec::new(),
             read_error: Some("permission denied".into()),
+            ..Default::default()
         };
         let err = store.save().unwrap_err().to_string();
         assert!(err.contains("refusing to overwrite"), "{err}");
@@ -821,25 +926,19 @@ mod tests {
         let dir = tempdir();
         env.set("REDISCOPE_HOME", &dir);
         let first = Store {
-            theme: Theme::default(),
             connections: vec![Connection {
                 name: "prod".into(),
                 ..Default::default()
             }],
-            sessions: Default::default(),
-            codecs: Vec::new(),
-            read_error: None,
+            ..Default::default()
         };
         first.save().unwrap();
         let second = Store {
-            theme: Theme::default(),
             connections: vec![Connection {
                 name: "staging".into(),
                 ..Default::default()
             }],
-            sessions: Default::default(),
-            codecs: Vec::new(),
-            read_error: None,
+            ..Default::default()
         };
         second.save().unwrap();
 
@@ -884,6 +983,7 @@ mod tests {
             assert_eq!(c.deployment, Deployment::Standalone);
             assert!(c.seeds.is_empty());
             assert!(c.sentinel_master.is_empty());
+            assert!(c.group.is_none());
             assert!(c.validate_topology().is_ok());
         }
         // And writing the file back keeps them loadable by this version.
@@ -891,9 +991,237 @@ mod tests {
         let (reloaded, notice) = Store::load();
         assert!(notice.is_none());
         assert_eq!(reloaded.connections.len(), 2);
+        assert_eq!(reloaded.connection_view, ConnectionView::Grouped);
+        assert!(reloaded.collapsed_groups.is_empty());
         assert_eq!(
             reloaded.connections[1].environment,
             Environment::Development
         );
+    }
+
+    #[test]
+    fn an_older_file_without_groups_writes_no_group_keys() {
+        let mut env = ScopedEnv::new();
+        let dir = tempdir();
+        env.set("REDISCOPE_HOME", &dir);
+        fs::write(
+            config_file(),
+            r#"{"theme":"dracula","connections":[{"name":"local","host":"127.0.0.1","port":6379}]}"#,
+        )
+        .unwrap();
+        let (store, notice) = Store::load();
+        assert!(notice.is_none());
+        assert_eq!(store.connection_view, ConnectionView::Grouped);
+        store.save().unwrap();
+        let text = fs::read_to_string(config_file()).unwrap();
+        for key in ["\"group\"", "connection_view", "collapsed_groups"] {
+            assert!(!text.contains(key), "{key} written: {text}");
+        }
+    }
+
+    #[test]
+    fn group_and_view_survive_a_reload() {
+        let mut env = ScopedEnv::new();
+        let dir = tempdir();
+        env.set("REDISCOPE_HOME", &dir);
+        let store = Store {
+            connections: vec![
+                Connection {
+                    name: "checkout-prod".into(),
+                    group: Some("checkout".into()),
+                    ..Default::default()
+                },
+                Connection {
+                    name: "local".into(),
+                    ..Default::default()
+                },
+            ],
+            connection_view: ConnectionView::Flat,
+            // "gone" names no profile, so it is dropped on the way out.
+            collapsed_groups: vec!["checkout".into(), "gone".into()],
+            ..Default::default()
+        };
+        store.save().unwrap();
+        let text = fs::read_to_string(config_file()).unwrap();
+        assert!(text.contains("\"connection_view\": \"flat\""), "{text}");
+
+        let (loaded, notice) = Store::load();
+        assert!(notice.is_none());
+        assert_eq!(loaded.connections[0].group.as_deref(), Some("checkout"));
+        assert!(loaded.connections[1].group.is_none());
+        assert_eq!(loaded.connection_view, ConnectionView::Flat);
+        assert_eq!(loaded.collapsed_groups, ["checkout"]);
+    }
+
+    #[test]
+    fn a_blank_group_is_no_group() {
+        let blank = Connection {
+            group: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(blank.group_name(), None);
+        let padded = Connection {
+            group: Some(" checkout ".into()),
+            ..Default::default()
+        };
+        assert_eq!(padded.group_name(), Some("checkout"));
+    }
+
+    #[test]
+    fn move_within_group_skips_other_groups_and_clamps() {
+        let conn = |name: &str, group: Option<&str>| Connection {
+            name: name.into(),
+            group: group.map(str::to_string),
+            ..Default::default()
+        };
+        let mut store = Store {
+            connections: vec![
+                conn("a1", Some("a")),
+                conn("root1", None),
+                conn("b1", Some("b")),
+                conn("a2", Some("a")),
+                conn("root2", None),
+            ],
+            ..Default::default()
+        };
+        let names =
+            |s: &Store| -> Vec<String> { s.connections.iter().map(|c| c.name.clone()).collect() };
+        assert_eq!(store.move_within_group(0, 1), 3, "jumps over other groups");
+        assert_eq!(names(&store), ["a2", "root1", "b1", "a1", "root2"]);
+        assert_eq!(store.move_within_group(3, 1), 3, "last of its group");
+        assert_eq!(store.move_within_group(2, -1), 2, "only member of b");
+        assert_eq!(store.move_within_group(4, -1), 1, "ungrouped move together");
+        assert_eq!(names(&store), ["a2", "root2", "b1", "a1", "root1"]);
+        assert_eq!(store.move_within_group(9, 1), 9, "out of range is a no-op");
+    }
+
+    /// AC2, strictly: once a pre-groups file has been written by this
+    /// version, loading and saving it again changes not one byte, and no
+    /// group-related key appears anywhere, per profile or at the top level.
+    #[test]
+    fn a_file_without_groups_resaves_byte_for_byte() {
+        let mut env = ScopedEnv::new();
+        let dir = tempdir();
+        env.set("REDISCOPE_HOME", &dir);
+        fs::write(
+            config_file(),
+            r#"{"theme":"nord","connections":[
+                {"name":"local","host":"127.0.0.1","port":6379},
+                {"name":"prod","host":"cache","port":6380,"environment":"production"}],
+                "sessions":{"local":{"db":2}}}"#,
+        )
+        .unwrap();
+        let (store, notice) = Store::load();
+        assert!(notice.is_none(), "{notice:?}");
+        store.save().unwrap();
+        let first = fs::read_to_string(config_file()).unwrap();
+        let (again, _) = Store::load();
+        again.save().unwrap();
+        let second = fs::read_to_string(config_file()).unwrap();
+        assert_eq!(first, second);
+
+        let json: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let top = json.as_object().unwrap();
+        assert!(!top.contains_key("connection_view"), "{first}");
+        assert!(!top.contains_key("collapsed_groups"), "{first}");
+        for c in json["connections"].as_array().unwrap() {
+            assert!(c.get("group").is_none(), "{c}");
+        }
+    }
+
+    /// Hand-edited files: `"group": null` is no group, and an unused or
+    /// padded collapsed entry is handled on save.
+    #[test]
+    fn hand_edited_group_values_load_sensibly() {
+        let mut env = ScopedEnv::new();
+        let dir = tempdir();
+        env.set("REDISCOPE_HOME", &dir);
+        fs::write(
+            config_file(),
+            r#"{"connections":[
+                {"name":"a","group":null},
+                {"name":"b","group":"  ops  "},
+                {"name":"c","group":""}],
+               "connection_view":"grouped",
+               "collapsed_groups":["ops","nobody"]}"#,
+        )
+        .unwrap();
+        let (store, notice) = Store::load();
+        assert!(notice.is_none(), "{notice:?}");
+        assert_eq!(store.connections[0].group, None);
+        assert_eq!(store.connections[1].group_name(), Some("ops"));
+        assert_eq!(store.connections[2].group_name(), None);
+        assert_eq!(store.connection_view, ConnectionView::Grouped);
+
+        store.save().unwrap();
+        let text = fs::read_to_string(config_file()).unwrap();
+        assert!(
+            !text.contains("connection_view"),
+            "an explicit default is not re-written: {text}"
+        );
+        let (reloaded, _) = Store::load();
+        assert_eq!(
+            reloaded.collapsed_groups,
+            ["ops"],
+            "the padded group still counts"
+        );
+    }
+
+    #[test]
+    fn move_within_group_with_no_delta_stays_put() {
+        let mut store = Store {
+            connections: vec![
+                Connection {
+                    name: "a".into(),
+                    group: Some("g".into()),
+                    ..Default::default()
+                },
+                Connection {
+                    name: "b".into(),
+                    group: Some(" g ".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(store.move_within_group(0, 0), 0);
+        assert_eq!(store.connections[0].name, "a");
+        // A padded name is the same group, so they are neighbours.
+        assert_eq!(store.move_within_group(0, 5), 1);
+        assert_eq!(store.connections[1].name, "a");
+        assert_eq!(Store::default().move_within_group(0, -1), 0, "empty store");
+    }
+
+    /// A newer version may add a layout this one does not know, or a hand
+    /// edit may mistype one. Either way the profiles must still load.
+    #[test]
+    fn an_unknown_or_malformed_view_falls_back_to_grouped() {
+        for view in [r#""tree""#, "42", "null", r#"{"x":1}"#] {
+            let text = format!(r#"{{"connections":[{{"name":"a"}}],"connection_view":{view}}}"#);
+            let store: Store =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{view}: {e}"));
+            assert_eq!(store.connection_view, ConnectionView::Grouped, "{view}");
+            assert_eq!(store.connections.len(), 1, "{view}");
+        }
+        let store: Store = serde_json::from_str(r#"{"connection_view":"flat"}"#).unwrap();
+        assert_eq!(store.connection_view, ConnectionView::Flat);
+    }
+
+    #[test]
+    fn collapsed_group_names_are_trimmed_and_wrong_types_ignored() {
+        let store: Store = serde_json::from_str(
+            r#"{"connections":[{"name":"a","group":"ops"}],
+                "collapsed_groups":[" ops ", "", 7, null, "billing"]}"#,
+        )
+        .unwrap();
+        assert_eq!(store.collapsed_groups, ["ops", "billing"]);
+        assert_eq!(store.connections.len(), 1);
+        for wrong in [r#""ops""#, "3", "null", r#"{"ops":true}"#] {
+            let text = format!(r#"{{"connections":[{{"name":"a"}}],"collapsed_groups":{wrong}}}"#);
+            let store: Store =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{wrong}: {e}"));
+            assert!(store.collapsed_groups.is_empty(), "{wrong}");
+            assert_eq!(store.connections.len(), 1, "{wrong}");
+        }
     }
 }

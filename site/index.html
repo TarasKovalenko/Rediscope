@@ -72,7 +72,7 @@
 
   <figure class="shot" data-shot-panel>
     <img src="screenshots/connections.svg" alt="Server list." width="1268" height="590" loading="lazy">
-    <figcaption>Saved profiles, each showing what it is: TLS, a keychain password, an SSH tunnel, and the read-only flag that refuses every write.</figcaption>
+    <figcaption>Saved profiles grouped by product, one folder per group that folds away. Each row shows what it is: TLS, an SSH tunnel, the read-only flag. v flips back to a flat list.</figcaption>
   </figure>
 
   <noscript>
@@ -159,6 +159,7 @@
         <li>SSH tunnels, for a cache behind a bastion.</li>
         <li>Passwords in the OS keychain, or from <code>${VAR}</code> at connect time.</li>
         <li>A read-only flag per profile that refuses every write.</li>
+        <li>Profiles grouped into folders, say one per product with dev, staging and prod inside. Fold what you don't need, or press <kbd>v</kbd> for the plain flat list.</li>
       </ul>
     </article>
 
