@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/TarasKovalenko/Rediscope/security/advisories/new
+    about: Report it privately. Please don't open a public issue.
+  - name: Documentation
+    url: https://taraskovalenko.github.io/Rediscope/
+    about: Install options, screenshots and the full key list.
