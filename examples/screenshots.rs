@@ -169,6 +169,7 @@ fn demo_store(_url: &str) -> Store {
             demo_connection(&format!("redis://127.0.0.1:6379/{DEMO_DB}")),
             Connection {
                 name: "staging".into(),
+                group: Some("checkout".into()),
                 host: "cache-01.staging.example".into(),
                 port: 6380,
                 db: 0,
@@ -177,6 +178,7 @@ fn demo_store(_url: &str) -> Store {
             },
             Connection {
                 name: "production".into(),
+                group: Some("checkout".into()),
                 host: "cache-01.prod.example".into(),
                 port: 6380,
                 db: 0,
@@ -187,6 +189,7 @@ fn demo_store(_url: &str) -> Store {
             },
             Connection {
                 name: "analytics".into(),
+                group: Some("data".into()),
                 host: "cache-02.prod.example".into(),
                 port: 6380,
                 db: 2,
@@ -196,6 +199,7 @@ fn demo_store(_url: &str) -> Store {
             },
             Connection {
                 name: "eu-replica".into(),
+                group: Some("data".into()),
                 host: "replica.eu.example".into(),
                 port: 6379,
                 tls: true,
@@ -203,7 +207,16 @@ fn demo_store(_url: &str) -> Store {
                 ssh_user: "deploy".into(),
                 ..Default::default()
             },
+            // A folded group, so the picture shows both header states.
+            Connection {
+                name: "legacy-sessions".into(),
+                group: Some("legacy".into()),
+                host: "sessions.old.example".into(),
+                port: 6379,
+                ..Default::default()
+            },
         ],
+        collapsed_groups: vec!["legacy".into()],
         ..Default::default()
     }
 }

@@ -8,7 +8,7 @@ Python runtime.
 
 | Key browser | Server list |
 |---|---|
-| <img src="docs/screenshots/browser.svg" alt="Browsing the keyspace as a tree, with a JSON value open"> | <img src="docs/screenshots/connections.svg" alt="The saved connection list, showing TLS, keychain, read-only and SSH profiles"> |
+| <img src="docs/screenshots/browser.svg" alt="Browsing the keyspace as a tree, with a JSON value open"> | <img src="docs/screenshots/connections.svg" alt="The saved connection list, grouped into folders, showing TLS, read-only and SSH profiles"> |
 | **Server info** | **Namespace memory** |
 | <img src="docs/screenshots/server-info.svg" alt="The server info dialog with its section tabs"> | <img src="docs/screenshots/memory.svg" alt="The namespace memory report, showing which prefixes hold the RAM"> |
 | **Pub/Sub feed** | **Value editor** |

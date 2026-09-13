@@ -27,7 +27,7 @@ const captions = {
   browser:
     "Keys as a folder tree, split by ':'. TTLs count down in place, and a JSON value is formatted and coloured as you read it.",
   connections:
-    "Saved profiles, each showing what it is: TLS, a keychain password, an SSH tunnel, and the read-only flag that refuses every write.",
+    "Saved profiles grouped by product, one folder per group that folds away. Each row shows what it is: TLS, an SSH tunnel, the read-only flag. v flips back to a flat list.",
   "server-info":
     "INFO in sections, with a usage bar against maxmemory, plus the slow log, client list and running config.",
   memory:
