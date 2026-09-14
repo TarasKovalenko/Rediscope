@@ -122,6 +122,11 @@ rediscope
 
 - **Namespace tree.** Keys grouped by `:` into collapsible folders, with a
   per-folder key count and a type badge on every leaf.
+- **Sorting that reads right** (`o`). Keys sort naturally, so `order:9` comes
+  before `order:10`, ignoring case. `o` switches the keys in each folder to
+  soonest expiry first (keys without a TTL go last), then to grouped by type,
+  then back. Folders always stay in name order. The tree header says `by ttl`
+  or `by type` while one of those is on, and each profile remembers its choice.
 - **Your own key separator.** A profile whose keys look like `app/user/42` or
   `com.example.cache` can split on `/`, `.`, `::`, `|` or any other string
   instead, set under **Key tree** in the connection form. The tree, marking a
@@ -158,7 +163,7 @@ rediscope
   `D` then deletes the marked set (pipelined `UNLINK`, not one round trip per
   key) and `t` sets or clears their TTLs together. `u` clears the marks.
 - **Session memory.** Each profile remembers its database, search pattern, open
-  folders and selected key, and reopens where you left it.
+  folders, selected key and sort order, and reopens where you left it.
 - **Go to anything** (`Ctrl+P`). One input line over every action on the
   screen and every loaded key, matched as you type: `u42prof` finds
   `app:user:42:profile`, `mem` finds the memory report. Choosing a key opens
@@ -474,6 +479,7 @@ Press `?` in the app for this list at any time.
 | `w` / `I` | Export the marked keys to a file · import a file back |
 | `L` | Run a Lua script (marked keys become `KEYS[1..]`) |
 | `r` | Refresh keys and the open value |
+| `o` | Sort keys by name, TTL (soonest expiry first) or type |
 | `e` | Edit. A string opens the editor, a row opens a form |
 | `a` | Add an element to a hash / list / set / zset / stream / vector set |
 | `x` | Delete the selected element |
@@ -790,7 +796,7 @@ rediscope --config-path
 
 The same file keeps your theme, so the colours come back on the next run, and
 one entry per profile recording where you left it — database, search pattern,
-open folders and selected key.
+open folders, selected key and, once it is not by name, the sort order.
 
 ### Key separator
 

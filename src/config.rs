@@ -475,6 +475,21 @@ pub struct Session {
     pub expanded: Vec<String>,
     #[serde(default)]
     pub selected_key: String,
+    /// How the key tree orders keys. Written only once it is not by name, so
+    /// sessions saved before sorting existed are written back unchanged.
+    #[serde(
+        default,
+        deserialize_with = "lenient_sort",
+        skip_serializing_if = "crate::tree::SortMode::is_default"
+    )]
+    pub sort: crate::tree::SortMode,
+}
+
+/// Read a session's `sort` without failing the file: a mode from a newer
+/// version, or a typo, sorts by name.
+fn lenient_sort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::tree::SortMode, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1033,6 +1048,24 @@ mod tests {
             .collect();
         assert_eq!(written, [None, None, Some("/")]);
         assert_eq!(Connection::default().key_separator(), ":");
+    }
+
+    #[test]
+    fn a_session_remembers_its_sort_and_older_sessions_stay_as_they_were() {
+        use crate::tree::SortMode;
+        let store: Store = serde_json::from_str(
+            r#"{"sessions":{"old":{"db":2},"ttl":{"sort":"ttl"},"typo":{"sort":"sideways"},"odd":{"sort":7}}}"#,
+        )
+        .unwrap();
+        assert_eq!(store.sessions["old"].sort, SortMode::Name);
+        assert_eq!(store.sessions["ttl"].sort, SortMode::Ttl);
+        assert_eq!(store.sessions["typo"].sort, SortMode::Name);
+        assert_eq!(store.sessions["odd"].sort, SortMode::Name);
+
+        let old = serde_json::to_string(&store.sessions["old"]).unwrap();
+        assert!(!old.contains("sort"), "{old}");
+        let ttl = serde_json::to_string(&store.sessions["ttl"]).unwrap();
+        assert!(ttl.contains(r#""sort":"ttl""#), "{ttl}");
     }
 
     #[test]

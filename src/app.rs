@@ -24,7 +24,7 @@ use crate::redis_client::{
     StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
 };
 use crate::theme::Theme;
-use crate::tree::{Tree, VisibleRow};
+use crate::tree::{SortMode, Tree, VisibleRow};
 
 /// The "copy to" target that means the connection already open.
 pub const THIS_CONNECTION: &str = "(this connection)";
@@ -1200,6 +1200,9 @@ pub struct App {
     /// What the open profile splits key names on: the tree's folders, marking
     /// a folder, the memory report and the new-key prefill all use it.
     pub separator: String,
+    /// How the tree orders the keys in each folder, cycled with `o` and
+    /// remembered per profile.
+    pub sort: SortMode,
     pub tree: Tree,
     pub expanded: HashSet<String>,
     pub rows: Vec<VisibleRow>,
@@ -1287,6 +1290,7 @@ impl App {
             server_line: String::new(),
             keys: Vec::new(),
             separator: crate::config::DEFAULT_SEPARATOR.to_string(),
+            sort: SortMode::default(),
             tree: Tree::default(),
             expanded: HashSet::new(),
             rows: Vec::new(),
@@ -1550,7 +1554,7 @@ impl App {
         self.keys.retain(|k| k.ttl > 0 || k.ttl == -1);
         self.key_count = self.keys.len();
         self.dbsize = self.dbsize.saturating_sub(expired.len() as u64);
-        self.tree = Tree::build(&self.keys, &self.separator);
+        self.tree = Tree::build(&self.keys, &self.separator, self.sort);
         self.rebuild_rows();
         if self.rows.is_empty() {
             self.tree_state.select(None);
@@ -1615,20 +1619,7 @@ impl App {
                         self.current = None;
                         self.value = None;
                         self.marked.clear();
-                        self.expanded.clear();
-                        // Reopen where this profile was left: same filter, same
-                        // folders, same key.
-                        self.pattern = "*".into();
-                        self.pending_selection = None;
-                        if let Some(session) = session {
-                            if !session.pattern.is_empty() {
-                                self.pattern = session.pattern;
-                            }
-                            self.expanded.extend(session.expanded);
-                            if !session.selected_key.is_empty() {
-                                self.pending_selection = Some(session.selected_key);
-                            }
-                        }
+                        self.restore_session(session);
                         self.reload_keys();
                     }
                     Err(e) => self.status = format!("Connection failed: {e}"),
@@ -1664,7 +1655,7 @@ impl App {
                 self.truncated = truncated;
                 self.dbsize = dbsize;
                 self.pattern = pattern;
-                self.tree = Tree::build(&keys, &self.separator);
+                self.tree = Tree::build(&keys, &self.separator, self.sort);
                 self.keys = keys.clone();
                 // A narrow result set is more useful expanded than collapsed.
                 if keys.len() <= 200 {
@@ -2611,6 +2602,7 @@ impl App {
             KeyCode::Char('v') => self.open_view_picker(),
             KeyCode::Char('+') => self.load_more(),
             KeyCode::Char('f') => self.prompt_element_filter(),
+            KeyCode::Char('o') => self.cycle_sort(),
             _ => match self.focus {
                 Focus::Tree => self.tree_key(key),
                 Focus::Value => self.value_key(key),
@@ -2786,8 +2778,16 @@ impl App {
         let Some(client) = &self.client else {
             return;
         };
-        let session = crate::config::Session {
-            db: client.conn.db,
+        let (name, session) = (client.conn.name.clone(), self.session(client.conn.db));
+        self.store.sessions.insert(name, session);
+        let _ = self.store.save();
+    }
+
+    /// The view as a session to save: database, pattern, open folders,
+    /// selected key and sort order.
+    fn session(&self, db: i64) -> crate::config::Session {
+        crate::config::Session {
+            db,
             pattern: self.pattern.clone(),
             expanded: {
                 let mut folders: Vec<String> = self.expanded.iter().cloned().collect();
@@ -2799,11 +2799,54 @@ impl App {
                 .as_ref()
                 .map(|k| k.name.clone())
                 .unwrap_or_default(),
+            sort: self.sort,
+        }
+    }
+
+    /// Reopen where a profile was left: same filter, same folders, same key,
+    /// same order. With no session, the defaults.
+    fn restore_session(&mut self, session: Option<crate::config::Session>) {
+        self.expanded.clear();
+        self.pattern = "*".into();
+        self.pending_selection = None;
+        self.sort = SortMode::default();
+        if let Some(session) = session {
+            if !session.pattern.is_empty() {
+                self.pattern = session.pattern;
+            }
+            self.expanded.extend(session.expanded);
+            if !session.selected_key.is_empty() {
+                self.pending_selection = Some(session.selected_key);
+            }
+            self.sort = session.sort;
+        }
+    }
+
+    /// `o`: order the keys in each folder by name, then TTL, then type,
+    /// keeping the cursor on the row it was on.
+    fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        let (key, folder) = match self.selected_row() {
+            Some(row) => (
+                row.key.as_ref().map(|k| k.name.clone()),
+                row.folder_path.clone(),
+            ),
+            None => (None, None),
         };
-        self.store
-            .sessions
-            .insert(client.conn.name.clone(), session);
-        let _ = self.store.save();
+        self.tree = Tree::build(&self.keys, &self.separator, self.sort);
+        self.rebuild_rows();
+        let index = self.rows.iter().position(|r| {
+            (key.is_some() && r.key.as_ref().map(|k| &k.name) == key.as_ref())
+                || (folder.is_some() && r.folder_path == folder)
+        });
+        if let Some(index) = index {
+            self.tree_state.select(Some(index));
+        }
+        self.status = match self.sort {
+            SortMode::Name => "Keys sorted by name".into(),
+            SortMode::Ttl => "Keys sorted by TTL, soonest expiry first".into(),
+            SortMode::Type => "Keys sorted by type".into(),
+        };
     }
 
     fn back_to_connections(&mut self) {
@@ -4969,6 +5012,9 @@ impl App {
         if let Some(client) = &self.client {
             let _ = client.lock_writes();
         }
+        // The reconnect restores the profile's session, so save this view
+        // first or the sort order and filter fall back to what was saved last.
+        self.save_session();
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -6342,6 +6388,70 @@ mod tests {
             .unwrap_or_else(|| panic!("no row {label}"));
         app.tree_state.select(Some(index));
         app.on_tree_move();
+    }
+
+    #[test]
+    fn o_cycles_the_sort_and_keeps_the_cursor_on_its_key() {
+        let mut app = tick_app(vec![
+            info("job:10", -1),
+            info("job:2", 90),
+            info("job:9", 5),
+            info("job:1", -1),
+        ]);
+        let leaves = |app: &App| -> Vec<String> {
+            app.rows
+                .iter()
+                .filter(|r| r.key.is_some())
+                .map(|r| r.label.clone())
+                .collect()
+        };
+        assert_eq!(leaves(&app), ["1", "2", "9", "10"], "natural by default");
+        select_label(&mut app, "10");
+
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.sort, SortMode::Ttl);
+        assert_eq!(leaves(&app), ["9", "2", "1", "10"]);
+        assert_eq!(
+            app.selected_row().unwrap().label,
+            "10",
+            "the cursor follows"
+        );
+        assert!(app.status.contains("TTL"), "{}", app.status);
+
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.sort, SortMode::Type);
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.sort, SortMode::Name);
+        assert_eq!(leaves(&app), ["1", "2", "9", "10"]);
+
+        // A countdown and a rescan both keep the order that was chosen.
+        press(&mut app, KeyCode::Char('o'));
+        app.age_ttls(1);
+        assert_eq!(leaves(&app), ["9", "2", "1", "10"]);
+        app.on_msg(Msg::Keys {
+            keys: vec![info("job:3", 1), info("job:1", -1)],
+            truncated: false,
+            warnings: vec![],
+            dbsize: 2,
+            pattern: "*".into(),
+        });
+        assert_eq!(leaves(&app), ["3", "1"]);
+    }
+
+    #[test]
+    fn the_sort_order_is_saved_with_the_session_and_restored() {
+        let mut app = tick_app(vec![info("a", -1)]);
+        press(&mut app, KeyCode::Char('o'));
+        let session = app.session(3);
+        assert_eq!(session.sort, SortMode::Ttl);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut other = App::new(crate::config::Store::default(), tx);
+        other.restore_session(Some(session));
+        assert_eq!(other.sort, SortMode::Ttl);
+        // A profile with no session starts by name again.
+        other.restore_session(None);
+        assert_eq!(other.sort, SortMode::Name);
     }
 
     #[test]

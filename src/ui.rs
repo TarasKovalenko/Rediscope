@@ -378,6 +378,11 @@ fn key_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
     if !app.marked.is_empty() {
         title.push_str(&format!("  ·  {} marked", app.marked.len()));
     }
+    // Last, so a narrow pane cuts this before a warning. By name is the
+    // order everyone expects, so only another one is spelled out.
+    if !app.sort.is_default() {
+        title.push_str(&format!("  ·  by {}", app.sort.name()));
+    }
 
     let list = List::new(items)
         .block(panel(&title, focused, palette))
@@ -2428,6 +2433,7 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
             "r",
             "refresh — TTLs count down live, expired keys leave the tree",
         ),
+        row("o", "sort keys by name, TTL (soonest first) or type"),
         head("Values"),
         row("e", "edit — string opens an editor, rows open a form"),
         row(

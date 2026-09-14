@@ -64,6 +64,7 @@ pub const BROWSER: &[Command] = &[
     Command::key("x", 'x', "Delete the selected element"),
     Command::key("f", 'f', "Filter the open collection's elements"),
     Command::key("+", '+', "Load more keys or elements"),
+    Command::key("o", 'o', "Sort keys by name, TTL or type"),
     Command::key("v", 'v', "View the value as plain, gzip, msgpack, hex …"),
     Command::key("t", 't', "Set or clear a TTL"),
     Command::key("R", 'R', "Rename key"),

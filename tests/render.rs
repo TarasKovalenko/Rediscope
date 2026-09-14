@@ -324,6 +324,48 @@ async fn previews_structured_list_values_and_handles_long_editor_titles() {
     assert!(controls_line.contains("esc cancels"), "{controls_line}");
 }
 
+/// `o` reorders the keys inside each folder and the tree header says how.
+#[tokio::test]
+async fn the_tree_header_names_the_sort_order() {
+    let mut a = app();
+    a.screen = rediscope::app::Screen::Browser;
+    a.on_msg(Msg::Keys {
+        warnings: vec![],
+        keys: vec![
+            key("order:10", KeyType::String, -1),
+            key("order:9", KeyType::Hash, 600),
+            key("order:100", KeyType::List, 30),
+        ],
+        truncated: false,
+        dbsize: 3,
+        pattern: "*".into(),
+    });
+    let leaves = |a: &App| -> Vec<String> {
+        a.rows
+            .iter()
+            .filter(|r| r.key.is_some())
+            .map(|r| r.label.clone())
+            .collect()
+    };
+    assert_eq!(leaves(&a), ["9", "10", "100"]);
+    let screen = render_text(&mut a, 140, 10);
+    assert!(!screen.contains("by name"), "the usual order goes unsaid");
+
+    press(&mut a, KeyCode::Char('o'));
+    assert_eq!(leaves(&a), ["100", "9", "10"]);
+    let screen = render_text(&mut a, 140, 10);
+    assert!(screen.contains("by ttl"), "{screen}");
+    render_all_sizes(&mut a);
+
+    press(&mut a, KeyCode::Char('o'));
+    assert_eq!(leaves(&a), ["9", "100", "10"], "hash, list, string");
+    assert!(render_text(&mut a, 140, 10).contains("by type"));
+    render_all_sizes(&mut a);
+
+    press(&mut a, KeyCode::Char('o'));
+    assert!(!render_text(&mut a, 140, 10).contains("  by "));
+}
+
 #[tokio::test]
 async fn tree_navigation_expands_folders_and_tracks_selection() {
     let mut a = app();
