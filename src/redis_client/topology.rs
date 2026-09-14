@@ -673,7 +673,9 @@ impl Transport {
         offset: usize,
         count: usize,
     ) -> RedisResult<Vec<Value>> {
-        let (results, spread) = self.pipeline_results(pipeline, offset, count).await?;
+        let (results, spread) = self
+            .pipeline_results(pipeline, offset, count, false)
+            .await?;
         if pipeline.is_transaction()
             && let Some((i, e)) = exec_failure(&results)
         {
@@ -718,12 +720,14 @@ impl Transport {
     /// Send a pipeline and give back each command's own reply or error, with
     /// the outer error kept for a batch whose outcome is unknown or that was
     /// never sent. The flag says whether a cluster batch went to more than
-    /// one node or resent commands.
+    /// one node or resent commands. With `quiet`, reads sent one at a time
+    /// are not audited one by one: the caller records the whole operation.
     async fn pipeline_results(
         &self,
         pipeline: &redis::Pipeline,
         offset: usize,
         count: usize,
+        quiet: bool,
     ) -> RedisResult<(Vec<RedisResult<Value>>, bool)> {
         let writes = pipeline.cmd_iter().any(|c| !read_route(c).0);
         if self.read_only() && writes {
@@ -740,7 +744,7 @@ impl Transport {
             }
             let mut values = Vec::new();
             for cmd in pipeline.cmd_iter() {
-                values.push(Ok(self.request(cmd).await?));
+                values.push(Ok(self.read_request(cmd, quiet).await?));
             }
             return Ok((values.into_iter().skip(offset).take(count).collect(), false));
         }
@@ -786,7 +790,7 @@ impl Transport {
                         drop(state);
                         let mut values = Vec::new();
                         for cmd in pipeline.cmd_iter() {
-                            values.push(Ok(self.request(cmd).await?));
+                            values.push(Ok(self.read_request(cmd, quiet).await?));
                         }
                         return Ok((values.into_iter().skip(offset).take(count).collect(), false));
                     }
@@ -926,7 +930,7 @@ impl Transport {
         let count = if atomic { commands + 2 } else { commands };
         let writes = pipeline.cmd_iter().any(|c| !read_route(c).0);
         if !writes {
-            return Ok(self.pipeline_results(pipeline, 0, count).await?.0);
+            return Ok(self.pipeline_results(pipeline, 0, count, false).await?.0);
         }
         let id = self.audit.id();
         let targets = pipeline.cmd_iter().try_fold(0usize, |sum, c| {
@@ -936,7 +940,7 @@ impl Transport {
             .record(id, "PIPELINE", "started", targets)
             .map_err(|_| error("Audit unavailable; pipeline was not sent"))?;
         let result = self
-            .pipeline_results(pipeline, 0, count)
+            .pipeline_results(pipeline, 0, count, false)
             .await
             .map(|(r, _)| r);
         let result = match result {
@@ -1002,6 +1006,34 @@ impl Transport {
                 })
             })
             .collect()
+    }
+
+    /// A pipeline of reads for an operation the caller audits as a whole,
+    /// such as an export: no read in it is logged on its own, on any
+    /// deployment. A pipeline with a write in it is audited as usual.
+    pub(super) async fn read_pipeline_unaudited(
+        &self,
+        pipeline: &redis::Pipeline,
+    ) -> RedisResult<Vec<Value>> {
+        let count = pipeline.cmd_iter().count();
+        if pipeline.is_transaction() || pipeline.cmd_iter().any(|c| !read_route(c).0) {
+            let mut c = self.clone();
+            return c.req_packed_commands(pipeline, 0, count).await;
+        }
+        self.pipeline_results(pipeline, 0, count, true)
+            .await?
+            .0
+            .into_iter()
+            .collect()
+    }
+
+    /// A read sent on its own, audited unless `quiet`.
+    async fn read_request(&self, cmd: &Cmd, quiet: bool) -> RedisResult<Value> {
+        if quiet && read_route(cmd).0 {
+            self.request_inner(cmd).await
+        } else {
+            self.request(cmd).await
+        }
     }
 
     /// Record one event for a whole operation that is not a single command,

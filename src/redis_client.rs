@@ -2568,9 +2568,20 @@ return 1
     // ---- export and import -----------------------------------------------
 
     /// Serialize keys with `DUMP`, so every type — and the TTL — survives the
-    /// round trip through a file.
+    /// round trip through a file. Audited as one `EXPORT` event, like
+    /// [`Client::export_to`].
     pub async fn export_keys(&self, names: &[String]) -> Result<Vec<ExportEntry>> {
-        let mut c = self.mgr.clone();
+        let count = Some(names.len());
+        let id = self.mgr.audit_event("EXPORT", "started", count)?;
+        let result = self.dump_entries(names).await;
+        let outcome = if result.is_ok() { "success" } else { "failure" };
+        self.mgr.audit_finish(id, "EXPORT", outcome, count)?;
+        result
+    }
+
+    /// The `DUMP` payloads of `names`, for an export that audits itself: no
+    /// key is logged as a read of its own.
+    async fn dump_entries(&self, names: &[String]) -> Result<Vec<ExportEntry>> {
         let mut out = Vec::with_capacity(names.len());
         for chunk in names.chunks(128) {
             let mut pipe = redis::pipe();
@@ -2579,7 +2590,7 @@ return 1
                 pipe.cmd("PTTL").arg(decode_key(name));
                 pipe.cmd("TYPE").arg(decode_key(name));
             }
-            let replies: Vec<redis::Value> = pipe.query_async(&mut c).await?;
+            let replies = self.mgr.read_pipeline_unaudited(&pipe).await?;
             for (name, triple) in chunk.iter().zip(replies.chunks(3)) {
                 let [dump, pttl, kind] = triple else { continue };
                 let redis::Value::BulkString(bytes) = dump else {
@@ -2660,7 +2671,7 @@ return 1
     ) -> Result<(ExportReport, W)> {
         use crate::transfer::{Format, Value, Writer};
         if format == Format::Dump {
-            let entries = self.export_keys(names).await?;
+            let entries = self.dump_entries(names).await?;
             let out = crate::transfer::write_dump(out, &entries)?;
             return Ok((
                 ExportReport {

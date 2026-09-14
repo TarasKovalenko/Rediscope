@@ -1154,8 +1154,10 @@ refused if the path is not a regular file:
 unrecognised is logged as `OTHER_COMMAND`, so user input can never become a log
 field. `target_key_count` is how many keys the command was aimed at, not a claim
 that they all changed, and is absent when that cannot be known (`FLUSHDB`, an
-arbitrary script). An export, in any format, is one `EXPORT` operation whose
-count is the number of keys asked for. A batch of writes is one `PIPELINE`
+arbitrary script). An export, in any format and on any deployment, is one
+`EXPORT` operation whose count is the number of keys asked for; the reads it
+makes are not logged one by one. Copying a single key with `DUMP` outside an
+export is logged as `EXPORT_READ`. A batch of writes is one `PIPELINE`
 operation. It is `denied` only when nothing in it was sent, and `unknown` when
 it may have run in part, including a transaction in which one command failed
 while the others ran. Every operation writes an intent line before it is dispatched

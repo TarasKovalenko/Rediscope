@@ -2996,3 +2996,29 @@ async fn cluster_import_resend_refused_by_an_expired_lease_is_not_audited_denied
         vec!["started", "unknown"]
     );
 }
+
+#[tokio::test]
+async fn cluster_dump_export_is_one_export_event_without_per_key_reads() {
+    let nodes = TwoNodes::start(|_, _, args| match args[0].as_str() {
+        "DUMP" => Some(Some(bulk("payload"))),
+        "PTTL" => Some(Some(":-1\r\n".into())),
+        "TYPE" => Some(Some("+string\r\n".into())),
+        _ => None,
+    });
+    let mut profile = nodes.profile();
+    profile.name = unique("dump-export-audit", nodes.a.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    let names = vec![key_on(true, "dump", 0), key_on(false, "dump", 0)];
+    let (report, _) = client
+        .export_to(&names, rediscope::transfer::Format::Dump, false, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(report.written, 2);
+    assert_eq!(client.export_keys(&names).await.unwrap().len(), 2);
+    assert_eq!(count(&nodes.a_log, "DUMP", None), 2);
+    assert!(audit_outcomes(&profile.name, "EXPORT_READ").is_empty());
+    assert_eq!(
+        audit_outcomes(&profile.name, "EXPORT"),
+        vec!["started", "success", "started", "success"]
+    );
+}
