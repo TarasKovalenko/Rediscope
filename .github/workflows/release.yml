@@ -258,8 +258,8 @@ jobs:
           if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then stable=true; fi
           # A backport or a re-run of an old tag must not replace a newer
           # version that package managers already have.
-          newest="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-pre-releases --limit 100 \
-            --json tagName --jq '.[].tagName' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          newest="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-pre-releases --exclude-drafts --limit 100 \
+            --json tagName --jq '.[].tagName' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -n 1)"
           if [ "$stable" = true ] && [ -n "$newest" ] && [ "$newest" != "$RELEASE_TAG" ]; then
             echo "::notice::package managers skipped: $newest is newer than $RELEASE_TAG"
             stable=false

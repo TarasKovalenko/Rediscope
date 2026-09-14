@@ -14,7 +14,12 @@ workflow publishes the result after the GitHub release is up:
 
 A job whose secret is missing is skipped with a notice, and the release run
 stays green. So you can set these up one at a time, or not at all. Tags with a
-suffix, like `v1.0.0-rc.1`, never go to package managers.
+suffix, like `v1.0.0-rc.1`, never go to package managers. Neither does a tag
+older than the newest stable release, so a backport like `v0.12.5` after
+`v0.13.0` builds and publishes on GitHub but leaves the packages alone.
+
+Every tag, pre-releases included, has to match the version in `Cargo.toml`
+exactly, or the release stops in its first job.
 
 To render the manifests yourself:
 
@@ -118,9 +123,8 @@ license.
    `rediscope`.
 2. Add it as `CARGO_REGISTRY_TOKEN`.
 
-The job checks that the tag matches the version in `Cargo.toml` before
-publishing. A version on crates.io can be yanked but never replaced, so a rerun
-of the same tag fails at that step, which is expected.
+A version on crates.io can be yanked but never replaced, so rerunning a tag
+that already published fails at `cargo publish`, which is expected.
 
 ## Flathub
 

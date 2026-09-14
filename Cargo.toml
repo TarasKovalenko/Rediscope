@@ -18,6 +18,7 @@ exclude = [
     "scripts/*",
     "install.sh",
     "install.ps1",
+    ".cargo/*",
 ]
 
 [[bin]]
