@@ -718,3 +718,171 @@ async fn real_sentinel_monitor_watches_the_primary() {
     })
     .await;
 }
+
+// ---- feed lifecycles ----------------------------------------------------------
+
+/// Subscriber and `MONITOR` connections `server` lists, by `CLIENT LIST`,
+/// other than Sentinel's own.
+async fn feed_clients(server: &Server) -> usize {
+    let list: String = redis::cmd("CLIENT")
+        .arg("LIST")
+        .query_async(&mut server.raw().await)
+        .await
+        .unwrap();
+    list.lines()
+        // Sentinel keeps a subscription of its own on the primary it watches.
+        .filter(|line| !line.contains(" name=sentinel-"))
+        .filter(|line| {
+            let field = |name: &str| {
+                line.split(' ')
+                    .find_map(|f| f.strip_prefix(name))
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            field("flags=").contains('O')
+                || field("psub=").parse::<u64>().unwrap_or(0) > 0
+                || field("sub=").parse::<u64>().unwrap_or(0) > 0
+        })
+        .count()
+}
+
+/// Poll until every server in `servers` lists `expected` feed connections.
+async fn until_feed_clients(servers: &[&Server], expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut counts = Vec::new();
+        for server in servers {
+            counts.push(feed_clients(server).await);
+        }
+        if counts.iter().all(|c| *c == expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "feed connections per node {counts:?}, expected {expected} each"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+async fn until_tasks_at_most(baseline: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive_tasks() > baseline {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} tasks alive, {baseline} before the feed",
+            alive_tasks()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_feeds_close_every_connection_and_task_when_dropped() {
+    let _serial = SERIAL.lock().await;
+    let servers = start_cluster().await;
+    let every: Vec<&Server> = servers.iter().collect();
+    let client = Client::connect(servers[0].profile(Deployment::Cluster))
+        .await
+        .unwrap();
+    until_feed_clients(&every, 0).await;
+    let baseline = alive_tasks();
+
+    let feed = client
+        .subscribe(vec!["__keyevent@0__:*".into()], true)
+        .await
+        .unwrap();
+    until_feed_clients(&every, 1).await;
+    drop(feed);
+    until_feed_clients(&every, 0).await;
+    until_tasks_at_most(baseline).await;
+
+    let feed = client.monitor_feed().await.unwrap();
+    assert_eq!(feed.nodes(), 3);
+    until_feed_clients(&every, 1).await;
+    drop(feed);
+    until_feed_clients(&every, 0).await;
+    until_tasks_at_most(baseline).await;
+
+    // Channel messages need one subscription, on one node.
+    let feed = client
+        .subscribe(vec!["live.*".into()], false)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut total = 0;
+        for server in &servers {
+            total += feed_clients(server).await;
+        }
+        if total == 1 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{total} subscribers");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(feed);
+    until_feed_clients(&every, 0).await;
+    until_tasks_at_most(baseline).await;
+    drop(client);
+    drop(servers);
+
+    // Standalone.
+    let server = Server::start(false, None).await;
+    let client = Client::connect(server.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+    let baseline = alive_tasks();
+    let feed = client.subscribe(vec!["*".into()], false).await.unwrap();
+    let monitor = client.monitor_feed().await.unwrap();
+    until_feed_clients(&[&server], 2).await;
+    drop((feed, monitor));
+    until_feed_clients(&[&server], 0).await;
+    until_tasks_at_most(baseline).await;
+
+    // Sentinel: the connections are on the primary.
+    let primary = Server::start(false, None).await;
+    let sentinel = Server::start(false, Some(primary.port)).await;
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "test-primary".into();
+    let client = Client::connect(profile).await.unwrap();
+    let baseline = alive_tasks();
+    let feed = client.subscribe(vec!["*".into()], false).await.unwrap();
+    let monitor = client.monitor_feed().await.unwrap();
+    until_feed_clients(&[&primary], 2).await;
+    drop((feed, monitor));
+    until_feed_clients(&[&primary], 0).await;
+    until_tasks_at_most(baseline).await;
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_cluster_feed_modal_quit_closes_every_node_connection() {
+    use crossterm::event::{KeyCode, KeyEvent};
+    use rediscope::app::{App, Msg, Screen};
+    let _serial = SERIAL.lock().await;
+    let servers = start_cluster().await;
+    let every: Vec<&Server> = servers.iter().collect();
+    let client = Client::connect(servers[0].profile(Deployment::Cluster))
+        .await
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(rediscope::config::Store::default(), tx);
+    app.screen = Screen::Browser;
+    app.client = Some(client);
+    let baseline = alive_tasks();
+    for open in ['W', 'N'] {
+        app.on_key(KeyEvent::from(KeyCode::Char(open)));
+        until_feed_clients(&every, 1).await;
+        app.on_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.modal.is_none());
+        until_feed_clients(&every, 0).await;
+        until_tasks_at_most(baseline).await;
+    }
+}
