@@ -76,6 +76,9 @@ struct State {
     discovered: u64,
     last_generation: u64,
     last_discovery: RedisResult<()>,
+    /// The last discovery failed. A Sentinel profile then discovers again
+    /// before its next request instead of trusting the address it had.
+    must_rediscover: bool,
 }
 /// A cached multiplexed connection. The id lets a caller whose request failed
 /// on it drop exactly that socket, not a newer one another caller opened.
@@ -166,6 +169,7 @@ impl Transport {
                 discovered: 0,
                 last_generation: 0,
                 last_discovery: Ok(()),
+                must_rediscover: false,
             })),
             discovery: Arc::default(),
             primary_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
@@ -399,6 +403,7 @@ impl Transport {
         let result = result.map(|_| ());
         state.discovered += 1;
         state.last_generation = generation;
+        state.must_rediscover = result.is_err();
         state.last_discovery = result.clone();
         result
     }
@@ -429,8 +434,7 @@ impl Transport {
             result?;
             return Ok(None);
         }
-        let mut seeds = vec![(self.profile.host.clone(), self.profile.port)];
-        seeds.extend(self.profile.seeds.iter().filter_map(|s| endpoint(s).ok()));
+        let mut seeds = self.seeds();
         if self.profile.deployment == Deployment::Cluster {
             seeds.extend(self.state().nodes.iter().map(Node::endpoint));
         }
@@ -443,31 +447,8 @@ impl Transport {
             let mut used = None;
             let result: RedisResult<Vec<Node>> = async {
                 if self.profile.deployment == Deployment::Sentinel {
-                    let mut sentinel = self.profile.clone();
-                    sentinel.host = ep.0.clone();
-                    sentinel.port = ep.1;
-                    sentinel.db = 0;
-                    sentinel.username = self.profile.sentinel_username.clone();
-                    sentinel.password = self.profile.sentinel_password.clone();
-                    sentinel.use_keychain = false;
-                    let raw = build_client(&sentinel, None)
-                        .await
-                        .map_err(|e| error(e.to_string()))?;
-                    let mut c = socket(&raw).await?;
-                    let address: Option<(String, u16)> = redis::cmd("SENTINEL")
-                        .arg("get-master-addr-by-name")
-                        .arg(&self.profile.sentinel_master)
-                        .query_async(&mut c)
-                        .await?;
-                    let address =
-                        address.ok_or_else(|| error("Sentinel does not know this service"))?;
-                    // Always establish a fresh socket on rediscovery and verify the role.
-                    self.state().sockets.remove(&address);
-                    let mut primary = self.connection(&address).await?.conn;
-                    let role: Vec<Value> = redis::cmd("ROLE").query_async(&mut primary).await?;
-                    if role.first().map(scalar).as_deref() != Some("master") {
-                        return Err(error("Sentinel candidate is not a primary"));
-                    }
+                    let address = self.sentinel_names(&ep).await?;
+                    self.verify_primary(&address).await?;
                     Ok(vec![Node {
                         id: self.profile.sentinel_master.clone(),
                         host: address.0,
@@ -510,13 +491,86 @@ impl Transport {
         Err(error(format!("Discovery failed: {}", failures.join("; "))))
     }
 
-    /// Rediscover when the topology is older than 30 seconds. Only a Sentinel
+    /// The profile's address, then its other seeds.
+    fn seeds(&self) -> Vec<Endpoint> {
+        let mut seeds = vec![(self.profile.host.clone(), self.profile.port)];
+        seeds.extend(self.profile.seeds.iter().filter_map(|s| endpoint(s).ok()));
+        seeds
+    }
+
+    /// The primary the Sentinel at `ep` names for the profile's service.
+    async fn sentinel_names(&self, ep: &Endpoint) -> RedisResult<Endpoint> {
+        let mut sentinel = self.profile.clone();
+        sentinel.host = ep.0.clone();
+        sentinel.port = ep.1;
+        sentinel.db = 0;
+        sentinel.username = self.profile.sentinel_username.clone();
+        sentinel.password = self.profile.sentinel_password.clone();
+        sentinel.use_keychain = false;
+        let raw = build_client(&sentinel, None)
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        let mut c = socket(&raw).await?;
+        let address: Option<(String, u16)> = redis::cmd("SENTINEL")
+            .arg("get-master-addr-by-name")
+            .arg(&self.profile.sentinel_master)
+            .query_async(&mut c)
+            .await?;
+        address.ok_or_else(|| error("Sentinel does not know this service"))
+    }
+
+    /// Check with `ROLE` that the node Sentinel named is a primary. The
+    /// cached socket to it is kept when it is the primary already in use, so
+    /// a periodic discovery does not cut the connection every request
+    /// shares. A newly named primary, or a failed check, starts over on a
+    /// fresh socket.
+    async fn verify_primary(&self, address: &Endpoint) -> RedisResult<()> {
+        {
+            let mut state = self.state();
+            if state.default != *address {
+                state.sockets.remove(address);
+            }
+        }
+        let mut retried = false;
+        loop {
+            let socket = self.connection(address).await?;
+            let mut c = socket.conn.clone();
+            let result = redis::cmd("ROLE").query_async::<Vec<Value>>(&mut c).await;
+            self.answered(&socket, &result);
+            match result {
+                Ok(role) if role.first().map(scalar).as_deref() == Some("master") => return Ok(()),
+                Ok(_) => {
+                    self.forget(address, socket.id);
+                    return Err(error("Sentinel candidate is not a primary"));
+                }
+                // A cached socket that died since it was last used says
+                // nothing about the node: ask once more on a new one.
+                Err(e) if e.is_io_error() && !retried => {
+                    self.forget(address, socket.id);
+                    retried = true;
+                }
+                Err(e) => {
+                    self.forget(address, socket.id);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Rediscover when the topology is older than 30 seconds, or, on a
+    /// Sentinel profile, when the last discovery failed. Only a Sentinel
     /// failure is an error: its primary may have moved, and a stale address
     /// must never be written to. A cluster keeps routing on what it knows.
     async fn refresh_if_stale(&self) -> RedisResult<()> {
-        if self.profile.deployment == Deployment::Standalone
-            || self.state().refreshed.elapsed() < Duration::from_secs(30)
-        {
+        if self.profile.deployment == Deployment::Standalone {
+            return Ok(());
+        }
+        let due = {
+            let state = self.state();
+            state.refreshed.elapsed() >= Duration::from_secs(30)
+                || (state.must_rediscover && self.profile.deployment == Deployment::Sentinel)
+        };
+        if !due {
             return Ok(());
         }
         if let Err(e) = self.discover_noting(false).await
