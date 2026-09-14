@@ -47,6 +47,10 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const HEX_DUMP_LIMIT: usize = 4_096;
 /// Most decoded text one value read may produce, across all of its elements.
 const DECODE_BUDGET: usize = 64 * 1024 * 1024;
+/// What every temporary key an import writes has right after the key's own
+/// name. An import that is killed before its rename leaves such a key behind,
+/// and this is how to find it.
+pub const IMPORT_TEMP_MARKER: &str = ":rediscope-import-tmp:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
@@ -456,6 +460,39 @@ pub struct ExportEntry {
     pub pttl: i64,
     /// The `DUMP` payload, hex encoded so the file stays text.
     pub dump: String,
+}
+
+/// What an export wrote.
+#[derive(Clone, Debug, Default)]
+pub struct ExportReport {
+    pub written: u64,
+    /// Keys left out, each as `name: reason`: types no readable format has
+    /// a shape for, empty streams a CSV or commands file cannot hold, and
+    /// keys that changed type while they were read.
+    pub skipped: Vec<String>,
+}
+
+/// A key this server cannot hand over whole, which an export leaves out and
+/// reports instead of failing.
+#[derive(Debug)]
+struct Unreadable(String);
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// What an import wrote.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Keys written; for a commands file, the distinct keys its commands wrote.
+    pub keys: u64,
+    pub commands: u64,
+    /// Records with nothing to write, such as an empty collection.
+    pub skipped: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2595,9 +2632,20 @@ return 1
     // ---- export and import -----------------------------------------------
 
     /// Serialize keys with `DUMP`, so every type — and the TTL — survives the
-    /// round trip through a file.
+    /// round trip through a file. Audited as one `EXPORT` event, like
+    /// [`Client::export_to`].
     pub async fn export_keys(&self, names: &[String]) -> Result<Vec<ExportEntry>> {
-        let mut c = self.mgr.clone();
+        let count = Some(names.len());
+        let id = self.mgr.audit_event("EXPORT", "started", count)?;
+        let result = self.dump_entries(names).await;
+        let outcome = if result.is_ok() { "success" } else { "failure" };
+        self.mgr.audit_finish(id, "EXPORT", outcome, count)?;
+        result
+    }
+
+    /// The `DUMP` payloads of `names`, for an export that audits itself: no
+    /// key is logged as a read of its own.
+    async fn dump_entries(&self, names: &[String]) -> Result<Vec<ExportEntry>> {
         let mut out = Vec::with_capacity(names.len());
         for chunk in names.chunks(128) {
             let mut pipe = redis::pipe();
@@ -2606,7 +2654,7 @@ return 1
                 pipe.cmd("PTTL").arg(decode_key(name));
                 pipe.cmd("TYPE").arg(decode_key(name));
             }
-            let replies: Vec<redis::Value> = pipe.query_async(&mut c).await?;
+            let replies = self.mgr.read_pipeline_unaudited(&pipe).await?;
             for (name, triple) in chunk.iter().zip(replies.chunks(3)) {
                 let [dump, pttl, kind] = triple else { continue };
                 let redis::Value::BulkString(bytes) = dump else {
@@ -2614,6 +2662,8 @@ return 1
                     continue;
                 };
                 let pttl = match pttl {
+                    // RESTORE reads 0 as no expiry; the key had moments left.
+                    redis::Value::Int(0) => 1,
                     redis::Value::Int(i) => *i,
                     _ => -1,
                 };
@@ -2649,6 +2699,919 @@ return 1
             written += 1;
         }
         Ok(written)
+    }
+
+    /// Write `names` to `out` in `format`, one key at a time, so the export
+    /// never holds more than one value in memory. Collections are read in
+    /// chunks, never in one `HGETALL` or `LRANGE 0 -1`. `replace` makes a
+    /// commands file `DEL` each key before writing it.
+    ///
+    /// The whole export is one `EXPORT` event in the audit log, whatever the
+    /// format and the server, so reading data out is recorded the same way
+    /// everywhere. A key that expires, or changes type, while it is read is
+    /// left out rather than failing the export, and a key's TTL is read after
+    /// its value, so it is never older than the data.
+    pub async fn export_to<W: std::io::Write + Send>(
+        &self,
+        names: &[String],
+        format: crate::transfer::Format,
+        replace: bool,
+        out: W,
+    ) -> Result<(ExportReport, W)> {
+        let count = Some(names.len());
+        let id = self.mgr.audit_event("EXPORT", "started", count)?;
+        let result = self.export_inner(names, format, replace, out).await;
+        let outcome = if result.is_ok() { "success" } else { "failure" };
+        self.mgr.audit_finish(id, "EXPORT", outcome, count)?;
+        result
+    }
+
+    async fn export_inner<W: std::io::Write + Send>(
+        &self,
+        names: &[String],
+        format: crate::transfer::Format,
+        replace: bool,
+        out: W,
+    ) -> Result<(ExportReport, W)> {
+        use crate::transfer::{Format, Value, Writer};
+        if format == Format::Dump {
+            let entries = self.dump_entries(names).await?;
+            let out = crate::transfer::write_dump(out, &entries)?;
+            return Ok((
+                ExportReport {
+                    written: entries.len() as u64,
+                    skipped: Vec::new(),
+                },
+                out,
+            ));
+        }
+        let mut writer = Writer::new(out, format, replace)?;
+        let mut skipped = Vec::new();
+        let mut c = self.mgr.clone();
+        // In name order, so two exports of the same data diff cleanly.
+        let mut names = names.to_vec();
+        names.sort();
+        names.dedup();
+        for chunk in names.chunks(128) {
+            let mut pipe = redis::pipe();
+            for name in chunk {
+                pipe.cmd("TYPE").arg(decode_key(name));
+            }
+            let kinds: Vec<redis::Value> = pipe.query_async(&mut c).await?;
+            for (name, kind) in chunk.iter().zip(&kinds) {
+                let type_name = scalar(kind);
+                let kind = KeyType::parse(&type_name);
+                if kind == KeyType::Other {
+                    // "none" means it expired; anything else has no reader.
+                    if type_name != "none" {
+                        skipped.push(format!("{name}: a {type_name} has no readable format"));
+                    }
+                    continue;
+                }
+                let value = match self.read_transfer_value(name, kind).await {
+                    Ok(Some(value)) => value,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        if let Some(Unreadable(why)) = e.downcast_ref::<Unreadable>() {
+                            skipped.push(format!("{name}: {why}"));
+                            continue;
+                        }
+                        // A key replaced by another type, or gone, between
+                        // TYPE and the read is not a reason to stop.
+                        let now: String = redis::cmd("TYPE")
+                            .arg(decode_key(name))
+                            .query_async(&mut c)
+                            .await
+                            .unwrap_or_default();
+                        if now == "none" {
+                            continue;
+                        }
+                        if !now.is_empty() && now != type_name {
+                            skipped.push(format!(
+                                "{name}: it changed from a {type_name} to a {now} while it was read"
+                            ));
+                            continue;
+                        }
+                        return Err(e.context(format!("cannot read '{name}'")));
+                    }
+                };
+                if let Value::Stream(entries) = &value
+                    && entries.is_empty()
+                    && matches!(format, Format::Csv | Format::Commands)
+                {
+                    let why = if format == Format::Csv {
+                        "an empty stream has no entries to give it a row in CSV"
+                    } else {
+                        "an empty stream has no entries for XADD to create it"
+                    };
+                    skipped.push(format!("{name}: {why}"));
+                    continue;
+                }
+                // Read after the value, so the TTL written is never older than it.
+                let pttl: i64 = redis::cmd("PTTL")
+                    .arg(decode_key(name))
+                    .query_async(&mut c)
+                    .await?;
+                let ttl_ms = match pttl {
+                    // Gone while it was read: what was read may be half of it.
+                    -2 => continue,
+                    // A key with moments left is written expiring, never as 0.
+                    t if t >= 0 => Some(t.max(1)),
+                    _ => None,
+                };
+                writer.write(&crate::transfer::Record {
+                    key: decode_key(name),
+                    ttl_ms,
+                    value,
+                })?;
+            }
+        }
+        let written = writer.written();
+        Ok((ExportReport { written, skipped }, writer.finish()?))
+    }
+
+    /// A whole value, read in bounded chunks. `None` when the key went away
+    /// while it was being read.
+    async fn read_transfer_value(
+        &self,
+        name: &str,
+        kind: KeyType,
+    ) -> Result<Option<crate::transfer::Value>> {
+        use crate::transfer::{Series, StreamEntry, Value, VectorElement, VectorSet};
+        const STEP: usize = 1_000;
+        let key = decode_key(name);
+        let mut c = self.mgr.clone();
+        let value = match kind {
+            KeyType::String => {
+                let v: Option<Vec<u8>> = c.get(&key).await?;
+                return Ok(v.map(Value::String));
+            }
+            KeyType::Hash => {
+                let scan = self
+                    .scan_elements("HSCAN", name, None, usize::MAX, 2, 0)
+                    .await?;
+                let mut items = scan.items.into_iter();
+                let mut pairs = Vec::new();
+                while let (Some(f), Some(v)) = (items.next(), items.next()) {
+                    pairs.push((f, v));
+                }
+                // SCAN order is the hash table's; sorted, two exports diff.
+                pairs.sort();
+                Value::Hash(pairs)
+            }
+            KeyType::List => {
+                let mut items: Vec<Vec<u8>> = Vec::new();
+                loop {
+                    let start = items.len() as isize;
+                    let chunk: Vec<Vec<u8>> =
+                        c.lrange(&key, start, start + STEP as isize - 1).await?;
+                    let short = chunk.len() < STEP;
+                    items.extend(chunk);
+                    if short {
+                        break;
+                    }
+                }
+                Value::List(items)
+            }
+            KeyType::Set => {
+                let mut members = self
+                    .scan_elements("SSCAN", name, None, usize::MAX, 1, 0)
+                    .await?
+                    .items;
+                members.sort();
+                Value::Set(members)
+            }
+            KeyType::ZSet => {
+                let mut items: Vec<(Vec<u8>, f64)> = Vec::new();
+                loop {
+                    let start = items.len() as isize;
+                    let chunk: Vec<(Vec<u8>, f64)> = c
+                        .zrange_withscores(&key, start, start + STEP as isize - 1)
+                        .await?;
+                    let short = chunk.len() < STEP;
+                    items.extend(chunk);
+                    if short {
+                        break;
+                    }
+                }
+                Value::ZSet(items)
+            }
+            KeyType::Stream => {
+                let mut entries = Vec::new();
+                let mut start = "-".to_string();
+                loop {
+                    let chunk: Vec<(String, Vec<Vec<u8>>)> = redis::cmd("XRANGE")
+                        .arg(&key)
+                        .arg(&start)
+                        .arg("+")
+                        .arg("COUNT")
+                        .arg(STEP)
+                        .query_async(&mut c)
+                        .await?;
+                    let short = chunk.len() < STEP;
+                    let next = chunk.last().and_then(|(id, _)| next_stream_id(id));
+                    for (id, flat) in chunk {
+                        let mut flat = flat.into_iter();
+                        let mut fields = Vec::new();
+                        while let (Some(f), Some(v)) = (flat.next(), flat.next()) {
+                            fields.push((f, v));
+                        }
+                        entries.push(StreamEntry { id, fields });
+                    }
+                    match next {
+                        Some(next) if !short => start = next,
+                        _ => break,
+                    }
+                }
+                if entries.is_empty() {
+                    let exists: String = redis::cmd("TYPE").arg(&key).query_async(&mut c).await?;
+                    if exists == "none" {
+                        return Ok(None);
+                    }
+                }
+                return Ok(Some(Value::Stream(entries)));
+            }
+            KeyType::Json => {
+                let doc: Option<Vec<u8>> = redis::cmd("JSON.GET")
+                    .arg(&key)
+                    .arg(".")
+                    .query_async(&mut c)
+                    .await?;
+                let Some(doc) = doc else {
+                    return Ok(None);
+                };
+                return Ok(Some(Value::Json(
+                    serde_json::from_slice(&doc).context("the JSON document does not parse")?,
+                )));
+            }
+            KeyType::TimeSeries => {
+                let info: redis::Value =
+                    redis::cmd("TS.INFO").arg(&key).query_async(&mut c).await?;
+                let mut series = Series::default();
+                let fields: Vec<(String, redis::Value)> = match info {
+                    redis::Value::Map(pairs) => {
+                        pairs.into_iter().map(|(k, v)| (scalar(&k), v)).collect()
+                    }
+                    redis::Value::Array(items) => items
+                        .chunks(2)
+                        .filter_map(|p| match p {
+                            [k, v] => Some((scalar(k), v.clone())),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (name, value) in fields {
+                    match (name.as_str(), value) {
+                        ("retentionTime", redis::Value::Int(r)) if r > 0 => {
+                            series.retention_ms = Some(r as u64);
+                        }
+                        ("labels", redis::Value::Array(labels)) => {
+                            for label in labels {
+                                if let redis::Value::Array(pair) = label
+                                    && let [k, v] = pair.as_slice()
+                                {
+                                    series.labels.push((scalar(k), scalar(v)));
+                                }
+                            }
+                        }
+                        ("labels", redis::Value::Map(labels)) => {
+                            for (k, v) in labels {
+                                series.labels.push((scalar(&k), scalar(&v)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut from = "-".to_string();
+                loop {
+                    let chunk: Vec<(i64, f64)> = redis::cmd("TS.RANGE")
+                        .arg(&key)
+                        .arg(&from)
+                        .arg("+")
+                        .arg("COUNT")
+                        .arg(STEP)
+                        .query_async(&mut c)
+                        .await?;
+                    let short = chunk.len() < STEP;
+                    let last = chunk.last().map(|(t, _)| *t);
+                    series.samples.extend(chunk);
+                    match last {
+                        Some(t) if !short => from = (t + 1).to_string(),
+                        _ => break,
+                    }
+                }
+                Value::TimeSeries(series)
+            }
+            KeyType::VectorSet => {
+                let info: redis::Value = redis::cmd("VINFO").arg(&key).query_async(&mut c).await?;
+                let quant = flat_map(&info).get("quant-type").cloned();
+                let mut elements = Vec::new();
+                let mut start = b"-".to_vec();
+                loop {
+                    let members: Vec<Vec<u8>> = match redis::cmd("VRANGE")
+                        .arg(&key)
+                        .arg(&start)
+                        .arg("+")
+                        .arg(STEP)
+                        .query_async(&mut c)
+                        .await
+                    {
+                        Ok(members) => members,
+                        Err(e) if is_unknown_command(&e) => {
+                            return Err(Unreadable(
+                                "listing a whole vector set needs VRANGE (Redis 8.2+)".into(),
+                            )
+                            .into());
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    let short = members.len() < STEP;
+                    let mut vectors = redis::pipe();
+                    let mut attributes = redis::pipe();
+                    for m in &members {
+                        vectors.cmd("VEMB").arg(&key).arg(m);
+                        attributes.cmd("VGETATTR").arg(&key).arg(m);
+                    }
+                    let mut vecs: Vec<Option<Vec<f64>>> = Vec::new();
+                    let mut attrs: Vec<Option<Vec<u8>>> = Vec::new();
+                    if !members.is_empty() {
+                        vecs = vectors.query_async(&mut c).await?;
+                        attrs = attributes.query_async(&mut c).await?;
+                    }
+                    if let Some(last) = members.last() {
+                        start = [b"(".as_slice(), last].concat();
+                    }
+                    for ((element, vector), attrs) in members.into_iter().zip(vecs).zip(attrs) {
+                        // An element removed between VRANGE and VEMB.
+                        let Some(vector) = vector else { continue };
+                        elements.push(VectorElement {
+                            element,
+                            vector,
+                            attributes: attrs
+                                .and_then(|a| String::from_utf8(a).ok())
+                                .filter(|a| !a.is_empty()),
+                        });
+                    }
+                    if short {
+                        break;
+                    }
+                }
+                Value::VectorSet(VectorSet { quant, elements })
+            }
+            KeyType::Other => return Ok(None),
+        };
+        let empty = match &value {
+            Value::Hash(v) => v.is_empty(),
+            Value::List(v) | Value::Set(v) => v.is_empty(),
+            Value::ZSet(v) => v.is_empty(),
+            Value::VectorSet(v) => v.elements.is_empty(),
+            _ => false,
+        };
+        // Redis removes a collection with its last element: empty means gone.
+        Ok((!empty).then_some(value))
+    }
+
+    /// Write parsed import records. Without `replace` a key that already
+    /// exists stops the import with an error; with it the key is replaced.
+    ///
+    /// Every record is checked before anything is sent, and so is the
+    /// server's support for each type's commands, so a file the target cannot
+    /// hold fails whole. Then each key is written so a failure leaves the
+    /// existing key as it was. With `replace`, a key whose commands fit one
+    /// bounded pipeline goes out as one `MULTI` transaction, and a bigger one
+    /// is written in bounded pipelines under a temporary name in the same slot
+    /// and renamed into place at the end. A cluster runs no transactions, so
+    /// there every key takes the temporary name. Only when no such name can
+    /// be found is a key written in place, and a failure then says it is
+    /// partly written.
+    ///
+    /// Without `replace` the key is checked first, for a clear error, but the
+    /// write itself must not depend on that check still being true: another
+    /// client can create the key in between. `WATCH` cannot guard it, because
+    /// the connection is shared and multiplexed, so another caller's `EXEC`
+    /// or `UNWATCH` on it would silently drop the watch. So the write is
+    /// conditional on the server: a string is one `SET ... NX`, and anything
+    /// else is written under a temporary name and moved with `RENAMENX`.
+    pub async fn import_records(
+        &self,
+        records: &[crate::transfer::Record],
+        replace: bool,
+    ) -> Result<ImportReport> {
+        use crate::transfer::{Value, pipeline_chunks, validate, write_commands};
+        for (i, record) in records.iter().enumerate() {
+            validate(record)
+                .map_err(|e| anyhow!("entry {}: {e}, so nothing was imported", i + 1))?;
+        }
+        self.check_import_commands(records).await?;
+        let cluster = self.mgr.deployment() == Deployment::Cluster;
+        let mut c = self.mgr.clone();
+        let mut report = ImportReport::default();
+        for record in records {
+            let shown = encode_key(&record.key);
+            let writes = write_commands(record, &record.key);
+            if writes.is_empty() {
+                // Nothing to write: an empty collection, which Redis cannot hold.
+                report.skipped += 1;
+                continue;
+            }
+            if !replace {
+                let kind: String = redis::cmd("TYPE")
+                    .arg(&record.key)
+                    .query_async(&mut c)
+                    .await?;
+                anyhow::ensure!(
+                    kind == "none",
+                    "cannot import '{shown}': the key already exists; import with overwrite to replace it. {} key(s) were written before it",
+                    report.keys
+                );
+            }
+            // The writes and the TTL, plus one more: the DEL before them, or
+            // the RENAME or RENAMENX that moves a temporary key into place.
+            let mut sent = writes.len() + 1 + usize::from(record.ttl_ms.is_some());
+            let result = match &record.value {
+                Value::String(bytes) if !replace => {
+                    sent = 1;
+                    self.import_string_if_absent(record, bytes).await
+                }
+                _ if replace && !cluster && pipeline_chunks(&writes).len() == 1 => {
+                    self.import_in_transaction(record, writes, replace).await
+                }
+                _ => match self.temporary_name(&record.key).await {
+                    Ok(Some(temp)) => self.import_through(record, &temp, replace).await,
+                    Ok(None) if replace => self.import_in_place(record, writes, replace).await,
+                    Ok(None) => Err(anyhow!(
+                        "no unused temporary name was found to write it under, so nothing was written"
+                    )),
+                    Err(e) => Err(anyhow!(
+                        "{e}, while looking for a temporary name to write it under, so nothing was written"
+                    )),
+                },
+            };
+            result.map_err(|e| {
+                anyhow!(
+                    "cannot import '{shown}': {e}. {} key(s) were written before it",
+                    report.keys
+                )
+            })?;
+            report.keys += 1;
+            report.commands += sent as u64;
+        }
+        Ok(report)
+    }
+
+    /// A string that must not replace a key: `SET ... NX`, with the TTL in
+    /// the same command, so a key someone else created is never touched.
+    async fn import_string_if_absent(
+        &self,
+        record: &crate::transfer::Record,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut pipe = redis::pipe();
+        let cmd = pipe.cmd("SET").arg(&record.key).arg(bytes).arg("NX");
+        if let Some(ttl) = record.ttl_ms {
+            cmd.arg("PX").arg(ttl.max(1));
+        }
+        let results = self.mgr.pipeline_each(&pipe).await?;
+        match results.into_iter().next() {
+            Some(Ok(redis::Value::Nil)) => Err(anyhow!(
+                "the key was created by someone else while it was being imported, and was left as it is"
+            )),
+            Some(Ok(_)) => Ok(()),
+            // A refused SET sets nothing; a lost one may have set it.
+            Some(Err(e)) => Err(anyhow!("{e}{}", unchanged_unless_unknown(&e))),
+            None => Err(anyhow!("the server did not answer the write")),
+        }
+    }
+
+    /// Refuse, before anything is written, a file holding a type whose
+    /// commands this server does not have: a JSON document without RedisJSON
+    /// would otherwise fail only after its key had been deleted.
+    async fn check_import_commands(&self, records: &[crate::transfer::Record]) -> Result<()> {
+        use crate::transfer::Value;
+        let mut needed: Vec<(&str, &str)> = Vec::new();
+        for record in records {
+            let names: &[(&str, &str)] = match &record.value {
+                Value::Stream(_) => &[("XADD", "streams")],
+                Value::Json(_) => &[("JSON.SET", "JSON documents (RedisJSON)")],
+                Value::TimeSeries(_) => &[
+                    ("TS.CREATE", "time series (RedisTimeSeries)"),
+                    ("TS.MADD", "time series (RedisTimeSeries)"),
+                ],
+                Value::VectorSet(_) => &[("VADD", "vector sets (Redis 8)")],
+                _ => &[],
+            };
+            for name in names {
+                if !needed.contains(name) {
+                    needed.push(*name);
+                }
+            }
+        }
+        if needed.is_empty() {
+            return Ok(());
+        }
+        let mut probe = redis::cmd("COMMAND");
+        probe.arg("INFO");
+        for (name, _) in &needed {
+            probe.arg(*name);
+        }
+        let mut c = self.mgr.clone();
+        // A server that cannot answer COMMAND INFO is not refused on a guess.
+        let Ok(redis::Value::Array(info)) = probe.query_async::<redis::Value>(&mut c).await else {
+            return Ok(());
+        };
+        if info.len() != needed.len() {
+            return Ok(());
+        }
+        let missing: Vec<String> = needed
+            .iter()
+            .zip(&info)
+            .filter(|(_, i)| matches!(i, redis::Value::Nil))
+            .map(|((name, what), _)| format!("{name} for {what}"))
+            .collect();
+        anyhow::ensure!(
+            missing.is_empty(),
+            "the server has no {}, so nothing was imported",
+            missing.join(" or ")
+        );
+        Ok(())
+    }
+
+    /// One key as one `MULTI` transaction: `DEL`, the writes and the TTL. A
+    /// command the server refuses while queueing discards the whole thing.
+    async fn import_in_transaction(
+        &self,
+        record: &crate::transfer::Record,
+        writes: Vec<Vec<Vec<u8>>>,
+        replace: bool,
+    ) -> Result<()> {
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        if replace {
+            pipe.cmd("DEL").arg(&record.key);
+        }
+        for args in &writes {
+            pipe.add_command(args_cmd(args));
+        }
+        if let Some(ttl) = record.ttl_ms {
+            pipe.add_command(args_cmd(&crate::transfer::ttl_command(&record.key, ttl)));
+        }
+        let results = self.mgr.pipeline_each(&pipe).await?;
+        let queued = &results[1..results.len().saturating_sub(1)];
+        let old = if replace {
+            " and its old value is gone"
+        } else {
+            ""
+        };
+        // A refused MULTI leaves each command to run on its own, and an EXEC
+        // failing any way but EXECABORT proves nothing either.
+        if let Some(why) = results.iter().find_map(|r| r.as_ref().err())
+            && !topology::transaction_unrun(&results)
+        {
+            return Err(anyhow!(
+                "{why}; the server did not run the writes as one transaction, so they may have been partly or fully applied"
+            ));
+        }
+        match results.last() {
+            Some(Err(e)) => {
+                let why = queued
+                    .iter()
+                    .find_map(|r| r.as_ref().err())
+                    .map_or_else(|| e.to_string(), ToString::to_string);
+                Err(anyhow!(
+                    "{why}; the transaction was discarded, so the key was not changed"
+                ))
+            }
+            Some(Ok(redis::Value::Array(replies))) => {
+                match replies
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, r)| Some((i, nested_error(r)?)))
+                {
+                    None => Ok(()),
+                    // Only the TTL failed: the whole value is there.
+                    Some((i, why)) if record.ttl_ms.is_some() && i + 1 == replies.len() => {
+                        Err(anyhow!(
+                            "setting its TTL failed: {why}; the rest of the transaction ran, so the new value was written without its TTL{old}"
+                        ))
+                    }
+                    Some((i, why)) => Err(anyhow!(
+                        "command {} of {} failed: {why}; the rest of the transaction ran, so the key is partly written{old}",
+                        i + 1,
+                        replies.len(),
+                    )),
+                }
+            }
+            Some(Ok(redis::Value::Nil)) => Err(anyhow!(
+                "the server aborted the transaction, so the key was not changed"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// A name for writing `key` out of sight: unused, and on a cluster in the
+    /// same slot, so `RENAME` can move it into place. See [`temporary_name`].
+    /// `None` when no unused name turns up.
+    async fn temporary_name(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEMP: AtomicU64 = AtomicU64::new(0);
+        let cluster = self.mgr.deployment() == Deployment::Cluster;
+        let mut c = self.mgr.clone();
+        for _ in 0..3 {
+            // The pid and counter alone repeat across hosts and containers
+            // (every container can be pid 1), and two imports sharing a
+            // temporary key would mix their data. Random bits make that
+            // practically impossible.
+            let random = {
+                use std::hash::{BuildHasher, Hasher};
+                std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish()
+            };
+            let unique = format!(
+                "{}-{}-{random:016x}",
+                std::process::id(),
+                TEMP.fetch_add(1, Ordering::Relaxed)
+            );
+            let name = temporary_name(key, &unique, cluster);
+            let exists: i64 = redis::cmd("EXISTS").arg(&name).query_async(&mut c).await?;
+            if exists == 0 {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Write a record under `temp` in bounded pipelines, then move it into
+    /// place with its TTL. Until that last step the key itself is untouched.
+    async fn import_through(
+        &self,
+        record: &crate::transfer::Record,
+        temp: &[u8],
+        replace: bool,
+    ) -> Result<()> {
+        use crate::transfer::{pipeline_chunks, ttl_command, write_commands};
+        let cluster = self.mgr.deployment() == Deployment::Cluster;
+        let writes = write_commands(record, temp);
+        for chunk in pipeline_chunks(&writes) {
+            let mut pipe = redis::pipe();
+            for args in &writes[chunk] {
+                pipe.add_command(args_cmd(args));
+            }
+            if let Some(why) = batch_failure(self.mgr.pipeline_each(&pipe).await) {
+                return Err(anyhow!(
+                    "{why}; the key was not changed{}",
+                    self.drop_temporary(temp).await
+                ));
+            }
+        }
+        let mut pipe = redis::pipe();
+        // Standalone and Sentinel set the TTL and rename in one transaction;
+        // a cluster sends the two together to the one node that owns both.
+        if !cluster {
+            pipe.atomic();
+        }
+        if let Some(ttl) = record.ttl_ms {
+            pipe.add_command(args_cmd(&ttl_command(temp, ttl)));
+        }
+        pipe.cmd(if replace { "RENAME" } else { "RENAMENX" })
+            .arg(temp)
+            .arg(&record.key);
+        let results = match self.mgr.pipeline_each(&pipe).await {
+            Ok(results) => results,
+            // Refused, or lost on the way: the rename may not have run.
+            Err(e) => {
+                return Err(anyhow!(
+                    "{e}. If the rename did not run, the key was not changed, and the temporary key '{}' is left to delete",
+                    encode_key(temp)
+                ));
+            }
+        };
+        // Each command's own reply: a transaction wraps them in EXEC's, and
+        // an error outside that array means none of them ran.
+        let replies: Vec<redis::RedisResult<redis::Value>> = if cluster {
+            results
+        } else if let Some(why) = results.iter().find_map(|r| r.as_ref().err())
+            && !topology::transaction_unrun(&results)
+        {
+            // MULTI refused: the TTL and the rename ran, or not, on their own.
+            // The temporary name is this import's alone, so deleting it is
+            // safe whether or not the rename moved it.
+            return Err(anyhow!(
+                "{why}; the server did not run the TTL and rename as one transaction, so they may have been partly or fully applied{}",
+                self.drop_temporary(temp).await
+            ));
+        } else {
+            match results.last() {
+                Some(Ok(redis::Value::Array(replies))) => replies
+                    .iter()
+                    .map(|r| match r {
+                        redis::Value::ServerError(_) => r.clone().extract_error(),
+                        r => Ok(r.clone()),
+                    })
+                    .collect(),
+                _ => {
+                    let why = batch_failure(Ok(results))
+                        .unwrap_or_else(|| "the server aborted the transaction".into());
+                    return Err(anyhow!(
+                        "{why}; the key was not changed{}",
+                        self.drop_temporary(temp).await
+                    ));
+                }
+            }
+        };
+        let (ttl, renamed) = match replies.as_slice() {
+            [ttl, renamed] if record.ttl_ms.is_some() => (Some(ttl), renamed),
+            [renamed] if record.ttl_ms.is_none() => (None, renamed),
+            _ => {
+                return Err(anyhow!(
+                    "the server's reply to the rename did not have the expected shape, so whether the key changed is unknown; the temporary key '{}' may be left to delete",
+                    encode_key(temp)
+                ));
+            }
+        };
+        let why = |r: &redis::RedisResult<redis::Value>| match r {
+            Err(e) => Some(e.to_string()),
+            Ok(v) => nested_error(v),
+        };
+        // A rename lost on the way may have run: nothing more is sent.
+        if let Err(e) = renamed
+            && topology::outcome_unknown(e)
+        {
+            return Err(anyhow!(
+                "{e}; whether the rename ran is unknown, so the key may already hold the new value, or the temporary key '{}' may be left to delete",
+                encode_key(temp)
+            ));
+        }
+        // A rename that failed moved nothing, whatever happened to the TTL.
+        if let Some(why) = why(renamed) {
+            return Err(anyhow!(
+                "{why}; the key was not changed{}",
+                self.drop_temporary(temp).await
+            ));
+        }
+        if !replace && matches!(renamed, Ok(redis::Value::Int(0))) {
+            return Err(anyhow!(
+                "the key was created by someone else while it was being imported, and was left as it is{}",
+                self.drop_temporary(temp).await
+            ));
+        }
+        if let Some(why) = ttl.and_then(why) {
+            return Err(anyhow!(
+                "setting its TTL failed: {why}; the rename ran, so the new value is in place without its TTL{}",
+                if replace {
+                    " and its old value is gone"
+                } else {
+                    ""
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    /// Delete a temporary key after a failure, saying so if it could not be.
+    async fn drop_temporary(&self, temp: &[u8]) -> String {
+        let mut c = self.mgr.clone();
+        match redis::cmd("DEL").arg(temp).query_async::<i64>(&mut c).await {
+            Ok(_) => String::new(),
+            Err(e) => format!(
+                ", but the temporary key '{}' could not be deleted ({e})",
+                encode_key(temp)
+            ),
+        }
+    }
+
+    /// The last resort on a cluster: write the key in place, in bounded
+    /// pipelines, and say plainly how much of it a failure left behind.
+    async fn import_in_place(
+        &self,
+        record: &crate::transfer::Record,
+        writes: Vec<Vec<Vec<u8>>>,
+        replace: bool,
+    ) -> Result<()> {
+        use crate::transfer::{pipeline_chunks, ttl_command};
+        let mut all = Vec::with_capacity(writes.len() + 2);
+        if replace {
+            all.push(vec![b"DEL".to_vec(), record.key.clone()]);
+        }
+        all.extend(writes);
+        if let Some(ttl) = record.ttl_ms {
+            all.push(ttl_command(&record.key, ttl));
+        }
+        for (n, chunk) in pipeline_chunks(&all).into_iter().enumerate() {
+            let mut pipe = redis::pipe();
+            for args in &all[chunk] {
+                pipe.add_command(args_cmd(args));
+            }
+            if let Some(why) = batch_failure(self.mgr.pipeline_each(&pipe).await) {
+                let state = match (n, replace) {
+                    (0, false) => "the key may be partly written",
+                    (0, true) => "the key may have been deleted or partly written",
+                    (_, false) => "the key is partly written",
+                    (_, true) => "its old value was deleted and the key is partly written",
+                };
+                return Err(anyhow!("{why}; {state}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a parsed commands file. Consecutive lines for the same key go out
+    /// together, in bounded pipelines. A failing line stops the import, and
+    /// the error names it exactly, with how many commands ran before it and
+    /// how many after it in the same pipeline ran too, since the server had
+    /// them already.
+    pub async fn import_commands(
+        &self,
+        lines: &[crate::transfer::CommandLine],
+    ) -> Result<ImportReport> {
+        let mut report = ImportReport::default();
+        let mut keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut rest = lines;
+        while let Some(first) = rest.first() {
+            let key = &first.args[1];
+            let len = rest
+                .iter()
+                .take_while(|l| l.args.get(1) == Some(key))
+                .count();
+            let (group, tail) = rest.split_at(len);
+            let args: Vec<&[Vec<u8>]> = group.iter().map(|l| l.args.as_slice()).collect();
+            for chunk in crate::transfer::pipeline_chunks(&args) {
+                let batch = &group[chunk];
+                let mut pipe = redis::pipe();
+                for line in batch {
+                    pipe.add_command(args_cmd(&line.args));
+                }
+                let results = match self.mgr.pipeline_each(&pipe).await {
+                    Ok(results) => results,
+                    Err(e) => {
+                        let (a, b) = (batch[0].line, batch[batch.len() - 1].line);
+                        let at = if a == b {
+                            format!("line {a}")
+                        } else {
+                            format!("lines {a}-{b}")
+                        };
+                        anyhow::bail!("{at}: {e}. {} command(s) before it ran", report.commands);
+                    }
+                };
+                let failure = results.iter().enumerate().find_map(|(i, r)| match r {
+                    Err(e) => Some((i, e.to_string())),
+                    Ok(v) => Some((i, nested_error(v)?)),
+                });
+                if let Some((i, why)) = failure {
+                    report.commands += i as u64;
+                    let after = &results[i + 1..];
+                    let ran = after
+                        .iter()
+                        .filter(|r| r.as_ref().is_ok_and(|v| nested_error(v).is_none()))
+                        .count();
+                    let mut text = format!(
+                        "line {}: {why}. {} command(s) before it ran",
+                        batch[i].line, report.commands
+                    );
+                    if ran > 0 {
+                        text.push_str(&format!(
+                            ", and {ran} command(s) after it ran too, because they were sent in the same batch"
+                        ));
+                    }
+                    if ran < after.len() {
+                        text.push_str(&format!(
+                            "; {} more line(s) in that batch failed as well",
+                            after.len() - ran
+                        ));
+                    }
+                    anyhow::bail!(text);
+                }
+                report.commands += batch.len() as u64;
+                for line in batch {
+                    keys.extend(crate::transfer::command_keys(&line.args));
+                }
+                report.keys = keys.len() as u64;
+            }
+            rest = tail;
+        }
+        Ok(report)
+    }
+
+    /// Import whatever [`crate::transfer::parse`] made of a file.
+    pub async fn import_parsed(
+        &self,
+        parsed: &crate::transfer::Parsed,
+        replace: bool,
+    ) -> Result<ImportReport> {
+        use crate::transfer::Parsed;
+        match parsed {
+            Parsed::Dump(entries) => {
+                let keys = self.import_entries(entries, replace).await?;
+                Ok(ImportReport {
+                    keys,
+                    commands: keys,
+                    skipped: 0,
+                })
+            }
+            Parsed::Records(records, _) => self.import_records(records, replace).await,
+            Parsed::Commands(lines) => self.import_commands(lines).await,
+        }
     }
 
     /// Indexes this server knows about, when the search module is loaded.
@@ -3268,6 +4231,91 @@ impl Pace {
     }
 }
 
+/// The stream id just after `id`, for walking forwards with an exclusive
+/// start on servers older than 6.2, which have no `(id` syntax.
+fn next_stream_id(id: &str) -> Option<String> {
+    let (ms, seq) = id.split_once('-')?;
+    let (ms, seq): (u64, u64) = (ms.parse().ok()?, seq.parse().ok()?);
+    match (ms, seq) {
+        (m, u64::MAX) if m < u64::MAX => Some(format!("{}-0", m + 1)),
+        (_, u64::MAX) => None,
+        (m, s) => Some(format!("{m}-{}", s + 1)),
+    }
+}
+
+/// The first error inside a reply, at any depth: `EXEC` answers with each
+/// command's reply, and `TS.MADD` with each sample's.
+fn nested_error(value: &redis::Value) -> Option<String> {
+    match value {
+        redis::Value::ServerError(_) => value.clone().extract_error().err().map(|e| e.to_string()),
+        redis::Value::Array(items) | redis::Value::Set(items) => {
+            items.iter().find_map(nested_error)
+        }
+        redis::Value::Map(pairs) => pairs
+            .iter()
+            .find_map(|(k, v)| nested_error(k).or_else(|| nested_error(v))),
+        _ => None,
+    }
+}
+
+/// A temporary name for importing `key`: the key itself, then
+/// [`IMPORT_TEMP_MARKER`], then `unique`. Starting with the key keeps the name
+/// inside any ACL key pattern (`~app:*`) that lets the user write the key.
+///
+/// On a cluster the name must hash to the key's slot. A key with a hash tag
+/// keeps it as the name's first, so the plain name does. A key without one
+/// gets itself as a tag after the marker, `key:rediscope-import-tmp:{key}n`,
+/// which hashes like the key when the key has no braces of its own. Failing
+/// that, a short tag for the slot goes after the marker, and as a last resort
+/// before the key, where it always decides the slot.
+fn temporary_name(key: &[u8], unique: &str, cluster: bool) -> Vec<u8> {
+    let marker = IMPORT_TEMP_MARKER.as_bytes();
+    let plain = [key, marker, unique.as_bytes()].concat();
+    if !cluster {
+        return plain;
+    }
+    let slot = key_slot(key);
+    let tag = topology::slot_tags()[usize::from(slot)].to_string();
+    let tagged = |t: &[u8]| [key, marker, b"{", t, b"}", unique.as_bytes()].concat();
+    let first = [b"{", tag.as_bytes(), b"}", key, marker, unique.as_bytes()].concat();
+    [plain, tagged(key), tagged(tag.as_bytes())]
+        .into_iter()
+        .find(|name| key_slot(name) == slot)
+        .unwrap_or(first)
+}
+
+/// "; the key was not changed", for a write the server refused, and nothing
+/// for one whose outcome is unknown.
+fn unchanged_unless_unknown(e: &redis::RedisError) -> &'static str {
+    if topology::outcome_unknown(e) {
+        ""
+    } else {
+        "; the key was not changed"
+    }
+}
+
+/// Why a batch of writes did not all succeed, if it did not.
+fn batch_failure(
+    result: redis::RedisResult<Vec<redis::RedisResult<redis::Value>>>,
+) -> Option<String> {
+    match result {
+        Err(e) => Some(e.to_string()),
+        Ok(results) => results.iter().find_map(|r| match r {
+            Err(e) => Some(e.to_string()),
+            Ok(v) => nested_error(v),
+        }),
+    }
+}
+
+/// A command from raw arguments, the first being its name.
+fn args_cmd(args: &[Vec<u8>]) -> redis::Cmd {
+    let mut cmd = redis::Cmd::new();
+    for arg in args {
+        cmd.arg(arg.as_slice());
+    }
+    cmd
+}
+
 /// The stream id just before `id`, for walking backwards with an exclusive
 /// end on servers older than 6.2, which have no `(id` syntax.
 fn previous_stream_id(id: &str) -> Option<String> {
@@ -3683,6 +4731,30 @@ mod tests {
     }
 
     #[test]
+    fn a_temporary_name_starts_with_its_key_and_shares_its_slot() {
+        for key in [
+            "app:x", "{t}x", "x{t}y", "a{}", "{}", "a}b", "a{b", "}{", "", "a{b}c{d}",
+        ] {
+            let key = key.as_bytes();
+            let name = temporary_name(key, "7-1", false);
+            assert_eq!(name, [key, b":rediscope-import-tmp:7-1"].concat());
+            let name = temporary_name(key, "7-1", true);
+            assert_eq!(key_slot(&name), key_slot(key), "{:?}", encode_key(&name));
+            assert!(
+                encode_key(&name).contains("rediscope-import-tmp"),
+                "{:?}",
+                encode_key(&name)
+            );
+            // Only braces in the key itself can push the tag before it.
+            if !key.contains(&b'{') && !key.contains(&b'}') || topology::hash_tag(key).is_some() {
+                assert!(name.starts_with(key), "{:?}", encode_key(&name));
+            }
+        }
+        let name = temporary_name(b"app:x", "7-1", true);
+        assert_eq!(name, b"app:x:rediscope-import-tmp:{app:x}7-1");
+    }
+
+    #[test]
     fn a_config_value_that_is_a_list_does_not_lose_the_rest() {
         // KeyDB 6.3 answers `tls-allowlist` with an empty array.
         let reply = redis::Value::Array(vec![
@@ -3803,6 +4875,17 @@ mod tests {
         assert!(pace.room());
         pace.took(1, 100 * CHUNK_BYTES);
         assert!(!pace.room(), "the byte budget is spent");
+    }
+
+    #[test]
+    fn stream_ids_step_forward_across_the_millisecond() {
+        assert_eq!(next_stream_id("5-3").as_deref(), Some("5-4"));
+        assert_eq!(
+            next_stream_id(&format!("5-{}", u64::MAX)).as_deref(),
+            Some("6-0")
+        );
+        assert_eq!(next_stream_id(&format!("{0}-{0}", u64::MAX)), None);
+        assert_eq!(next_stream_id("junk"), None);
     }
 
     #[test]

@@ -48,7 +48,7 @@ impl Audit {
             .unwrap_or_else(|| crate::config::config_file().with_file_name("audit.jsonl"));
         Self::at(p, path)
     }
-    fn at(p: &Connection, path: PathBuf) -> Result<Self> {
+    pub(crate) fn at(p: &Connection, path: PathBuf) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Cannot create the audit directory {}", parent.display())
@@ -143,6 +143,7 @@ pub(crate) fn command(cmd: &redis::Cmd) -> (&'static str, Option<usize>) {
         b"DEL" => ("DEL", Some(args.len().saturating_sub(1))),
         b"UNLINK" => ("UNLINK", Some(args.len().saturating_sub(1))),
         b"EXPIRE" => ("EXPIRE", Some(1)),
+        b"PEXPIRE" => ("PEXPIRE", Some(1)),
         b"PERSIST" => ("PERSIST", Some(1)),
         b"RENAME" | b"RENAMENX" => ("RENAME", Some(2)),
         b"RESTORE" => ("RESTORE", Some(1)),
@@ -160,6 +161,7 @@ pub(crate) fn command(cmd: &redis::Cmd) -> (&'static str, Option<usize>) {
         b"FLUSHALL" => ("FLUSHALL", None),
         b"SHUTDOWN" => ("SHUTDOWN", None),
         b"JSON.SET" => ("JSON.SET", Some(1)),
+        b"TS.CREATE" => ("TS.CREATE", Some(1)),
         b"TS.ADD" => ("TS.ADD", Some(1)),
         b"TS.DEL" => ("TS.DEL", Some(1)),
         b"VADD" => ("VADD", Some(1)),

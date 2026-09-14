@@ -15,7 +15,15 @@ use ratatui::backend::CrosstermBackend;
 
 use rediscope::app::{App, Msg};
 use rediscope::config::{self, Connection, Store};
+use rediscope::transfer::Format;
 use rediscope::{headless, ui};
+
+fn parse_format(name: &str) -> Result<Format, String> {
+    Format::parse(name).ok_or_else(|| {
+        let names: Vec<&str> = Format::ALL.iter().map(|f| f.name()).collect();
+        format!("expected one of {}", names.join(", "))
+    })
+}
 
 /// A terminal UI Redis client: browse keys as a tree, edit every value type,
 /// run raw commands.
@@ -131,18 +139,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Write keys and their TTLs to a file, as DUMP payloads.
+    /// Write keys and their TTLs to a file.
     Export {
         #[arg(long, default_value = "*")]
         pattern: String,
         /// Output file, or `-` for stdout.
         #[arg(long, default_value = "-")]
         out: String,
-    },
-    /// Restore keys from a file written by `export`.
-    Import {
+        /// dump (DUMP payloads), json, jsonl, csv or commands (redis-cli).
+        #[arg(long, default_value = "dump", value_parser = parse_format)]
+        format: Format,
+        /// With --format commands: write DEL before each key.
         #[arg(long)]
-        file: String,
+        replace: bool,
+    },
+    /// Write a file made by `export` back, detecting its format.
+    Import {
+        /// The file to import.
+        #[arg(
+            value_name = "FILE",
+            required_unless_present = "file",
+            conflicts_with = "file"
+        )]
+        path: Option<String>,
+        /// The file to import, as a flag.
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
         /// Overwrite keys that already exist.
         #[arg(long)]
         replace: bool,
@@ -263,13 +285,20 @@ async fn main() -> Result<()> {
         }
         return match command {
             Command::Keys { pattern, json } => headless::keys(conn, pattern, *json).await,
-            Command::Export { pattern, out } => headless::export(conn, pattern, out).await,
+            Command::Export {
+                pattern,
+                out,
+                format,
+                replace,
+            } => headless::export(conn, pattern, out, *format, *replace).await,
             Command::Import {
+                path,
                 file,
                 replace,
                 unlock_production,
                 confirm_production,
             } => {
+                let file = path.as_deref().or(file.as_deref()).unwrap_or_default();
                 headless::import_confirmed(
                     conn,
                     file,

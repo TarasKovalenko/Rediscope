@@ -1467,3 +1467,160 @@ async fn diagnostics_that_could_not_be_read_say_why_on_every_tab() {
         assert!(!text.contains("nothing has crossed"), "{tab}:\n{text}");
     }
 }
+
+#[test]
+fn the_export_form_picks_a_format_and_draws_at_every_size() {
+    let mut a = app();
+    populate(&mut a);
+    press(&mut a, KeyCode::Char('w'));
+    let Some(Modal::Form { title, fields, .. }) = &a.modal else {
+        panic!("w should open the export form");
+    };
+    assert_eq!(title, "Export 4 key(s)");
+    let labels: Vec<&str> = fields.iter().map(|f| f.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "File",
+            "Format",
+            "Commands format: DEL each key before writing it"
+        ]
+    );
+    // DUMP stays the default, so Enter does what it always did.
+    assert_eq!(fields[1].choice, 0);
+    let text = render_text(&mut a, 120, 40);
+    assert!(
+        text.contains("[dump]") && text.contains(" jsonl "),
+        "{text}"
+    );
+    render_all_sizes(&mut a);
+
+    // The arrows cycle the format, both ways, wrapping at either end.
+    press(&mut a, KeyCode::Tab);
+    for expected in ["json", "jsonl", "csv", "commands", "dump", "json"] {
+        press(&mut a, KeyCode::Right);
+        let text = render_text(&mut a, 120, 40);
+        assert!(
+            text.contains(&format!("[{expected}]")),
+            "{expected}: {text}"
+        );
+    }
+    press(&mut a, KeyCode::Left);
+    press(&mut a, KeyCode::Left);
+    assert!(render_text(&mut a, 120, 40).contains("[commands]"));
+    press(&mut a, KeyCode::Tab);
+    press(&mut a, KeyCode::Char(' '));
+    let Some(Modal::Form { fields, focus, .. }) = &a.modal else {
+        panic!("the form closed");
+    };
+    assert_eq!((*focus, fields[2].flag), (2, true));
+    render_all_sizes(&mut a);
+    // Enter without a live connection closes the form and writes nothing.
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none());
+    render_all_sizes(&mut a);
+
+    // Marked keys narrow what is exported.
+    press(&mut a, KeyCode::Char('m'));
+    press(&mut a, KeyCode::Char('w'));
+    let Some(Modal::Form { title, .. }) = &a.modal else {
+        panic!("w should open the export form");
+    };
+    assert!(
+        title.starts_with("Export ") && title != "Export 4 key(s)",
+        "{title}"
+    );
+    press(&mut a, KeyCode::Esc);
+
+    // The import form says it reads every format.
+    press(&mut a, KeyCode::Char('I'));
+    let Some(Modal::Form { hint, fields, .. }) = &a.modal else {
+        panic!("I should open the import form");
+    };
+    assert!(
+        hint.contains("JSON Lines, CSV or redis-cli commands"),
+        "{hint}"
+    );
+    assert_eq!(fields.len(), 2);
+    render_all_sizes(&mut a);
+}
+
+#[test]
+fn the_export_form_keeps_its_fields_reachable_when_small() {
+    let mut a = app();
+    populate(&mut a);
+    press(&mut a, KeyCode::Char('w'));
+    let small = render_text(&mut a, 40, 12);
+    assert!(
+        small.contains("File") && small.contains("Format"),
+        "{small}"
+    );
+    // The arrows edit the file name while it has focus, not the format.
+    press(&mut a, KeyCode::Right);
+    press(&mut a, KeyCode::Left);
+    assert!(render_text(&mut a, 120, 40).contains("[dump]"));
+    // On the format, Left from the first wraps to the last.
+    press(&mut a, KeyCode::Tab);
+    press(&mut a, KeyCode::Left);
+    assert!(render_text(&mut a, 120, 40).contains("[commands]"));
+    for (w, h) in [(10, 5), (40, 12), (120, 40)] {
+        render_text(&mut a, w, h);
+    }
+    // The last field scrolls into view on a short terminal.
+    press(&mut a, KeyCode::Tab);
+    let small = render_text(&mut a, 40, 12);
+    assert!(small.contains("Commands format: DEL"), "{small}");
+    assert!(small.contains("[ ] off"), "{small}");
+    press(&mut a, KeyCode::Char(' '));
+    assert!(
+        render_text(&mut a, 40, 12).contains("[x] on"),
+        "{}",
+        render_text(&mut a, 40, 12)
+    );
+    for (w, h) in [(10, 5), (40, 12), (120, 40)] {
+        render_text(&mut a, w, h);
+    }
+    // Closing forgets the choice: the next export starts from dump again.
+    press(&mut a, KeyCode::Esc);
+    assert!(a.modal.is_none());
+    press(&mut a, KeyCode::Char('w'));
+    let Some(Modal::Form { fields, .. }) = &a.modal else {
+        panic!("w should open the export form");
+    };
+    assert_eq!((fields[1].choice, fields[2].flag), (0, false));
+    assert_eq!(fields[0].input.value(), rediscope::app::EXPORT_FILE);
+}
+
+#[test]
+fn the_export_form_shows_the_whole_format_and_when_the_switch_is_unused() {
+    let mut a = app();
+    populate(&mut a);
+    press(&mut a, KeyCode::Char('w'));
+    press(&mut a, KeyCode::Tab);
+    // Too narrow for every option: the chosen one is still shown whole.
+    for (rights, name) in [(0, "dump"), (2, "jsonl"), (2, "commands")] {
+        for _ in 0..rights {
+            press(&mut a, KeyCode::Right);
+        }
+        let small = render_text(&mut a, 40, 12);
+        assert!(small.contains(&format!("[{name}]")), "{name}: {small}");
+        assert!(
+            render_text(&mut a, 120, 40).contains(" json "),
+            "every option fits a wide terminal"
+        );
+    }
+    // The DEL switch says it does nothing for any format but commands.
+    press(&mut a, KeyCode::Tab);
+    let text = render_text(&mut a, 40, 12);
+    assert!(
+        text.contains("[ ] off") && !text.contains("unused"),
+        "{text}"
+    );
+    press(&mut a, KeyCode::BackTab);
+    press(&mut a, KeyCode::Right);
+    let text = render_text(&mut a, 40, 30);
+    assert!(text.contains("unused with dump"), "{text}");
+    for (w, h) in [(10, 5), (40, 12), (120, 40)] {
+        render_text(&mut a, w, h);
+    }
+}

@@ -1005,45 +1005,63 @@ fn form(f: &mut Frame, area: Rect, view: FormView<'_>, palette: Palette) {
         } else {
             palette.panel
         };
+        // Inside the field's rounded border.
+        let room = row.width.saturating_sub(2) as usize;
         let content = match &field.kind {
             FieldKind::Secret => "•".repeat(field.value().chars().count()),
-            FieldKind::Bool => {
-                if field.flag {
-                    "[x] on   (space toggles)".into()
+            FieldKind::Bool => match (field.flag, &field.note) {
+                (true, None) => "[x] on   (space toggles)".into(),
+                (false, None) => "[ ] off  (space toggles)".into(),
+                (true, Some(note)) => format!("[x] on   ({note})"),
+                (false, Some(note)) => format!("[ ] off  ({note})"),
+            },
+            FieldKind::Choice(opts) => {
+                let all = opts
+                    .iter()
+                    .enumerate()
+                    .map(|(j, o)| {
+                        if j == field.choice {
+                            format!("[{o}]")
+                        } else {
+                            format!(" {o} ")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if all.chars().count() <= room {
+                    all
                 } else {
-                    "[ ] off  (space toggles)".into()
+                    // Too narrow for every option: the chosen one, whole,
+                    // with arrows saying there are more either side.
+                    let chosen = opts.get(field.choice).cloned().unwrap_or_default();
+                    format!("‹ [{chosen}] ›  {}/{}", field.choice + 1, opts.len())
                 }
             }
-            FieldKind::Choice(opts) => opts
-                .iter()
-                .enumerate()
-                .map(|(j, o)| {
-                    if j == field.choice {
-                        format!("[{o}]")
-                    } else {
-                        format!(" {o} ")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
             FieldKind::Text => field.value(),
             FieldKind::Section => unreachable!("handled above"),
         };
+        let dimmed = matches!(field.kind, FieldKind::Bool) && field.note.is_some();
         f.render_widget(
-            Paragraph::new(content).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::new().fg(border))
-                    .title(Span::styled(
-                        format!(" {} ", field.label),
-                        if active {
-                            Style::new().fg(palette.accent).bold()
-                        } else {
-                            Style::new().fg(palette.dim)
-                        },
-                    )),
-            ),
+            Paragraph::new(content)
+                .style(if dimmed {
+                    Style::new().fg(palette.dim)
+                } else {
+                    Style::new()
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::new().fg(border))
+                        .title(Span::styled(
+                            format!(" {} ", field.label),
+                            if active {
+                                Style::new().fg(palette.accent).bold()
+                            } else {
+                                Style::new().fg(palette.dim)
+                            },
+                        )),
+                ),
             row,
         );
         if active && matches!(field.kind, FieldKind::Text | FieldKind::Secret) {
@@ -2463,7 +2481,7 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         row("C", "copy a key elsewhere (name, database or server)"),
         row(
             "w / I",
-            "export the marked keys to a file · import one back",
+            "export the marked keys (dump, JSON, CSV, commands) · import a file back",
         ),
         row(
             "r",
