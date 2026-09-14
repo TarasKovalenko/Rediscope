@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: TarasKovalenko.Rediscope
+PackageVersion: "@VERSION@"
+PackageLocale: en-US
+Publisher: Taras Kovalenko
+PublisherUrl: https://github.com/TarasKovalenko
+PublisherSupportUrl: https://github.com/TarasKovalenko/Rediscope/issues
+Author: Taras Kovalenko
+PackageName: rediscope
+PackageUrl: https://github.com/TarasKovalenko/Rediscope
+License: MIT
+LicenseUrl: https://github.com/TarasKovalenko/Rediscope/blob/main/LICENSE
+ShortDescription: Terminal UI client for Redis, Valkey, KeyDB and Dragonfly.
+Description: |-
+  Browse the keyspace as a folder tree, read and edit every value type, watch
+  TTLs count down, find out which prefix is using the memory, and run raw
+  commands in a console. Works with Redis, Valkey, KeyDB and Dragonfly.
+Moniker: rediscope
+Tags:
+  - redis
+  - valkey
+  - tui
+  - terminal
+  - database
+  - cli
+ReleaseNotesUrl: https://github.com/TarasKovalenko/Rediscope/releases/tag/@TAG@
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

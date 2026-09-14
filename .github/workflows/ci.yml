@@ -172,3 +172,24 @@ jobs:
       - name: Server log
         if: always()
         run: docker logs server 2>&1 | tail -n 50
+
+  # The release workflow renders these manifests with the same script, so a
+  # broken template shows up here instead of after a tag is pushed.
+  packaging:
+    name: packaging manifests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check shell syntax
+        run: |
+          sh -n scripts/render-packaging.sh
+          sh -n scripts/check-packaging.sh
+          sh -n install.sh
+      - name: Render and validate manifests
+        env:
+          PACKAGING_REQUIRE_TOOLS: 1
+        run: sh scripts/check-packaging.sh

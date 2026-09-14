@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: TarasKovalenko.Rediscope
+PackageVersion: "@VERSION@"
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: rediscope.exe
+    PortableCommandAlias: rediscope
+Commands:
+  - rediscope
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/TarasKovalenko/Rediscope/releases/download/@TAG@/rediscope-@TAG@-x86_64-pc-windows-msvc.zip
+    InstallerSha256: "@SHA256_WINDOWS_X64_UPPER@"
+  - Architecture: arm64
+    InstallerUrl: https://github.com/TarasKovalenko/Rediscope/releases/download/@TAG@/rediscope-@TAG@-aarch64-pc-windows-msvc.zip
+    InstallerSha256: "@SHA256_WINDOWS_ARM64_UPPER@"
+ManifestType: installer
+ManifestVersion: 1.6.0
