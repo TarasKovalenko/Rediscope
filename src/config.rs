@@ -19,6 +19,19 @@ fn default_ssh_port() -> u16 {
     22
 }
 
+/// What the key tree splits names on when a profile does not say.
+pub const DEFAULT_SEPARATOR: &str = ":";
+
+fn default_separator() -> String {
+    DEFAULT_SEPARATOR.to_string()
+}
+
+/// `:` is what every file written before separators existed means, and an
+/// empty value reads as `:` too, so neither is written back.
+fn is_default_separator(separator: &str) -> bool {
+    separator.is_empty() || separator == DEFAULT_SEPARATOR
+}
+
 /// Discovery mode. Older profiles remain standalone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,6 +193,15 @@ pub struct Connection {
     #[serde(default)]
     pub read_only: bool,
 
+    /// What splits key names into folders in the key tree, the memory report
+    /// and everything else that treats a name as a path. Any non-empty
+    /// string; only written to the file when it is not `:`.
+    #[serde(
+        default = "default_separator",
+        skip_serializing_if = "is_default_separator"
+    )]
+    pub separator: String,
+
     /// Reach the server through `ssh -L`, e.g. a bastion in front of a managed
     /// cache. Empty means a direct connection.
     #[serde(default)]
@@ -217,6 +239,7 @@ impl Default for Connection {
             tls_key_file: String::new(),
             tls_insecure: false,
             read_only: false,
+            separator: default_separator(),
             ssh_host: String::new(),
             ssh_user: String::new(),
             ssh_port: default_ssh_port(),
@@ -252,6 +275,16 @@ impl Connection {
             .as_deref()
             .map(str::trim)
             .filter(|g| !g.is_empty())
+    }
+
+    /// The separator the key tree uses for this profile. An empty value, which
+    /// only a hand-edited file can hold, means the default.
+    pub fn key_separator(&self) -> &str {
+        if self.separator.is_empty() {
+            DEFAULT_SEPARATOR
+        } else {
+            &self.separator
+        }
     }
 
     /// True when this profile reaches the server through an SSH tunnel.
@@ -971,6 +1004,38 @@ mod tests {
     }
 
     #[test]
+    fn a_key_separator_is_written_only_when_it_is_not_a_colon() {
+        let mut env = ScopedEnv::new();
+        let dir = tempdir();
+        env.set("REDISCOPE_HOME", &dir);
+        fs::write(
+            config_file(),
+            r#"{"connections":[{"name":"plain"},{"name":"blank","separator":""},{"name":"slash","separator":"/"}]}"#,
+        )
+        .unwrap();
+        let (store, notice) = Store::load();
+        assert!(notice.is_none(), "{notice:?}");
+        let seps: Vec<&str> = store
+            .connections
+            .iter()
+            .map(|c| c.key_separator())
+            .collect();
+        assert_eq!(seps, [":", ":", "/"]);
+
+        store.save().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_file()).unwrap()).unwrap();
+        let written: Vec<Option<&str>> = json["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.get("separator").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(written, [None, None, Some("/")]);
+        assert_eq!(Connection::default().key_separator(), ":");
+    }
+
+    #[test]
     fn tilde_expands_with_either_separator() {
         let home = dirs::home_dir().expect("a home directory");
         assert_eq!(expand_home("~/certs/ca.pem"), home.join("certs/ca.pem"));
@@ -1263,6 +1328,7 @@ mod tests {
             "connection_view",
             "collapsed_groups",
             "\"socket\"",
+            "\"separator\"",
         ] {
             assert!(!text.contains(key), "{key} written: {text}");
         }

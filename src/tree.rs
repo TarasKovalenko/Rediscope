@@ -1,7 +1,8 @@
-//! Namespace tree over key names split on `:`, plus a flattened view for
-//! rendering. Expansion state lives outside the tree (keyed by folder path) so
-//! it survives a rescan.
+//! Namespace tree over key names split on a separator (`:` unless the profile
+//! says otherwise), plus a flattened view for rendering. Expansion state lives
+//! outside the tree (keyed by folder path) so it survives a rescan.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
@@ -45,18 +46,28 @@ struct Builder {
 }
 
 impl Tree {
-    pub fn build(keys: &[KeyInfo]) -> Self {
+    /// Group `keys` into folders on `separator`. A folder's path is its
+    /// segments joined with the same separator, so it reads as a key prefix.
+    pub fn build(keys: &[KeyInfo], separator: &str) -> Self {
+        let separator = effective(separator);
+        let separator = separator.as_ref();
         let mut root = Builder::default();
         for k in keys {
-            let parts: Vec<&str> = k.name.split(':').collect();
             let mut cur = &mut root;
-            for part in &parts[..parts.len().saturating_sub(1)] {
-                cur = cur.folders.entry((*part).to_string()).or_default();
+            if let Some((folders, _)) = split_last(&k.name, separator) {
+                for part in folders.split(separator) {
+                    // Looked up before inserting, so a folder already seen
+                    // costs no allocation for its name.
+                    if !cur.folders.contains_key(part) {
+                        cur.folders.insert(part.to_string(), Builder::default());
+                    }
+                    cur = cur.folders.get_mut(part).expect("inserted above");
+                }
             }
             cur.leaves.push(k.clone());
         }
         Self {
-            roots: finish(root, ""),
+            roots: finish(root, None, separator),
         }
     }
 
@@ -75,15 +86,44 @@ impl Tree {
     }
 }
 
-fn finish(b: Builder, prefix: &str) -> Vec<Node> {
+/// The separator as it appears in a key name. An empty one would split
+/// between every character, so it means the default. Names reach the tree
+/// through [`encode_key`](crate::redis_client::encode_key), which doubles a
+/// literal backslash, so a separator holding one is matched in that same
+/// doubled form.
+pub fn effective(separator: &str) -> Cow<'_, str> {
+    if separator.is_empty() {
+        Cow::Borrowed(":")
+    } else if separator.contains('\\') {
+        Cow::Owned(separator.replace('\\', "\\\\"))
+    } else {
+        Cow::Borrowed(separator)
+    }
+}
+
+/// `name` cut at the last separator a left-to-right split finds, as the path
+/// of the folder the key is drawn in and the key's label. `None` for a name
+/// at the root. `separator` is already [`effective`].
+///
+/// This is not `rsplit_once`: a separator that can overlap itself, such as
+/// `::` in `a:::b`, splits into `a` and `:b` from the left but `a:` and `b`
+/// from the right, and the tree splits from the left.
+pub fn split_last<'a>(name: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
+    let (at, _) = name.match_indices(separator).last()?;
+    Some((&name[..at], &name[at + separator.len()..]))
+}
+
+/// `parent` is the path of the folder these nodes sit in, `None` at the root.
+/// It cannot be an empty string for the root, since a folder may have an
+/// empty name (a key starting with the separator).
+fn finish(b: Builder, parent: Option<&str>, separator: &str) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::new();
     for (name, child) in b.folders {
-        let path = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}:{name}")
+        let path = match parent {
+            None => name.clone(),
+            Some(parent) => format!("{parent}{separator}{name}"),
         };
-        let children = finish(child, &path);
+        let children = finish(child, Some(&path), separator);
         let leaves = children
             .iter()
             .map(|c| match c {
@@ -101,7 +141,9 @@ fn finish(b: Builder, prefix: &str) -> Vec<Node> {
     let mut leaves: Vec<KeyInfo> = b.leaves;
     leaves.sort_by(|a, b| a.name.cmp(&b.name));
     for k in leaves {
-        let label = k.name.rsplit(':').next().unwrap_or(&k.name).to_string();
+        let label = split_last(&k.name, separator)
+            .map_or(k.name.as_str(), |(_, label)| label)
+            .to_string();
         out.push(Node::Leaf { label, key: k });
     }
     out
@@ -165,7 +207,10 @@ mod tests {
 
     #[test]
     fn groups_by_namespace_and_counts_leaves() {
-        let tree = Tree::build(&[key("user:1"), key("user:2"), key("session:a"), key("flat")]);
+        let tree = Tree::build(
+            &[key("user:1"), key("user:2"), key("session:a"), key("flat")],
+            ":",
+        );
         let mut open = HashSet::new();
         let rows = tree.visible(&open);
         // Two collapsed folders plus the flat key.
@@ -184,9 +229,59 @@ mod tests {
 
     #[test]
     fn nests_deeply_and_lists_folder_paths() {
-        let tree = Tree::build(&[key("a:b:c:1")]);
+        let tree = Tree::build(&[key("a:b:c:1")], ":");
         let mut paths = tree.all_folder_paths();
         paths.sort();
         assert_eq!(paths, vec!["a", "a:b", "a:b:c"]);
+    }
+
+    fn labels(tree: &Tree) -> Vec<String> {
+        let all: HashSet<String> = tree.all_folder_paths().into_iter().collect();
+        tree.visible(&all).into_iter().map(|r| r.label).collect()
+    }
+
+    #[test]
+    fn any_separator_splits_the_tree_and_joins_the_paths() {
+        let names = ["app/user/1", "app/user/2", "app/queue", "a:b"];
+        let keys: Vec<KeyInfo> = names.iter().map(|n| key(n)).collect();
+        let tree = Tree::build(&keys, "/");
+        let mut paths = tree.all_folder_paths();
+        paths.sort();
+        assert_eq!(paths, ["app", "app/user"]);
+        // A colon is just a character once the separator is something else.
+        assert_eq!(labels(&tree), ["app", "user", "1", "2", "queue", "a:b"]);
+
+        for (sep, names, want) in [
+            (".", ["com.example.api", "com.example.web"], "com.example"),
+            (
+                "::",
+                ["crate::mod::Item", "crate::mod::Other"],
+                "crate::mod",
+            ),
+            ("|", ["tenant|42|cart", "tenant|42|seen"], "tenant|42"),
+            // A glob character is only a character here.
+            ("*", ["a*b*c", "a*b*d"], "a*b"),
+        ] {
+            let keys: Vec<KeyInfo> = names.iter().map(|n| key(n)).collect();
+            let tree = Tree::build(&keys, sep);
+            assert!(tree.all_folder_paths().contains(&want.to_string()), "{sep}");
+            let rows = tree.visible(&tree.all_folder_paths().into_iter().collect());
+            let leaf = rows.iter().find(|r| r.key.is_some()).unwrap();
+            assert_eq!(leaf.key.as_ref().unwrap().name, names[0], "{sep}");
+            assert!(!leaf.label.contains(sep), "{sep}: {}", leaf.label);
+        }
+    }
+
+    #[test]
+    fn a_multi_character_separator_is_matched_whole() {
+        let tree = Tree::build(&[key("a:b::c"), key("a:b::d")], "::");
+        assert_eq!(tree.all_folder_paths(), ["a:b"]);
+        assert_eq!(labels(&tree), ["a:b", "c", "d"]);
+    }
+
+    #[test]
+    fn an_empty_separator_means_the_default() {
+        let tree = Tree::build(&[key("user:1")], "");
+        assert_eq!(tree.all_folder_paths(), ["user"]);
     }
 }

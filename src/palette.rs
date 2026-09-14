@@ -139,6 +139,10 @@ pub struct PaletteState {
     /// How many candidates matched, including those past [`RESULT_LIMIT`].
     pub matches: usize,
     pub commands: &'static [Command],
+    /// The open profile's key separator, as it appears in an encoded name. A
+    /// character right after the whole of it starts a word in a key name,
+    /// like one after `:` does.
+    pub separator: String,
 }
 
 impl PaletteState {
@@ -149,6 +153,7 @@ impl PaletteState {
             hits: Vec::new(),
             matches: 0,
             commands,
+            separator: String::new(),
         }
     }
 
@@ -185,7 +190,7 @@ impl PaletteState {
         // An empty query lists the actions; keys only appear once asked for.
         if !query.is_empty() {
             for (name, kind) in keys {
-                if let Some((score, matched)) = fuzzy(query, name) {
+                if let Some((score, matched)) = fuzzy_split(query, name, &self.separator) {
                     hits.push(Hit {
                         target: Target::Key {
                             name: name.to_string(),
@@ -230,12 +235,20 @@ impl PaletteState {
 /// score well; gaps and a long text cost a little. An empty query matches
 /// everything with score 0. Returns the score and the matched char indices.
 pub fn fuzzy(query: &str, text: &str) -> Option<(i64, Vec<usize>)> {
+    fuzzy_split(query, text, "")
+}
+
+/// [`fuzzy`], also counting a character right after a whole `separator` as
+/// the start of a word, for key names split on something the usual
+/// boundaries do not cover.
+pub fn fuzzy_split(query: &str, text: &str, separator: &str) -> Option<(i64, Vec<usize>)> {
     if query.is_empty() {
         return Some((0, Vec::new()));
     }
     let text: Vec<char> = text.chars().collect();
     let lower: Vec<char> = text.iter().map(|c| fold(*c)).collect();
     let query: Vec<char> = query.chars().map(fold).collect();
+    let separator: Vec<char> = separator.chars().collect();
     if query.len() > text.len() {
         return None;
     }
@@ -259,7 +272,7 @@ pub fn fuzzy(query: &str, text: &str) -> Option<(i64, Vec<usize>)> {
             if lower[i] != qc {
                 continue;
             }
-            let bonus = position_bonus(&text, i);
+            let bonus = position_bonus(&text, i, &separator);
             if j == 0 {
                 // Where the match starts matters, less so at a word boundary.
                 let late = (i as i64).min(15);
@@ -306,12 +319,14 @@ fn fold(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-fn position_bonus(text: &[char], i: usize) -> i64 {
+fn position_bonus(text: &[char], i: usize, separator: &[char]) -> i64 {
     if i == 0 {
         return 12;
     }
     let before = text[i - 1];
-    if matches!(before, ':' | '_' | '-' | '.' | '/' | ' ' | '|') {
+    if matches!(before, ':' | '_' | '-' | '.' | '/' | ' ' | '|')
+        || after_separator(text, i, separator)
+    {
         10
     } else if before.is_lowercase() && text[i].is_uppercase() {
         // camelCase boundary.
@@ -319,6 +334,12 @@ fn position_bonus(text: &[char], i: usize) -> i64 {
     } else {
         0
     }
+}
+
+/// Whether `text[..i]` ends with the whole of `separator`. Only one of its
+/// characters is not enough: with `=>`, the `x` in `a>x` starts no word.
+fn after_separator(text: &[char], i: usize, separator: &[char]) -> bool {
+    !separator.is_empty() && i >= separator.len() && text[i - separator.len()..i] == *separator
 }
 
 /// How far an action is ranked ahead of a key matching as well.
@@ -369,6 +390,40 @@ mod tests {
         // The first `p` is mid-word; the one after the colon scores better.
         let (_, at) = fuzzy("pro", "app:profile").unwrap();
         assert_eq!(at, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn the_profile_separator_counts_as_a_word_boundary() {
+        // `#` is no boundary by default, so `c` after it scores as mid-word.
+        let plain = score("uc", "user#cart");
+        let split = fuzzy_split("uc", "user#cart", "#").unwrap().0;
+        assert!(split > plain, "{split} <= {plain}");
+        let mut p = PaletteState::new(BROWSER);
+        p.separator = "#".into();
+        p.input.set("uc");
+        p.refresh(keys(&["user#cart", "cute"]), []);
+        let first_key = p
+            .hits
+            .iter()
+            .find(|h| matches!(h.target, Target::Key { .. }))
+            .unwrap();
+        assert_eq!(first_key.text, "user#cart");
+    }
+
+    #[test]
+    fn only_a_whole_multi_character_separator_is_a_word_boundary() {
+        let mid = |text: &str| fuzzy_split("c", text, "=>").unwrap().0;
+        // Same length, so only the boundary bonus differs.
+        assert!(mid("ab=>c") > mid("ab>=c"));
+        assert_eq!(
+            mid("abx>c"),
+            mid("ab>=c"),
+            "one character of it is no boundary"
+        );
+        assert_eq!(
+            fuzzy_split("c", "ab>c", "=>").unwrap().0,
+            score("c", "ab>c")
+        );
     }
 
     #[test]

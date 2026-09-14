@@ -98,7 +98,7 @@ rediscope -H 127.0.0.1 -p 6379
 Your first minute, in order:
 
 1. The key tree fills on the left. Keys split on `:`, so `user:42:profile` sits
-   under `user` → `42`. Move with `j` / `k`, open a folder with `Enter` or `l`.
+   under `user` → `42`. A profile can split on something else, like `/`. Move with `j` / `k`, open a folder with `Enter` or `l`.
 2. Selecting a key loads its value on the right, with its type and TTL in the
    header. `Tab` moves focus into the value pane and back.
 3. Press `/` and type `session` to filter. A bare word becomes `*session*`;
@@ -122,6 +122,12 @@ rediscope
 
 - **Namespace tree.** Keys grouped by `:` into collapsible folders, with a
   per-folder key count and a type badge on every leaf.
+- **Your own key separator.** A profile whose keys look like `app/user/42` or
+  `com.example.cache` can split on `/`, `.`, `::`, `|` or any other string
+  instead, set under **Key tree** in the connection form. The tree, marking a
+  folder, `Ctrl+P`, the open folders a session remembers, the memory report's
+  prefixes and `mem-report` all follow it. `n` starts the new key's name in the
+  folder under the cursor, with the separator already on the end.
 - **Safe listing.** `SCAN` in batches, never `KEYS *`, 5,000 keys per view to
   start with. The header says so when a result was truncated, and `+` loads
   5,000 more, up to 50,000, rescanning so a refresh stays consistent.
@@ -651,8 +657,8 @@ rediscope --profile prod import --file users.json \
 A connection profile holds the server address or a Unix socket path, an
 optional group, database index, optional ACL username, TLS settings, a
 read-only switch, an optional SSH jump host, and how to find its password. The editor is one form with `Server`,
-`Authentication`, `TLS` and `SSH tunnel` sections (the group is set under
-`Server`); `Tab` moves between fields, `Space` toggles a switch, and the form
+`Authentication`, `TLS`, `SSH tunnel`, `Topology`, `Production safety` and
+`Key tree` sections (the group is set under `Server`); `Tab` moves between fields, `Space` toggles a switch, and the form
 scrolls when the terminal is short.
 
 Passwords resolve in one of three ways:
@@ -785,6 +791,25 @@ rediscope --config-path
 The same file keeps your theme, so the colours come back on the next run, and
 one entry per profile recording where you left it — database, search pattern,
 open folders and selected key.
+
+### Key separator
+
+`separator` is the string a profile splits key names on. It is `:` unless set,
+and only written to the file when it is something else, so older files save
+back unchanged. It can be more than one character (`::`), and characters that
+mean something in a glob (`*`, `?`, `[`) are just characters here, because
+folders are matched against the loaded key names, never turned into a
+pattern. An empty value in a hand-edited file reads as `:`; the form refuses
+one. A separator that can overlap itself, like `::` in `a:::b`, splits from
+the left, so that key is `:b` in folder `a`.
+
+A backslash separator matches a single literal backslash in a key name.
+Key names are shown with a real backslash doubled (see [Notes](#notes)), so
+the folders and prefixes the tree and memory report show carry it doubled too.
+
+```json
+{ "name": "assets", "host": "10.0.2.9", "port": 6379, "separator": "/" }
+```
 
 ### Unix sockets
 

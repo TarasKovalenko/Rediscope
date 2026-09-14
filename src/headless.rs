@@ -142,7 +142,7 @@ pub async fn mem_report(conn: Connection, depth: usize, json: bool) -> Result<()
     // The same sampling stride the TUI uses, so both give the same answer.
     let stride = (dbsize / 20_000).max(1);
     let mut scan = MemoryScan::default();
-    let mut rollup = Rollup::default();
+    let mut rollup = Rollup::with_separator(client.conn.key_separator());
     while !client.memory_batch(&mut scan, stride, &mut rollup).await? {}
 
     let rows = rollup.rows(depth.clamp(1, crate::memory::DEPTH_MAX));

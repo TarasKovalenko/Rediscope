@@ -160,7 +160,7 @@ enum Command {
     },
     /// Estimate which key prefixes hold the memory.
     MemReport {
-        /// How many `:`-separated segments to group by.
+        /// How many name segments to group by, split on the profile's key separator.
         #[arg(long, default_value_t = 1)]
         depth: usize,
         #[arg(long)]

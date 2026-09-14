@@ -64,13 +64,32 @@ pub struct Rollup {
     bytes: u64,
     /// Measured keys, largest first, capped at [`TOP_KEYS`].
     top: Vec<BigKey>,
+    /// What splits a key name into segments, as it appears in an encoded
+    /// name. Empty means `:`.
+    separator: String,
 }
 
 impl Rollup {
+    /// A rollup that splits key names on `separator` rather than `:`.
+    pub fn with_separator(separator: &str) -> Self {
+        Self {
+            separator: crate::tree::effective(separator).into_owned(),
+            ..Self::default()
+        }
+    }
+
+    fn separator(&self) -> &str {
+        if self.separator.is_empty() {
+            crate::config::DEFAULT_SEPARATOR
+        } else {
+            &self.separator
+        }
+    }
+
     /// Record that `key` exists.
     pub fn count(&mut self, key: &str) {
         self.scanned += 1;
-        let prefix = prefix_of(key, DEPTH_MAX);
+        let prefix = prefix_of(key, DEPTH_MAX, self.separator());
         if let Some(bucket) = self.buckets.get_mut(&prefix) {
             bucket.keys += 1;
         } else if self.buckets.len() < MAX_PREFIXES {
@@ -120,7 +139,7 @@ impl Rollup {
     pub fn measure(&mut self, key: &str, bytes: u64) {
         self.sampled += 1;
         self.bytes += bytes;
-        let prefix = prefix_of(key, DEPTH_MAX);
+        let prefix = prefix_of(key, DEPTH_MAX, self.separator());
         let bucket = match self.buckets.get_mut(&prefix) {
             Some(bucket) => bucket,
             None => &mut self.other,
@@ -148,7 +167,9 @@ impl Rollup {
 
         let mut merged: HashMap<String, Bucket> = HashMap::new();
         for (prefix, bucket) in &self.buckets {
-            let entry = merged.entry(prefix_of(prefix, depth)).or_default();
+            let entry = merged
+                .entry(prefix_of(prefix, depth, self.separator()))
+                .or_default();
             entry.keys += bucket.keys;
             entry.sampled += bucket.sampled;
             entry.bytes += bucket.bytes;
@@ -190,19 +211,19 @@ impl Rollup {
     }
 }
 
-/// The first `depth` colon-separated segments of `key`, keeping the trailing
-/// colon so a prefix reads as one. A key with fewer segments is its own
-/// prefix, since there is nothing left to group it with.
-fn prefix_of(key: &str, depth: usize) -> String {
+/// The first `depth` segments of `key`, keeping the trailing separator so a
+/// prefix reads as one. A key with fewer segments is its own prefix, since
+/// there is nothing left to group it with.
+fn prefix_of(key: &str, depth: usize, separator: &str) -> String {
     let mut out = String::with_capacity(key.len());
-    for (i, segment) in key.split(':').enumerate() {
+    for (i, segment) in key.split(separator).enumerate() {
         if i == depth {
-            // Truncated, so the trailing colon says "and everything below".
-            out.push(':');
+            // Truncated, so the trailing separator says "and everything below".
+            out.push_str(separator);
             return out;
         }
         if i > 0 {
-            out.push(':');
+            out.push_str(separator);
         }
         out.push_str(segment);
     }
@@ -263,6 +284,33 @@ mod tests {
         let deep = r.rows(2);
         assert_eq!(deep.len(), 2);
         assert!(deep.iter().any(|row| row.prefix == "session:web:"));
+    }
+
+    #[test]
+    fn prefixes_follow_the_profile_separator() {
+        let mut r = Rollup::with_separator("/");
+        for key in ["app/user/1", "app/user/2", "app/cache/1", "a:b:c"] {
+            r.count(key);
+            r.measure(key, 10);
+        }
+        let mut shallow: Vec<String> = r.rows(1).into_iter().map(|row| row.prefix).collect();
+        shallow.sort();
+        assert_eq!(shallow, ["a:b:c", "app/"]);
+        let deep: Vec<String> = r.rows(2).into_iter().map(|row| row.prefix).collect();
+        assert!(deep.contains(&"app/user/".to_string()), "{deep:?}");
+
+        let mut r = Rollup::with_separator("::");
+        r.count("crate::mod::Item");
+        assert_eq!(r.rows(1)[0].prefix, "crate::");
+        assert_eq!(r.rows(2)[0].prefix, "crate::mod::");
+    }
+
+    #[test]
+    fn a_backslash_separator_matches_the_doubled_backslash_of_an_encoded_name() {
+        let mut r = Rollup::with_separator("\\");
+        let name = crate::redis_client::encode_key(b"dir\\file");
+        r.count(&name);
+        assert_eq!(r.rows(1)[0].prefix, "dir\\\\");
     }
 
     #[test]

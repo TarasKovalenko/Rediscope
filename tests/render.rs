@@ -871,6 +871,75 @@ async fn the_info_modal_reaches_the_diagnostics_tabs() {
     }
 }
 
+/// The key separator is the form's last field. It is saved as typed, and an
+/// empty one is refused rather than splitting between every character.
+#[tokio::test]
+async fn the_key_separator_is_set_in_the_form_and_splits_the_tree() {
+    let mut a = app();
+    press(&mut a, KeyCode::Char('n'));
+    let set_separator = |a: &mut App, text: &str| {
+        let Some(Modal::Form { fields, .. }) = &mut a.modal else {
+            panic!("expected form")
+        };
+        let mut inputs: Vec<_> = fields.iter_mut().filter(|f| f.is_input()).collect();
+        assert_eq!(inputs.len(), 26, "the separator is the last input");
+        let last = inputs.last_mut().unwrap();
+        assert_eq!(last.input.value(), ":", "prefilled with the default");
+        inputs[0].input.set("slashes");
+        inputs[25].input.set(text);
+    };
+    set_separator(&mut a, "");
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Enter);
+    match &a.modal {
+        Some(Modal::Form { error, .. }) => {
+            assert!(
+                error.as_deref().unwrap_or("").contains("separator"),
+                "{error:?}"
+            );
+        }
+        _ => panic!("an empty separator must not save"),
+    }
+    press(&mut a, KeyCode::Esc);
+    press(&mut a, KeyCode::Char('n'));
+    set_separator(&mut a, "/");
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none());
+    let saved = a
+        .store
+        .connections
+        .iter()
+        .find(|c| c.name == "slashes")
+        .unwrap();
+    assert_eq!(saved.key_separator(), "/");
+
+    // A browser on such a profile splits keys on it, and only on it.
+    a.separator = "/".into();
+    populate_with(
+        &mut a,
+        &["app/user/1", "app/user/2", "app/queue", "legacy:colon:key"],
+    );
+    let labels: Vec<&str> = a.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["app", "user", "1", "2", "queue", "legacy:colon:key"]
+    );
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 100, 20);
+    assert!(screen.contains("legacy:colon:key"), "{screen}");
+}
+
+fn populate_with(app: &mut App, names: &[&str]) {
+    app.screen = rediscope::app::Screen::Browser;
+    app.on_msg(Msg::Keys {
+        warnings: vec![],
+        keys: names.iter().map(|n| key(n, KeyType::String, -1)).collect(),
+        truncated: false,
+        dbsize: names.len() as u64,
+        pattern: "*".into(),
+    });
+}
+
 #[tokio::test]
 async fn sentinel_form_persists_discovery_fields() {
     use rediscope::app::Modal;

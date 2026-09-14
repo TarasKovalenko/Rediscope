@@ -1197,6 +1197,9 @@ pub struct App {
     pub held_feed: Option<PubSubState>,
     /// The keys behind the tree, kept so a TTL can expire one locally.
     pub keys: Vec<KeyInfo>,
+    /// What the open profile splits key names on: the tree's folders, marking
+    /// a folder, the memory report and the new-key prefill all use it.
+    pub separator: String,
     pub tree: Tree,
     pub expanded: HashSet<String>,
     pub rows: Vec<VisibleRow>,
@@ -1283,6 +1286,7 @@ impl App {
             held_feed: None,
             server_line: String::new(),
             keys: Vec::new(),
+            separator: crate::config::DEFAULT_SEPARATOR.to_string(),
             tree: Tree::default(),
             expanded: HashSet::new(),
             rows: Vec::new(),
@@ -1546,7 +1550,7 @@ impl App {
         self.keys.retain(|k| k.ttl > 0 || k.ttl == -1);
         self.key_count = self.keys.len();
         self.dbsize = self.dbsize.saturating_sub(expired.len() as u64);
-        self.tree = Tree::build(&self.keys);
+        self.tree = Tree::build(&self.keys, &self.separator);
         self.rebuild_rows();
         if self.rows.is_empty() {
             self.tree_state.select(None);
@@ -1604,6 +1608,7 @@ impl App {
                             Msg::Commands(Box::new(names.command_names().await.unwrap_or_default()))
                         });
                         let session = self.store.sessions.get(&client.conn.name).cloned();
+                        self.separator = client.conn.key_separator().to_string();
                         self.client = Some(client);
                         self.screen = Screen::Browser;
                         self.status.clear();
@@ -1659,7 +1664,7 @@ impl App {
                 self.truncated = truncated;
                 self.dbsize = dbsize;
                 self.pattern = pattern;
-                self.tree = Tree::build(&keys);
+                self.tree = Tree::build(&keys, &self.separator);
                 self.keys = keys.clone();
                 // A narrow result set is more useful expanded than collapsed.
                 if keys.len() <= 200 {
@@ -2520,6 +2525,11 @@ impl App {
                         crate::config::Environment::Production => 2,
                     },
                 ),
+                Field::section("Key tree"),
+                Field::text(
+                    "Key separator (splits names into folders, : by default)",
+                    c.key_separator(),
+                ),
             ],
             focus: 1,
             error: None,
@@ -2824,7 +2834,7 @@ impl App {
                 }
             }
             (None, Some(path)) => {
-                let prefix = format!("{path}:");
+                let prefix = format!("{path}{}", crate::tree::effective(&self.separator));
                 let under: Vec<String> = self
                     .keys
                     .iter()
@@ -2985,17 +2995,38 @@ impl App {
             return;
         }
         let types: Vec<&str> = NEW_KEY_TYPES.iter().map(|t| t.name()).collect();
+        let prefix = self.new_key_prefix();
         self.modal = Some(Modal::Form {
             title: "New key".into(),
             hint: "Tab/↑↓ move · ←→ pick type · Enter creates · Esc cancels".into(),
             fields: vec![
-                Field::text("Key name", ""),
+                Field::text("Key name", &prefix),
                 Field::choice("Type", &types, 0),
             ],
             focus: 0,
             error: None,
             action: Action::NewKey,
         });
+    }
+
+    /// Where a new key starts: inside the folder under the cursor, or the
+    /// folder holding the key under the cursor, as that folder's path and a
+    /// separator. Empty at the root.
+    pub fn new_key_prefix(&self) -> String {
+        let Some(row) = self.selected_row() else {
+            return String::new();
+        };
+        let separator = crate::tree::effective(&self.separator);
+        let folder = match (&row.folder_path, &row.key) {
+            (Some(path), _) => Some(path.as_str()),
+            // The same cut the tree makes, so this is the folder the key is
+            // drawn in.
+            (None, Some(k)) => {
+                crate::tree::split_last(&k.name, &separator).map(|(parent, _)| parent)
+            }
+            _ => None,
+        };
+        folder.map_or_else(String::new, |f| format!("{f}{separator}"))
     }
 
     fn confirm_delete_key(&mut self) {
@@ -3793,8 +3824,10 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let state = MemoryState::new(self.dbsize);
+        let mut state = MemoryState::new(self.dbsize);
+        state.rollup = Rollup::with_separator(&self.separator);
         let stride = state.stride();
+        let separator = self.separator.clone();
         let cancel = state.cancel.clone();
         self.modal = Some(Modal::Memory(state));
 
@@ -3803,7 +3836,7 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let mut scan = crate::redis_client::MemoryScan::default();
-            let mut rollup = Rollup::default();
+            let mut rollup = Rollup::with_separator(&separator);
             let mut last = std::time::Instant::now();
             loop {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4083,6 +4116,9 @@ impl App {
             Screen::Connections => crate::palette::CONNECTIONS,
         };
         let mut state = PaletteState::new(commands);
+        if self.screen == Screen::Browser {
+            state.separator = crate::tree::effective(&self.separator).into_owned();
+        }
         self.refresh_palette(&mut state);
         self.modal = Some(Modal::Palette(state));
     }
@@ -4154,9 +4190,10 @@ impl App {
 
     /// Select a loaded key in the tree, opening every folder above it.
     fn jump_to_key(&mut self, name: &str) {
-        let parts: Vec<&str> = name.split(':').collect();
+        let separator = crate::tree::effective(&self.separator).to_string();
+        let parts: Vec<&str> = name.split(separator.as_str()).collect();
         for depth in 1..parts.len() {
-            self.expanded.insert(parts[..depth].join(":"));
+            self.expanded.insert(parts[..depth].join(&separator));
         }
         self.rebuild_rows();
         let Some(index) = self
@@ -5103,6 +5140,8 @@ impl App {
                         "staging" => crate::config::Environment::Staging,
                         _ => crate::config::Environment::Development,
                     },
+                    // Not trimmed: a space is a separator someone may want.
+                    separator: v(f::SEPARATOR),
                 };
                 let new_name = conn.name.clone();
                 self.store.upsert(conn, replacing.as_deref());
@@ -5683,6 +5722,7 @@ mod conn_field {
     pub const SENTINEL_USERNAME: usize = 22;
     pub const SENTINEL_PASSWORD: usize = 23;
     pub const ENVIRONMENT: usize = 24;
+    pub const SEPARATOR: usize = 25;
 }
 
 /// Field-level validation that must happen before the modal closes.
@@ -5733,6 +5773,9 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
                         "A Unix socket is local; it cannot go through an SSH tunnel".into(),
                     );
                 }
+            }
+            if values.get(f::SEPARATOR).is_some_and(|s| s.is_empty()) {
+                return Some("Key separator cannot be empty (: is the default)".into());
             }
             if get(f::DEPLOYMENT) == "cluster" && get(f::DATABASE) != "0" {
                 return Some("Cluster supports database 0 only".into());
@@ -6273,6 +6316,85 @@ mod tests {
             pattern: "*".into(),
         });
         app
+    }
+
+    /// A browser over `keys` for a profile that splits names on `separator`.
+    fn split_app(separator: &str, keys: &[&str]) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        app.screen = Screen::Browser;
+        app.separator = separator.into();
+        app.on_msg(Msg::Keys {
+            warnings: vec![],
+            dbsize: keys.len() as u64,
+            keys: keys.iter().map(|k| info(k, -1)).collect(),
+            truncated: false,
+            pattern: "*".into(),
+        });
+        app
+    }
+
+    fn select_label(app: &mut App, label: &str) {
+        let index = app
+            .rows
+            .iter()
+            .position(|r| r.label == label)
+            .unwrap_or_else(|| panic!("no row {label}"));
+        app.tree_state.select(Some(index));
+        app.on_tree_move();
+    }
+
+    #[test]
+    fn marking_a_folder_uses_the_profile_separator() {
+        let mut app = split_app("/", &["app/user/1", "app/user/2", "app:other", "appx/1"]);
+        select_label(&mut app, "app");
+        press(&mut app, KeyCode::Char('m'));
+        let mut marked: Vec<&str> = app.marked.iter().map(String::as_str).collect();
+        marked.sort();
+        assert_eq!(marked, ["app/user/1", "app/user/2"]);
+
+        let mut app = split_app("::", &["a::b::c", "a::b::d", "a::bx"]);
+        select_label(&mut app, "b");
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.marked.len(), 2, "{:?}", app.marked);
+    }
+
+    #[test]
+    fn the_palette_opens_folders_split_on_the_profile_separator() {
+        let mut app = split_app(".", &["com.example.api.v1", "com.example.web", "other"]);
+        app.expanded.clear();
+        app.rebuild_rows();
+        ctrl(&mut app, 'p');
+        type_text(&mut app, "apiv1");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.current.as_ref().map(|k| k.name.as_str()),
+            Some("com.example.api.v1")
+        );
+        for folder in ["com", "com.example", "com.example.api"] {
+            assert!(
+                app.expanded.contains(folder),
+                "{folder}: {:?}",
+                app.expanded
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_key_starts_in_the_folder_under_the_cursor() {
+        let mut app = split_app("|", &["tenant|42|cart", "tenant|42|seen", "loose"]);
+        select_label(&mut app, "42");
+        assert_eq!(app.new_key_prefix(), "tenant|42|");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(form_fields(&app)[0], "tenant|42|");
+        press(&mut app, KeyCode::Esc);
+
+        select_label(&mut app, "cart");
+        assert_eq!(app.new_key_prefix(), "tenant|42|", "a key's own folder");
+        select_label(&mut app, "loose");
+        assert_eq!(app.new_key_prefix(), "", "the root has no prefix");
+        select_label(&mut app, "tenant");
+        assert_eq!(app.new_key_prefix(), "tenant|");
     }
 
     fn info(name: &str, ttl: i64) -> KeyInfo {
