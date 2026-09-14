@@ -258,9 +258,12 @@ rediscope
 - **Copy a key** (`C`). Anywhere: another name, another database, or another
   saved server. `DUMP` + `RESTORE` carries the type and the remaining TTL, so a
   sorted set arrives as a sorted set.
-- **Export and import** (`w` / `I`). Write the marked keys — or everything on
-  screen — to a JSON file of `DUMP` payloads, and restore them here or on
-  another server, optionally overwriting what is already there.
+- **Export and import** (`w` / `I`). Write the marked keys, or everything on
+  screen, to a file and load it here or on another server, optionally
+  overwriting what is already there. The export form picks the format: `dump`
+  for `DUMP` payloads, or `json`, `jsonl`, `csv` and `commands` for data you can
+  read, diff, edit and load into a different server. Import works out the
+  format from the file. See [Export and import](#export-and-import).
 - **RedisJSON and RedisTimeSeries.** A `ReJSON-RL` document opens in the JSON
   editor and saves through `JSON.SET`; a time series lists its samples, and `a`
   appends one.
@@ -437,11 +440,13 @@ What does not work, and why:
   accounting, which packs ASCII strings, so a 400-byte value can show as 384
   bytes. There is no `OBJECT FREQ`, so the namespace report has no access
   counts.
-- **Exports between different servers.** An export holds `DUMP` payloads, and a
-  server refuses a payload from a newer RDB format than its own. Moving from an
-  older server to a newer one works; a Redis 8 or Valkey 9 export does not load
-  into any other server in the table, and KeyDB refuses Valkey 8 exports and
-  most Dragonfly ones.
+- **Exports between different servers.** A `dump` export holds `DUMP`
+  payloads, and a server refuses a payload from a newer RDB format than its
+  own. Moving from an older server to a newer one works; a Redis 8 or Valkey 9
+  dump does not load into any other server in the table, and KeyDB refuses
+  Valkey 8 dumps and most Dragonfly ones. The `json`, `jsonl`, `csv` and
+  `commands` formats carry the data rather than the payload, and load into any
+  server in the table that has the type.
 
 CI runs the integration, codec, monitor, paging, production and newer-type
 suites against each server in the table on every push (the `compat` job), with
@@ -501,7 +506,7 @@ Press `?` in the app for this list at any time.
 | `m` / `u` | Mark the key or folder · clear every mark |
 | `F` | Find keys whose value contains some text |
 | `C` | Copy the key to another name, database or server |
-| `w` / `I` | Export the marked keys to a file · import a file back |
+| `w` / `I` | Export the marked keys as dump, JSON, JSON Lines, CSV or commands · import a file in any of them |
 | `L` | Run a Lua script (marked keys become `KEYS[1..]`) |
 | `r` | Refresh keys and the open value |
 | `o` | Sort keys by name, TTL (soonest expiry first) or type |
@@ -655,7 +660,8 @@ rediscope --profile prod keys --pattern 'session:*' --json
 rediscope --profile prod info --json | jq .Memory.used_memory
 rediscope --profile prod mem-report --depth 2 --json
 rediscope --profile prod export --pattern 'user:*' --out users.json
-rediscope -H localhost import --file users.json --replace
+rediscope --profile prod export --pattern 'user:*' --format jsonl --out users.jsonl
+rediscope -H localhost import users.jsonl --replace
 ```
 
 | Subcommand | What it prints |
@@ -663,8 +669,8 @@ rediscope -H localhost import --file users.json --replace
 | `keys` | One line per key: type, TTL and name. `--json` for objects |
 | `info` | The raw `INFO` reply, or `--json` for sections as objects |
 | `mem-report` | The namespace estimate, including the biggest keys under `--json` |
-| `export` | `DUMP` payloads and TTLs as JSON, to `--out` or stdout |
-| `import` | Restores such a file; `--replace` overwrites existing keys |
+| `export` | The matching keys and their TTLs, to `--out` or stdout. `--format` is `dump` (the default), `json`, `jsonl`, `csv` or `commands`; `--replace` starts each key of a commands file with `DEL` |
+| `import` | Loads a file made by `export`, in any format, read from its content. `import FILE` or `import --file FILE`; `--replace` overwrites existing keys |
 
 A read-only profile refuses `import`, the same as it does in the UI.
 
@@ -683,6 +689,155 @@ rediscope --profile prod import --file users.json \
 | `REDISCOPE_PASSWORD` | Password, instead of `-a`. A flag is visible to anyone who can run `ps` |
 | `REDISCOPE_HOME` | Config directory, overriding the platform default |
 | `REDISCOPE_AUDIT_FILE` | Where to append audit events, instead of `audit.jsonl` in the config directory |
+
+### Export and import
+
+`w` in the key browser and `rediscope export` write the same files, and `I` and
+`rediscope import` read them. There are five formats:
+
+| Format | What it holds | Loads into |
+|---|---|---|
+| `dump` | `DUMP` payloads, hex encoded in a JSON array. Everything survives, including consumer groups and hash field TTLs | A server with the same or a newer RDB version |
+| `json` | One indented JSON document of typed values | Redis, Valkey, KeyDB or Dragonfly of any version that has the type |
+| `jsonl` | The same entries, one compact object per line. Good for `jq`, `grep` and big exports | The same |
+| `csv` | One row per element: `key,type,ttl_ms,field,value` | The same |
+| `commands` | `redis-cli` commands, one per line | The same, through rediscope or `redis-cli < file` |
+
+`dump` stays the default, so a script that ran `export` before gets the same
+file it always did.
+
+A JSON entry names the key, its type, the milliseconds it has left (`null` when
+it does not expire) and its value. Import also reads a `ttl_ms` of `-1` as no
+expiry, as `PTTL` does, and refuses `0` or any other negative number, which
+would delete the key the moment it was written:
+
+```json
+{"key":"user:1","type":"hash","ttl_ms":null,"value":{"name":"Ada","plan":"pro"}}
+{"key":"queue","type":"list","ttl_ms":86399000,"value":["job:1","job:2"]}
+{"key":"scores","type":"zset","ttl_ms":null,"value":[["ada",12.5],["bob","inf"]]}
+{"key":"events","type":"stream","ttl_ms":null,"value":[{"id":"1718000000000-0","fields":{"kind":"login"}}]}
+```
+
+| Type | `value` |
+|---|---|
+| `string` (HyperLogLogs too) | A string |
+| `hash` | An object of fields, or `[field, value]` pairs when a field name is not UTF-8 or repeats |
+| `list`, `set` | An array |
+| `zset` | `[member, score]` pairs. `inf` and `-inf` are strings, and every score reads back as the exact same double |
+| `stream` | `{"id", "fields"}` objects, with `fields` shaped like a hash |
+| `json` (RedisJSON) | The document itself |
+| `timeseries` | `{"samples": [[timestamp, value]], "labels": {...}, "retention_ms": n}` |
+| `vectorset` | `{"element", "vector", "attributes"}` objects, and a `"quant"` beside `value` |
+
+`json` wraps the entries in `{"format": "rediscope-export", "version": 1,
+"keys": [...]}`. Import also takes a plain JSON array of entries.
+
+A CSV export has one row per element:
+
+```csv
+key,type,ttl_ms,field,value
+user:1,hash,,name,Ada
+queue,list,86399000,0,job:1
+scores,zset,,ada,12.5
+events,stream,,1718000000000-0:kind,login
+greeting,string,,,"hello, world"
+```
+
+A string or set leaves `field` empty. A list's `field` is the index, a sorted
+set's is the member with the score in `value`, and a stream's is `id:field`.
+`ttl_ms` is empty, or `-1`, for a key that does not expire. Cells are quoted the
+RFC 4180 way. A time series row is a timestamp and a value, so its labels and
+retention are not in the file, and a vector set row does not carry the
+quantization.
+
+The rows of one key do not have to be next to each other: a sheet sorted by
+another column imports the same, list items follow their index, and stream
+fields join their entry by id. Every row of a key must give the same type and
+`ttl_ms`. Cells are written exactly as the data is, so a value that starts with
+`=`, `+`, `-` or `@` can be taken for a formula by a spreadsheet. rediscope does
+not change it, since that would change the data; import untrusted files into a
+spreadsheet as text.
+
+A commands file is plain `redis-cli` input:
+
+```
+HSET user:1 name Ada plan pro
+RPUSH queue job:1 job:2
+PEXPIRE queue 86399000
+ZADD scores 12.5 ada inf bob
+XADD events 1718000000000-0 kind login
+SET greeting "hello, world"
+```
+
+Big collections are split into commands of 500 elements, and the TTL comes last.
+With `--replace`, or the switch in the export form, each key starts with `DEL`;
+without it the commands add to whatever the key already holds. Load the file
+with `rediscope import` or with `redis-cli -n 2 < users.redis`.
+
+**Binary data.** A key name, field, member or value that is not valid UTF-8 is
+never changed. JSON writes it as `{"base64": "..."}` where the string would be,
+CSV as `base64:` and the base64 (text that starts with `base64:` is encoded the
+same way, so the prefix is never ambiguous), and a commands file uses the `\xNN`
+escapes `redis-cli` reads inside double quotes.
+
+**Reading.** An export reads one key at a time, and collections in chunks with
+`HSCAN`, `SSCAN`, `LRANGE`, `ZRANGE`, `XRANGE`, `TS.RANGE` and `VRANGE`, never in
+one `HGETALL`. Keys come out in name order, and hashes and sets are sorted, so
+two exports of the same data diff cleanly. On a cluster each key is read from
+the node that owns it. A key's TTL is read after its value, so it is never older
+than the data. A key that expires while it is read is left out, and one of a
+type there is no format for, such as another module's, or one that changes type
+while it is read, is left out with a warning. So is an empty stream in CSV or a
+commands file, which have no way to write one. `rediscope export` stops at 5,000
+keys, like the key tree; narrow `--pattern` to export more. An export to a file
+is written beside it and renamed into place when it is complete, so an export
+that fails leaves an existing file as it was.
+
+**Importing.** The format is read from the file's content. A `dump` file is
+restored with `RESTORE`, as before. For the other formats, without overwrite a
+key that already exists stops the import with an error naming it, and with
+overwrite the key is replaced.
+
+Before anything is written, every entry is checked for what the server would
+refuse halfway through a key: a score or sample that is not a number, vectors of
+different lengths in one set, stream ids that do not grow, two samples at one
+timestamp. The server is also asked whether it has the commands each type needs,
+so a file with a JSON document is refused whole on a server without RedisJSON.
+Then each key is written so that a failure leaves the existing key as it was.
+A key that fits one pipeline (256 commands, about 1 MB) goes out as one `MULTI`
+transaction. A bigger one is written in pipelines of that size under a
+temporary name, `key:rediscope-import-…`, and renamed over the key at the end,
+so readers see the old value until the new one is complete. On a cluster, which
+runs no transactions, every key takes a temporary name, and one without a hash
+tag gets a tag in front, `{n}key:rediscope-import-…`, that puts it in the key's
+own slot. If a transaction runs but one of its commands fails, which the
+checks above make unlikely, the error says the key is partly written.
+
+A commands file runs as written, and the overwrite switch does not change it.
+It may only hold commands that write data into a key (`SET`, `HSET`, `RPUSH`,
+`SADD`, `ZADD`, `XADD`, `JSON.SET`, `TS.CREATE`, `TS.MADD`, `VADD`, `PEXPIRE`,
+`DEL` and a few more). A file with `FLUSHALL`, `CONFIG` or a script in it is
+refused before anything is sent. Lines are split the way `redis-cli` splits
+them. Consecutive lines for the same key go out together, in pipelines of the
+size above. The first line that fails stops the import, and the error names
+that line and how many commands ran before it. The server already had the rest
+of that pipeline, so the error also says how many lines after the failing one
+ran, and how many failed too. The summary counts the commands and the distinct
+keys they wrote.
+
+Every import passes the same checks as any other write. A read-only profile
+refuses it, a production profile needs the write lease and the typed profile
+name, and on a cluster a command over keys in different slots is refused
+unsent. Import reads the whole file into memory before it writes.
+
+**What the readable formats leave out.** They carry the data, not everything
+around it: stream consumer groups and last ids, a hash field's own TTL, a vector
+set's graph settings, and internal encodings. A vector is read back the way the
+server stores it, so the vectors of an `int8` set are close to, not exactly,
+what was added. A RedisJSON number that does not fit a double loses precision.
+A time series keeps its samples, labels and retention, but not its duplicate
+policy, compaction rules, chunk size or encoding. When any of that matters and
+both servers are compatible, use `dump`.
 
 ## Connections and secrets
 
@@ -981,7 +1136,8 @@ refused if the path is not a regular file:
 unrecognised is logged as `OTHER_COMMAND`, so user input can never become a log
 field. `target_key_count` is how many keys the command was aimed at, not a claim
 that they all changed, and is absent when that cannot be known (`FLUSHDB`, an
-arbitrary script). Every operation writes an intent line before it is dispatched
+arbitrary script). An export, in any format, is one `EXPORT` operation whose
+count is the number of keys asked for. Every operation writes an intent line before it is dispatched
 and a completion line afterwards, sharing one `operation_id`; `outcome` is
 `success`, `failure`, `denied`, or `unknown` when the reply was lost and the
 operation must not be retried blindly.
