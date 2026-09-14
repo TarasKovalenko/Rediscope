@@ -298,7 +298,17 @@ rediscope
   minute carries the message rate, peak and total; a channel breakdown shows
   which channels the traffic is on, each in its own colour; selecting a JSON or
   XML message pretty-prints it below the feed. `w` publishes one, `f` follows
-  the tail, `y` copies the feed.
+  the tail, `y` copies the feed. A busy channel is handled like the monitor:
+  the feed keeps at most 500 messages every 100 ms. The rest are shown as one
+  total, "too fast to show", and still counted in each channel's number in the
+  channel breakdown. On a Sentinel profile the subscription is on
+  the primary. The feed asks Sentinel every 5 seconds which node it names, so
+  after a failover it moves to the new primary even if the old one keeps the
+  connection open, and says so in a warning line. A cluster delivers every
+  `PUBLISH` to every node, so one subscription on the default node sees them
+  all; if that node goes, the feed reconnects through another. A node that
+  keeps dropping the subscription is retried less and less often, up to every
+  5 seconds.
 - **Command monitor** (`W`). `MONITOR` in the same feed: every command the
   server runs, grouped by command name, with the rate and a filter (`s`) that
   keeps commands whose name or arguments match. A busy server runs more
@@ -312,11 +322,28 @@ rediscope
   the rate, the totals and that 500 per batch still cover every database. The
   `MONITOR` connection closes with the feed, however the feed goes away.
   A production profile asks before starting it, because `MONITOR` costs the
-  server real throughput while it runs; `Esc` stops it. Standalone profiles
-  only for now, like pub/sub.
+  server real throughput while it runs; `Esc` stops it. A Sentinel profile
+  monitors the primary and moves to the new one after a failover. `MONITOR`
+  only sees the node it runs on, so a Cluster profile opens one `MONITOR`
+  connection per primary and merges them into the one feed, naming each
+  command's node when the terminal is wide enough. The 500 per 100 ms cap
+  covers the merged feed, not each node, and `d` still works, though a
+  cluster only has database 0. On a production cluster the prompt says how
+  many primaries will be slowed. A node that drops out is reported in the feed
+  and the others keep streaming. Every 20 seconds the feed checks the
+  topology: a primary added by a reshard or promoted by a failover is
+  monitored too, and a node that is no longer a primary is dropped, each with
+  a line in the feed.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
-  evicted live. Needs `notify-keyspace-events` set on the server.
+  evicted live. Needs `notify-keyspace-events` set on the server. A cluster
+  raises these events only on the node that owns the key, so on a Cluster
+  profile the feed subscribes on every primary, one connection each, and
+  merges them, naming each event's node when the terminal is wide enough. A
+  node that drops out is reported in a warning line while the others keep
+  streaming, and it rejoins the feed when it answers again. Every 20 seconds
+  the feed also checks for primaries that were added or demoted, and follows
+  or drops them. Set `notify-keyspace-events` on every node.
 - **Consumer groups** (`S`, on a stream). Every group with its pending count
   and lag, the consumers behind it, and the entries none of them have acked.
   `n` creates a group, `d` destroys one, `a` acks an entry and `c` claims one
@@ -736,7 +763,8 @@ Both passwords accept environment placeholders. Data-node credentials also
 support the existing OS keychain setting. TLS trust/client certificates apply
 to both discovery endpoints and data nodes; all advertised addresses must be
 reachable and valid for those certificates. A single SSH forward is rejected
-for discovered deployments.
+for discovered deployments. Discovery trusts the first Sentinel that answers
+and does not ask the others whether they agree.
 
 Cluster browsing scans each discovered primary, deduplicates keys, and applies
 the view limit to the combined results. The tree displays **PARTIAL RESULTS**
@@ -751,7 +779,20 @@ diagnostic endpoint; the browser's total key count sums all primaries.
 
 Topology also refreshes on redirects, recoverable connection failures, and the
 next command after 30 seconds. Sentinel discovery verifies `ROLE master` and
-repeats discovery after connection loss. Reads use bounded retries and backoff.
+repeats discovery after connection loss. If a Sentinel discovery fails, the
+next command discovers again before it is sent and is refused if that fails
+too, so a stale address is never used. That includes changes made from the
+diagnostics tabs, and the tabs show the discovery error instead of reading
+the old primary. A `CONFIG SET` from the Config tab is refused, unsent, once
+a discovery has found a different primary than the one the tab was read from;
+disconnecting a client or resetting the slow log still goes to the node that
+listed it. A failover that no discovery has seen yet (they run every 30
+seconds, and after any failure) can still let that `CONFIG SET` reach the
+demoted node, since a replica accepts it. Reads use bounded retries and backoff.
+A node that stops answering only holds up the commands sent to it; reads and
+writes for other nodes carry on, and callers that need a fresh topology at
+the same moment share a single discovery. A command that just failed never
+takes the result of a discovery that was already running when it failed.
 A write is sent again only when the server proves it never ran: a `MOVED` or
 `ASK` redirect, or a refusal such as `READONLY` from a primary demoted during
 failover, `TRYAGAIN` mid-migration, `CLUSTERDOWN` or `LOADING`. A single
@@ -759,6 +800,16 @@ write whose connection failed before it was sent is also tried again; a bulk
 batch that cannot reach one of its nodes stops instead. A write whose
 reply is lost reports an unknown outcome and is never replayed, and the
 topology is refreshed at once so the next command finds the new primary.
+Writes that arrive while that refresh runs wait for it. Reads wait for it
+too, so the first commands after a lost write can take as long as that
+discovery, up to 10 seconds.
+A load balancer or firewall can drop a quiet connection without telling
+either side, so a write about to go out on a connection that has not answered
+anything for 30 seconds sends a `PING` first; if that fails, the write has not
+been sent, and it goes out once on a new connection instead of ending as an
+unknown outcome. Writes that pick up the same quiet connection at once wait
+for that one `PING` and follow its answer. If a discovery moves the primary
+while a write waits for that `PING`, the write goes to the new primary.
 The shared console refuses connection-state commands such as `AUTH` and `MULTI`;
 use profile settings for authentication and the database selector (or `SELECT`
 in the TUI) to open a fresh database connection.
@@ -806,8 +857,7 @@ the current default node, which can differ from it after a failover. `PUBLISH`
   `COMMAND GETKEYS` before they are routed.
 - **No transactions** (`MULTI`/`EXEC`) on a cluster, and database 0 only.
 
-Cluster memory rollups and discovered-profile pub/sub and `MONITOR` are not
-available yet. Managed services exposing a single proxy endpoint can keep a
+Cluster memory rollups are not available yet. Managed services exposing a single proxy endpoint can keep a
 standalone profile.
 
 Saved connections live in `connections.json` under your platform config dir, and

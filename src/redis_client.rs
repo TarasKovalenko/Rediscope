@@ -11,8 +11,10 @@ use redis::{
 use crate::codec::{Decoding, Shown, View};
 use crate::config::{Connection, Deployment};
 mod edit;
+mod feed;
 mod topology;
 pub use edit::{EditOutcome, EditTarget};
+pub use feed::{Feed, FeedEvent};
 use topology::Transport;
 pub use topology::{Node, key_slot};
 
@@ -747,23 +749,68 @@ impl Client {
     }
 
     /// A connection of its own, for pub/sub. The multiplexed connection cannot
-    /// be put into subscriber mode without breaking every other caller.
+    /// be put into subscriber mode without breaking every other caller. On a
+    /// Sentinel profile it goes to the primary, on a cluster to the default
+    /// node, which receives every node's `PUBLISH`.
     pub async fn pubsub(&self) -> Result<redis::aio::PubSub> {
-        anyhow::ensure!(
-            self.conn.deployment == Deployment::Standalone,
-            "Pub/sub is not supported for discovered deployments yet"
-        );
-        Ok(self.raw.get_async_pubsub().await?)
+        if self.conn.deployment == Deployment::Standalone {
+            return Ok(self.raw.get_async_pubsub().await?);
+        }
+        let ep = self.mgr.default_endpoint().await?;
+        Ok(self.mgr.node_client(&ep).await?.get_async_pubsub().await?)
+    }
+
+    /// Follow `patterns` with `PSUBSCRIBE` until the feed is dropped.
+    /// `keyspace` marks keyspace notifications: a cluster raises those only on
+    /// the node that owns the key, so the feed subscribes on every primary.
+    pub async fn subscribe(&self, patterns: Vec<String>, keyspace: bool) -> Result<Feed> {
+        feed::subscribe(self.mgr.clone(), patterns, keyspace).await
     }
 
     /// A `MONITOR` connection of its own: every command the server runs, as
-    /// it runs it. Dropping it ends the monitoring.
+    /// it runs it. Dropping it ends the monitoring. On a Sentinel profile it
+    /// watches the primary. A cluster runs `MONITOR` per node, so it needs
+    /// [`monitor_feed`](Self::monitor_feed) instead.
     pub async fn monitor(&self) -> Result<redis::aio::Monitor> {
-        anyhow::ensure!(
-            self.conn.deployment == Deployment::Standalone,
-            "MONITOR watches one server, and is not supported for discovered deployments yet"
-        );
-        Ok(self.raw.get_async_monitor().await?)
+        match self.conn.deployment {
+            Deployment::Standalone => Ok(self.raw.get_async_monitor().await?),
+            Deployment::Sentinel => {
+                let ep = self.mgr.default_endpoint().await?;
+                Ok(self.mgr.node_client(&ep).await?.get_async_monitor().await?)
+            }
+            Deployment::Cluster => anyhow::bail!(
+                "MONITOR on a cluster runs on every primary; use the merged monitor feed"
+            ),
+        }
+    }
+
+    /// Every command the server runs, as raw `MONITOR` lines, until the feed
+    /// is dropped. A Sentinel feed follows the primary; a cluster feed opens
+    /// one `MONITOR` per primary and labels each line with its node.
+    pub async fn monitor_feed(&self) -> Result<Feed> {
+        feed::monitor(self.mgr.clone()).await
+    }
+
+    /// How many primaries the last discovery found: one for a standalone or
+    /// Sentinel profile. Read without waiting, for a confirmation prompt.
+    pub fn primary_count(&self) -> usize {
+        self.mgr.primary_count()
+    }
+
+    /// Before a write, `PING` a cached connection that has not answered
+    /// anything for longer than `after` (30 seconds unless changed). Only
+    /// tests change it.
+    #[doc(hidden)]
+    pub fn idle_ping_after(&self, after: std::time::Duration) {
+        self.mgr.idle_ping_after(after);
+    }
+
+    /// How often a keyspace or `MONITOR` feed on a cluster checks for
+    /// primaries that were added or demoted (20 seconds unless changed). Only
+    /// tests change it.
+    #[doc(hidden)]
+    pub fn feed_check_every(&self, every: std::time::Duration) {
+        self.mgr.feed_check_every(every);
     }
 
     /// Command names for console completion, and the subset flagged `write`.
@@ -2236,10 +2283,26 @@ return 1
     pub async fn diagnostics(&self) -> Result<Diagnostics> {
         // Sentinel too: after a failover, a client id still belongs to the
         // node that listed it.
-        let node = if self.conn.deployment != Deployment::Standalone {
-            Some(self.mgr.default_endpoint().await)
-        } else {
-            None
+        let node = match self.conn.deployment {
+            Deployment::Standalone => None,
+            deployment => match self.mgr.default_endpoint().await {
+                Ok(ep) => Some(ep),
+                // A Sentinel primary that cannot be confirmed may have been
+                // demoted. Nothing is read from it, and the tabs say why
+                // instead of showing an old node as if it were current.
+                Err(e) => {
+                    return Ok(Diagnostics {
+                        cluster: vec![
+                            ("deployment".into(), deployment.name().into()),
+                            (
+                                "diagnostics_error".into(),
+                                format!("Cannot confirm the primary, so nothing was read: {e}"),
+                            ),
+                        ],
+                        ..Default::default()
+                    });
+                }
+            },
         };
         let slowlog = match self
             .node_query(&node, redis::cmd("SLOWLOG").arg("GET").arg(128))
@@ -2970,6 +3033,8 @@ pub struct MonitorLine {
     pub detail: String,
     /// The database the command ran against, when the line names one.
     pub db: Option<i64>,
+    /// The cluster node that ran it, when the feed merges several.
+    pub node: Option<String>,
 }
 
 impl MonitorLine {
@@ -3009,6 +3074,7 @@ pub fn parse_monitor_line(line: &str) -> Option<MonitorLine> {
             .trim_end()
             .to_string(),
         db: db.parse().ok(),
+        node: None,
     })
 }
 

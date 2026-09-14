@@ -6,10 +6,12 @@ use crate::config::Deployment;
 use redis::{Cmd, RedisError, RedisFuture, RedisResult, Value, aio::ConnectionLike};
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
 
 type Endpoint = (String, u16);
 
@@ -27,20 +29,97 @@ impl Node {
     }
 }
 
+/// Shared routing state and the network calls made with it.
+///
+/// The state lock is a plain mutex and is never held across an `.await`, so a
+/// request to a node that hangs cannot hold up requests to the others. Each
+/// call copies what it needs out of the state (a socket, the routing table),
+/// releases it, talks to the network, then takes it again to record what it
+/// learned. Discovery is the one thing callers wait on each other for: it runs
+/// one at a time. A caller that saw a request fail only takes the result of a
+/// discovery that started after it arrived; any other caller also takes one
+/// that was already running.
 #[derive(Clone)]
 pub(super) struct Transport {
     profile: Connection,
     safety: crate::safety::Safety,
     audit: crate::audit::Audit,
     state: Arc<Mutex<State>>,
+    /// Held for as long as one discovery runs.
+    discovery: Arc<tokio::sync::Mutex<()>>,
+    /// Primaries the last discovery found, readable without the lock.
+    primary_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Socket activity is measured in milliseconds from here.
+    epoch: Instant,
+    /// How long, in milliseconds, a cached socket may go without proving it
+    /// is alive before a write on it is preceded by a `PING`.
+    idle_ping_ms: Arc<AtomicU64>,
+    /// How often, in milliseconds, a feed that follows every primary checks
+    /// the topology for primaries that came or went.
+    feed_check_ms: Arc<AtomicU64>,
 }
+/// Load balancers and firewalls drop connections that sit quiet for a few
+/// minutes without telling either end. A write sent into such a socket is
+/// lost with an unknown outcome, so a socket unused for this long is checked
+/// with a `PING` first.
+const IDLE_PING: Duration = Duration::from_secs(30);
+/// How often a merged feed looks for primaries that were added or demoted.
+const FEED_CHECK: Duration = Duration::from_secs(20);
 struct State {
     clients: HashMap<Endpoint, redis::Client>,
-    sockets: HashMap<Endpoint, MultiplexedConnection>,
+    sockets: HashMap<Endpoint, Socket>,
     nodes: Vec<Node>,
     default: Endpoint,
     refreshed: Instant,
     warning: Option<String>,
+    /// Sockets opened so far; the latest one's number is its id.
+    opened: u64,
+    /// Discoveries started so far; the latest one's number is its generation.
+    started: u64,
+    /// Discoveries finished so far, the generation of the last one and how
+    /// it went.
+    discovered: u64,
+    last_generation: u64,
+    last_discovery: RedisResult<()>,
+    /// The last discovery failed. A Sentinel profile then discovers again
+    /// before its next request instead of trusting the address it had.
+    must_rediscover: bool,
+    /// A write was lost after it was sent, when `started` stood at this
+    /// number. Set before the writer rediscovers, so writers that arrive
+    /// meanwhile, or come after a writer that was cancelled, wait for a
+    /// discovery that started after the loss instead of routing by the
+    /// address the write was lost on.
+    lost_at: Option<u64>,
+}
+/// A cached multiplexed connection. The id lets a caller whose request failed
+/// on it drop exactly that socket, not a newer one another caller opened.
+#[derive(Clone)]
+struct Socket {
+    id: u64,
+    conn: MultiplexedConnection,
+    /// Shared by every copy.
+    health: Arc<Health>,
+}
+/// What is known about whether a socket still works.
+struct Health {
+    /// When it last proved alive, in milliseconds from the transport's epoch:
+    /// opened, or answered a `PING` or a command.
+    last: AtomicU64,
+    /// Bumped each time it proves alive, so a writer that waited for another
+    /// writer's `PING` can tell it succeeded.
+    proofs: AtomicU64,
+    /// A `PING` on it lost the connection.
+    dead: std::sync::atomic::AtomicBool,
+    /// Held while one writer checks it, so writers that take an idle socket
+    /// at once share a single `PING`.
+    check: tokio::sync::Mutex<()>,
+}
+impl Socket {
+    /// Record that the socket just answered.
+    fn alive(&self, now: u64) {
+        self.health.last.store(now, Ordering::Relaxed);
+        self.health.proofs.fetch_add(1, Ordering::Relaxed);
+    }
 }
 /// The guard's refusals. Audit events match them exactly, by kind and text,
 /// so no server reply or script error can pass for one.
@@ -53,6 +132,38 @@ fn own_error(e: &RedisError) -> bool {
 
 fn denied(e: &RedisError) -> bool {
     own_error(e) && matches!(e.detail(), Some(DENIED | PIPELINE_DENIED))
+}
+
+/// Refusals made before anything was sent, because the route could not be
+/// trusted. They are audited as failures even for a batch or a script, whose
+/// other errors leave the outcome unknown. Matched like the guard's refusals:
+/// by kind, and by exact text or the `UNSENT` prefix.
+const WRITE_UNSETTLED: &str =
+    "The topology kept changing while this write waited; nothing was sent, so try again";
+const BATCH_UNSETTLED: &str =
+    "The topology kept changing while this batch waited; nothing was sent, so try again";
+const SENTINEL_UNSETTLED: &str =
+    "The Sentinel primary is being rediscovered after a failure; nothing was sent, so try again";
+const UNSENT: &str = "Nothing was sent: ";
+
+fn unsent(e: &RedisError) -> bool {
+    own_error(e)
+        && e.detail().is_some_and(|d| {
+            matches!(d, WRITE_UNSETTLED | BATCH_UNSETTLED | SENTINEL_UNSETTLED)
+                || d.starts_with(UNSENT)
+        })
+}
+
+/// `e`, a failure to confirm the route, as a refusal that sent nothing.
+fn not_sent(e: RedisError) -> RedisError {
+    if unsent(&e) {
+        return e;
+    }
+    let reason = match e.detail() {
+        Some(detail) if own_error(&e) => detail.to_string(),
+        _ => e.to_string(),
+    };
+    error(format!("{UNSENT}{reason}"))
 }
 
 fn error(message: impl Into<String>) -> RedisError {
@@ -96,7 +207,19 @@ impl Transport {
                 default,
                 refreshed: Instant::now(),
                 warning: None,
+                opened: 0,
+                started: 0,
+                discovered: 0,
+                last_generation: 0,
+                last_discovery: Ok(()),
+                must_rediscover: false,
+                lost_at: None,
             })),
+            discovery: Arc::default(),
+            primary_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            epoch: Instant::now(),
+            idle_ping_ms: Arc::new(AtomicU64::new(IDLE_PING.as_millis() as u64)),
+            feed_check_ms: Arc::new(AtomicU64::new(FEED_CHECK.as_millis() as u64)),
         };
         let result = this.refresh().await;
         this.audit.record(
@@ -107,6 +230,14 @@ impl Transport {
         )?;
         result?;
         Ok(this)
+    }
+
+    /// The shared state, for a lookup or an update. Never held across an
+    /// `.await`: the guard is not `Send`, so the compiler refuses that.
+    fn state(&self) -> MutexGuard<'_, State> {
+        // Nothing panics while holding the lock, but a poisoned one must not
+        // take every later request down with it.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn read_only(&self) -> bool {
@@ -154,6 +285,7 @@ impl Transport {
         let outcome = match result {
             Ok(_) => "success",
             Err(e) if denied(e) => "denied",
+            Err(e) if unsent(e) => "failure",
             // A batch that fails may have run part of itself, and a script or
             // module command may have written before its error.
             Err(_) if pipeline || opaque => "unknown",
@@ -172,46 +304,223 @@ impl Transport {
         })
     }
 
-    async fn connection(
-        &self,
-        state: &mut State,
-        ep: &Endpoint,
-    ) -> RedisResult<MultiplexedConnection> {
-        if let Some(c) = state.sockets.get(ep) {
-            return Ok(c.clone());
+    /// The cached socket for `ep`, or a new one. Two callers connecting at
+    /// once both open one; the first to finish is cached and the other one's
+    /// is closed, so both use the same socket.
+    async fn connection(&self, ep: &Endpoint) -> RedisResult<Socket> {
+        if let Some(socket) = self.cached(ep) {
+            return Ok(socket);
         }
-        if !state.clients.contains_key(ep) {
-            let mut profile = self.profile.clone();
-            profile.host = ep.0.clone();
-            profile.port = ep.1;
-            let raw = build_client(&profile, None)
-                .await
-                .map_err(|e| error(e.to_string()))?;
-            state.clients.insert(ep.clone(), raw);
+        let client = self.node_client(ep).await?;
+        let conn = socket(&client).await?;
+        let mut state = self.state();
+        if let Some(existing) = state.sockets.get(ep) {
+            return Ok(existing.clone());
         }
-        let c = socket(&state.clients[ep]).await?;
-        state.sockets.insert(ep.clone(), c.clone());
-        Ok(c)
+        state.opened += 1;
+        let socket = Socket {
+            id: state.opened,
+            conn,
+            health: Arc::new(Health {
+                last: AtomicU64::new(self.now_ms()),
+                proofs: AtomicU64::new(0),
+                dead: Default::default(),
+                check: Default::default(),
+            }),
+        };
+        state.sockets.insert(ep.clone(), socket.clone());
+        Ok(socket)
     }
 
-    async fn discover(&self, state: &mut State) -> RedisResult<()> {
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    fn cached(&self, ep: &Endpoint) -> Option<Socket> {
+        self.state().sockets.get(ep).cloned()
+    }
+
+    /// Record the reply `result` got on `socket`: any reply but a lost
+    /// connection shows the socket works.
+    fn answered<T>(&self, socket: &Socket, result: &RedisResult<T>) {
+        if !result.as_ref().is_err_and(RedisError::is_io_error) {
+            socket.alive(self.now_ms());
+        }
+    }
+
+    /// A socket a write can be sent on. One that has not proved alive for a
+    /// while is asked for a `PING` first: if that fails, the connection was
+    /// already dead and the write has not been sent, so it goes out once on a
+    /// fresh socket instead of being lost with an unknown outcome. Any other
+    /// reply means the connection is alive. Writers that take the same idle
+    /// socket at once wait for one `PING` and all go by its answer.
+    async fn for_write(&self, ep: &Endpoint, socket: Socket) -> RedisResult<Socket> {
+        let health = socket.health.clone();
+        let proofs = health.proofs.load(Ordering::Relaxed);
+        let quiet = self
+            .now_ms()
+            .saturating_sub(health.last.load(Ordering::Relaxed));
+        if quiet < self.idle_ping_ms.load(Ordering::Relaxed) && !health.dead.load(Ordering::Relaxed)
+        {
+            return Ok(socket);
+        }
+        let checking = health.check.lock().await;
+        if health.dead.load(Ordering::Relaxed) {
+            drop(checking);
+            return self.connection(ep).await;
+        }
+        if health.proofs.load(Ordering::Relaxed) != proofs {
+            // It answered someone while this writer waited.
+            return Ok(socket);
+        }
+        let mut c = socket.conn.clone();
+        match redis::cmd("PING").query_async::<Value>(&mut c).await {
+            Err(e) if e.is_io_error() => {
+                health.dead.store(true, Ordering::Relaxed);
+                self.forget(ep, socket.id);
+                drop(checking);
+                self.connection(ep).await
+            }
+            _ => {
+                socket.alive(self.now_ms());
+                Ok(socket)
+            }
+        }
+    }
+
+    /// Check sockets idle for longer than `after` before writing on them.
+    pub fn idle_ping_after(&self, after: Duration) {
+        self.idle_ping_ms
+            .store(after.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How often a feed on every primary checks for primaries that came or went.
+    pub fn feed_check_every(&self, every: Duration) {
+        self.feed_check_ms
+            .store(every.as_millis() as u64, Ordering::Relaxed);
+    }
+    pub(super) fn feed_check(&self) -> Duration {
+        Duration::from_millis(self.feed_check_ms.load(Ordering::Relaxed))
+    }
+
+    /// Drop the cached socket for `ep` after a failure on it, if it is still
+    /// the socket `used` names. A request that failed before it had a socket
+    /// drops nothing: whatever is cached belongs to someone else.
+    fn forget(&self, ep: &Endpoint, used: u64) {
+        let mut state = self.state();
+        if state.sockets.get(ep).is_some_and(|s| s.id == used) {
+            state.sockets.remove(ep);
+        }
+    }
+
+    /// Discover the topology, or wait for the discovery already running and
+    /// take its result. Discoveries run one at a time, so a result can only
+    /// ever be replaced by one that started after it.
+    ///
+    /// With `since`, a discovery that was already under way may have asked
+    /// before something failed. Only a result from a discovery numbered
+    /// above `since` (one that started later) will do then. Otherwise any
+    /// discovery that finished after the caller arrived will.
+    async fn discover(&self, since: Option<u64>) -> RedisResult<()> {
+        let finished = self.state().discovered;
+        let _running = self.discovery.lock().await;
+        let generation = {
+            let mut state = self.state();
+            let fresh = match since {
+                Some(since) => state.last_generation > since,
+                None => state.discovered != finished,
+            };
+            if fresh {
+                return state.last_discovery.clone();
+            }
+            state.started += 1;
+            state.started
+        };
         // A long seed list cannot leave a caller waiting indefinitely.
-        tokio::time::timeout(Duration::from_secs(10), self.discover_inner(state))
+        let result = tokio::time::timeout(Duration::from_secs(10), self.discover_inner())
             .await
-            .map_err(|_| error("Topology discovery timed out"))?
+            .unwrap_or_else(|_| Err(error("Topology discovery timed out")));
+        let mut state = self.state();
+        if let Ok(Some((nodes, default))) = &result {
+            let primaries = nodes.iter().filter(|n| n.primary).count();
+            self.primary_count
+                .store(primaries.max(1), std::sync::atomic::Ordering::Relaxed);
+            state.default = default.clone();
+            state.nodes = nodes.clone();
+            state.refreshed = Instant::now();
+            state.warning = None;
+        }
+        let result = result.map(|_| ());
+        state.discovered += 1;
+        state.last_generation = generation;
+        state.must_rediscover = result.is_err();
+        // A discovery that started after the loss settles it. If it failed,
+        // `must_rediscover` keeps a Sentinel profile asking again.
+        if state.lost_at.is_some_and(|lost| generation > lost) {
+            state.lost_at = None;
+        }
+        state.last_discovery = result.clone();
+        result
     }
 
-    async fn discover_inner(&self, state: &mut State) -> RedisResult<()> {
+    /// Discover after a request failed, and keep a failure as the topology
+    /// warning.
+    async fn rediscover(&self) -> RedisResult<()> {
+        let started = self.state().started;
+        self.discover_noting(Some(started)).await
+    }
+
+    /// Record that a write was lost after it was sent, then rediscover. The
+    /// mark is set before anything is awaited, so it holds even if the
+    /// caller is cancelled while discovery runs.
+    async fn rediscover_after_lost_write(&self) {
         if self.profile.deployment == Deployment::Standalone {
-            let ep = state.default.clone();
-            let mut c = self.connection(state, &ep).await?;
-            redis::cmd("PING").query_async::<()>(&mut c).await?;
-            return Ok(());
+            return;
         }
-        let mut seeds = vec![(self.profile.host.clone(), self.profile.port)];
-        seeds.extend(self.profile.seeds.iter().filter_map(|s| endpoint(s).ok()));
+        let started = {
+            let mut state = self.state();
+            let started = state.started;
+            state.lost_at = Some(state.lost_at.map_or(started, |l| l.max(started)));
+            started
+        };
+        let _ = self.discover_noting(Some(started)).await;
+    }
+
+    /// A write was lost and no discovery that started after it has finished
+    /// yet, or, on a Sentinel profile, the last discovery failed. A write
+    /// must not go by the current address then.
+    fn unsettled(&self) -> bool {
+        let state = self.state();
+        state.lost_at.is_some()
+            || (state.must_rediscover && self.profile.deployment == Deployment::Sentinel)
+    }
+
+    async fn discover_noting(&self, since: Option<u64>) -> RedisResult<()> {
+        let result = self.discover(since).await;
+        if let Err(e) = &result {
+            self.state().warning = Some(e.to_string());
+        }
+        result
+    }
+
+    /// The nodes and the default endpoint, for everything but a standalone
+    /// profile, which only checks that its server answers.
+    async fn discover_inner(&self) -> RedisResult<Option<(Vec<Node>, Endpoint)>> {
+        if self.profile.deployment == Deployment::Standalone {
+            let ep = self.state().default.clone();
+            let socket = self.connection(&ep).await?;
+            let mut c = socket.conn.clone();
+            let result = redis::cmd("PING").query_async::<()>(&mut c).await;
+            self.answered(&socket, &result);
+            if result.is_err() {
+                self.forget(&ep, socket.id);
+            }
+            result?;
+            return Ok(None);
+        }
+        let mut seeds = self.seeds();
         if self.profile.deployment == Deployment::Cluster {
-            seeds.extend(state.nodes.iter().map(Node::endpoint));
+            seeds.extend(self.state().nodes.iter().map(Node::endpoint));
         }
         let mut failures = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -219,33 +528,11 @@ impl Transport {
             if !visited.insert(ep.clone()) {
                 continue;
             }
+            let mut used = None;
             let result: RedisResult<Vec<Node>> = async {
                 if self.profile.deployment == Deployment::Sentinel {
-                    let mut sentinel = self.profile.clone();
-                    sentinel.host = ep.0.clone();
-                    sentinel.port = ep.1;
-                    sentinel.db = 0;
-                    sentinel.username = self.profile.sentinel_username.clone();
-                    sentinel.password = self.profile.sentinel_password.clone();
-                    sentinel.use_keychain = false;
-                    let raw = build_client(&sentinel, None)
-                        .await
-                        .map_err(|e| error(e.to_string()))?;
-                    let mut c = socket(&raw).await?;
-                    let address: Option<(String, u16)> = redis::cmd("SENTINEL")
-                        .arg("get-master-addr-by-name")
-                        .arg(&self.profile.sentinel_master)
-                        .query_async(&mut c)
-                        .await?;
-                    let address =
-                        address.ok_or_else(|| error("Sentinel does not know this service"))?;
-                    // Always establish a fresh socket on rediscovery and verify the role.
-                    state.sockets.remove(&address);
-                    let mut primary = self.connection(state, &address).await?;
-                    let role: Vec<Value> = redis::cmd("ROLE").query_async(&mut primary).await?;
-                    if role.first().map(scalar).as_deref() != Some("master") {
-                        return Err(error("Sentinel candidate is not a primary"));
-                    }
+                    let address = self.sentinel_names(&ep).await?;
+                    self.verify_primary(&address).await?;
                     Ok(vec![Node {
                         id: self.profile.sentinel_master.clone(),
                         host: address.0,
@@ -254,31 +541,33 @@ impl Transport {
                         slots: vec![],
                     }])
                 } else {
-                    let mut c = self.connection(state, &ep).await?;
-                    let reply: Value = redis::cmd("CLUSTER")
+                    let socket = self.connection(&ep).await?;
+                    used = Some(socket.id);
+                    let mut c = socket.conn.clone();
+                    let reply = redis::cmd("CLUSTER")
                         .arg("SLOTS")
-                        .query_async(&mut c)
-                        .await?;
-                    parse_slots(reply, &ep.0)
+                        .query_async::<Value>(&mut c)
+                        .await;
+                    self.answered(&socket, &reply);
+                    parse_slots(reply?, &ep.0)
                 }
             }
             .await;
             match result {
                 Ok(nodes) if !nodes.is_empty() => {
-                    state.default = nodes
+                    let default = nodes
                         .iter()
                         .find(|n| n.primary && n.endpoint() == ep)
                         .or_else(|| nodes.iter().find(|n| n.primary))
                         .ok_or_else(|| error("No primary discovered"))?
                         .endpoint();
-                    state.nodes = nodes;
-                    state.refreshed = Instant::now();
-                    state.warning = None;
-                    return Ok(());
+                    return Ok(Some((nodes, default)));
                 }
                 Ok(_) => failures.push(format!("{}:{}: empty topology", ep.0, ep.1)),
                 Err(e) => {
-                    state.sockets.remove(&ep);
+                    if let Some(id) = used {
+                        self.forget(&ep, id);
+                    }
                     failures.push(format!("{}:{}: {e}", ep.0, ep.1));
                 }
             }
@@ -286,32 +575,169 @@ impl Transport {
         Err(error(format!("Discovery failed: {}", failures.join("; "))))
     }
 
-    /// Rediscover when the topology is older than 30 seconds. Only a Sentinel
-    /// failure is an error: its primary may have moved, and a stale address
-    /// must never be written to. A cluster keeps routing on what it knows.
-    async fn refresh_if_stale(&self, state: &mut State) -> RedisResult<()> {
-        if self.profile.deployment == Deployment::Standalone
-            || state.refreshed.elapsed() < Duration::from_secs(30)
+    /// The profile's address, then its other seeds.
+    fn seeds(&self) -> Vec<Endpoint> {
+        let mut seeds = vec![(self.profile.host.clone(), self.profile.port)];
+        seeds.extend(self.profile.seeds.iter().filter_map(|s| endpoint(s).ok()));
+        seeds
+    }
+
+    /// The primary the Sentinel at `ep` names for the profile's service.
+    async fn sentinel_names(&self, ep: &Endpoint) -> RedisResult<Endpoint> {
+        let mut sentinel = self.profile.clone();
+        sentinel.host = ep.0.clone();
+        sentinel.port = ep.1;
+        sentinel.db = 0;
+        sentinel.username = self.profile.sentinel_username.clone();
+        sentinel.password = self.profile.sentinel_password.clone();
+        sentinel.use_keychain = false;
+        let raw = build_client(&sentinel, None)
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        let mut c = socket(&raw).await?;
+        let address: Option<(String, u16)> = redis::cmd("SENTINEL")
+            .arg("get-master-addr-by-name")
+            .arg(&self.profile.sentinel_master)
+            .query_async(&mut c)
+            .await?;
+        address.ok_or_else(|| error("Sentinel does not know this service"))
+    }
+
+    /// The primary Sentinel names right now, from the first seed that
+    /// answers. Nothing is verified or recorded: this only tells a caller
+    /// whether a discovery is worth running.
+    pub(super) async fn sentinel_primary(&self) -> RedisResult<Endpoint> {
+        let ask = async {
+            let mut failures = Vec::new();
+            for ep in self.seeds() {
+                match self.sentinel_names(&ep).await {
+                    Ok(address) => return Ok(address),
+                    Err(e) => failures.push(format!("{}:{}: {e}", ep.0, ep.1)),
+                }
+            }
+            Err(error(format!(
+                "No Sentinel answered: {}",
+                failures.join("; ")
+            )))
+        };
+        tokio::time::timeout(Duration::from_secs(10), ask)
+            .await
+            .unwrap_or_else(|_| Err(error("Sentinel did not answer in time")))
+    }
+
+    /// Check with `ROLE` that the node Sentinel named is a primary. The
+    /// cached socket to it is kept when it is the primary already in use, so
+    /// a periodic discovery does not cut the connection every request
+    /// shares. A newly named primary, or a failed check, starts over on a
+    /// fresh socket.
+    async fn verify_primary(&self, address: &Endpoint) -> RedisResult<()> {
         {
-            return Ok(());
-        }
-        if let Err(e) = self.discover(state).await {
-            state.warning = Some(e.to_string());
-            if self.profile.deployment == Deployment::Sentinel {
-                return Err(e);
+            let mut state = self.state();
+            if state.default != *address {
+                state.sockets.remove(address);
             }
         }
+        let mut retried = false;
+        loop {
+            let socket = self.connection(address).await?;
+            let mut c = socket.conn.clone();
+            let result = redis::cmd("ROLE").query_async::<Vec<Value>>(&mut c).await;
+            self.answered(&socket, &result);
+            match result {
+                Ok(role) if role.first().map(scalar).as_deref() == Some("master") => return Ok(()),
+                Ok(_) => {
+                    self.forget(address, socket.id);
+                    return Err(error("Sentinel candidate is not a primary"));
+                }
+                // A cached socket that died since it was last used says
+                // nothing about the node: ask once more on a new one.
+                Err(e) if e.is_io_error() && !retried => {
+                    self.forget(address, socket.id);
+                    retried = true;
+                }
+                Err(e) => {
+                    self.forget(address, socket.id);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Rediscover when the topology is older than 30 seconds, or, on a
+    /// Sentinel profile, when the last discovery failed. After a lost write,
+    /// wait for a discovery that started after the loss. Only a Sentinel
+    /// failure is an error: its primary may have moved, and a stale address
+    /// must never be written to. A cluster keeps routing on what it knows.
+    async fn refresh_if_stale(&self) -> RedisResult<()> {
+        if self.profile.deployment == Deployment::Standalone {
+            return Ok(());
+        }
+        let (due, lost) = {
+            let state = self.state();
+            (
+                state.refreshed.elapsed() >= Duration::from_secs(30)
+                    || (state.must_rediscover && self.profile.deployment == Deployment::Sentinel),
+                state.lost_at,
+            )
+        };
+        if !due && lost.is_none() {
+            return Ok(());
+        }
+        if let Err(e) = self.discover_noting(lost).await
+            && self.profile.deployment == Deployment::Sentinel
+        {
+            return Err(e);
+        }
         Ok(())
+    }
+
+    /// Where a command for `slot` goes, by the topology as it is now.
+    fn route(&self, slot: Option<u16>) -> Endpoint {
+        route_slot(&self.state(), slot)
+    }
+
+    /// Record a `MOVED`: it is authoritative for its slot even when discovery
+    /// is unavailable.
+    fn moved(&self, slot: u16, target: &Endpoint) {
+        let mut state = self.state();
+        for n in &mut state.nodes {
+            let mut ranges = Vec::new();
+            for &(a, b) in &n.slots {
+                if slot < a || slot > b {
+                    ranges.push((a, b));
+                } else {
+                    if a < slot {
+                        ranges.push((a, slot - 1));
+                    }
+                    if slot < b {
+                        ranges.push((slot + 1, b));
+                    }
+                }
+            }
+            n.slots = ranges;
+        }
+        if let Some(n) = state.nodes.iter_mut().find(|n| n.endpoint() == *target) {
+            n.primary = true;
+            n.slots.push((slot, slot));
+        } else {
+            state.nodes.push(Node {
+                id: "MOVED".into(),
+                host: target.0.clone(),
+                port: target.1,
+                primary: true,
+                slots: vec![(slot, slot)],
+            });
+        }
     }
 
     /// The slot a command must be sent to on a cluster, or `None` when it has
     /// no keys and can go to any primary. Refuses, before anything is sent,
     /// keys in different slots and keyless writes that would silently touch
     /// only one primary of many.
-    async fn cluster_slot(&self, state: &mut State, cmd: &Cmd) -> RedisResult<Option<u16>> {
+    async fn cluster_slot(&self, cmd: &Cmd) -> RedisResult<Option<u16>> {
         let keys = match command_keys(cmd) {
             Keys::Known(keys) => keys,
-            Keys::Unknown => self.server_keys(state, cmd).await?,
+            Keys::Unknown => self.server_keys(cmd).await?,
         };
         let Some(first) = keys.first() else {
             if !read_route(cmd).0 && !keyless_on_any_node(cmd) {
@@ -333,20 +759,19 @@ impl Transport {
 
     /// Ask the server which arguments are keys, for a command the local
     /// table does not know: a module command, or a newer one.
-    async fn server_keys(&self, state: &mut State, cmd: &Cmd) -> RedisResult<Vec<Vec<u8>>> {
+    async fn server_keys(&self, cmd: &Cmd) -> RedisResult<Vec<Vec<u8>>> {
         let mut probe = redis::cmd("COMMAND");
         probe.arg("GETKEYS");
         // The connect below can fail without anything being sent.
         for arg in simple_args(cmd) {
             probe.arg(arg);
         }
-        let ep = state.default.clone();
-        let mut c = self.connection(state, &ep).await?;
-        match c
-            .req_packed_command(&probe)
-            .await
-            .and_then(Value::extract_error)
-        {
+        let ep = self.state().default.clone();
+        let socket = self.connection(&ep).await?;
+        let mut c = socket.conn.clone();
+        let reply = c.req_packed_command(&probe).await;
+        self.answered(&socket, &reply);
+        match reply.and_then(Value::extract_error) {
             Ok(v) => Ok(redis::from_redis_value(v)?),
             Err(e)
                 if e.to_string()
@@ -356,10 +781,8 @@ impl Transport {
                 Ok(Vec::new())
             }
             Err(e) if e.is_io_error() => {
-                state.sockets.remove(&ep);
-                if let Err(refresh) = self.discover(state).await {
-                    state.warning = Some(refresh.to_string());
-                }
+                self.forget(&ep, socket.id);
+                let _ = self.rediscover().await;
                 Err(error(format!(
                     "Cannot look up the keys of {} on {}:{}; nothing was sent, and the topology was refreshed, so try again: {e}",
                     command_name(cmd),
@@ -375,28 +798,60 @@ impl Transport {
     }
 
     pub async fn refresh(&self) -> RedisResult<()> {
-        let mut state = self.state.lock().await;
-        let result = self.discover(&mut state).await;
-        if let Err(e) = &result {
-            state.warning = Some(e.to_string());
-        }
-        result
+        self.discover_noting(None).await
+    }
+    /// Refresh after something was lost, such as a feed's connection: a
+    /// discovery already under way when that happened does not count.
+    pub(super) async fn refresh_after_loss(&self) -> RedisResult<()> {
+        self.rediscover().await
     }
     /// Where keyless commands go: the node diagnostics describe. Refreshed
-    /// first when stale; if that refresh fails, the last known node is used.
-    pub async fn default_endpoint(&self) -> Endpoint {
-        let mut state = self.state.lock().await;
-        let _ = self.refresh_if_stale(&mut state).await;
-        state.default.clone()
+    /// first when stale. If that refresh fails, a cluster uses the last known
+    /// node, and a Sentinel profile gets the error: its primary may have moved.
+    pub async fn default_endpoint(&self) -> RedisResult<Endpoint> {
+        self.refresh_if_stale().await?;
+        Ok(self.state().default.clone())
+    }
+    /// The default node as last discovered, without refreshing first.
+    pub async fn known_default(&self) -> Endpoint {
+        self.state().default.clone()
+    }
+    pub fn deployment(&self) -> Deployment {
+        self.profile.deployment
+    }
+    pub fn primary_count(&self) -> usize {
+        self.primary_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// A client for one node, with the profile's data credentials and TLS,
+    /// for a connection that cannot be shared: pub/sub or `MONITOR`. On a
+    /// standalone profile this is the client the profile connected with, so a
+    /// tunnel or a Unix socket still applies.
+    pub async fn node_client(&self, ep: &Endpoint) -> RedisResult<redis::Client> {
+        if let Some(client) = self.state().clients.get(ep) {
+            return Ok(client.clone());
+        }
+        let mut profile = self.profile.clone();
+        profile.host = ep.0.clone();
+        profile.port = ep.1;
+        let raw = build_client(&profile, None)
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        Ok(self
+            .state()
+            .clients
+            .entry(ep.clone())
+            .or_insert(raw)
+            .clone())
     }
     pub async fn nodes(&self) -> Vec<Node> {
-        self.state.lock().await.nodes.clone()
+        self.state().nodes.clone()
     }
     pub async fn warning(&self) -> Option<String> {
-        self.state.lock().await.warning.clone()
+        self.state().warning.clone()
     }
     pub async fn primaries(&self) -> Vec<Endpoint> {
-        let state = self.state.lock().await;
+        let state = self.state();
         if state.nodes.is_empty() {
             vec![state.default.clone()]
         } else {
@@ -427,18 +882,51 @@ impl Transport {
     async fn direct_inner(&self, ep: &Endpoint, cmd: &Cmd) -> RedisResult<Value> {
         let read = read_route(cmd).0;
         self.guard(read)?;
-        let mut state = self.state.lock().await;
-        let mut c = self.connection(&mut state, ep).await?;
-        drop(state);
-        // Again at the moment of sending: the lock can take a while.
+        // On a Sentinel profile, `ep` came from a discovery. If a later one
+        // failed, or a write was lost since, it may name a demoted primary:
+        // a change is only sent once discovery has succeeded again.
+        let checked = !read && self.profile.deployment == Deployment::Sentinel;
+        // A client id or a slow log belongs to the node that listed it, even
+        // once that node is no longer the primary. Any other change was meant
+        // for the primary, and must not reach one that was replaced.
+        let primary_only = checked && !node_bound(cmd);
+        let moved = || {
+            let now = self.state().default.clone();
+            (primary_only && now != *ep).then(|| {
+                error(format!(
+                    "{UNSENT}the Sentinel primary moved from {}:{} to {}:{} since this node was listed; refresh and try again",
+                    ep.0, ep.1, now.0, now.1
+                ))
+            })
+        };
+        if checked {
+            self.refresh_if_stale().await.map_err(not_sent)?;
+            if let Some(e) = moved() {
+                return Err(e);
+            }
+        }
+        let mut socket = self.connection(ep).await?;
+        if !read {
+            socket = self.for_write(ep, socket).await?;
+        }
+        if checked && self.unsettled() {
+            return Err(error(SENTINEL_UNSETTLED));
+        }
+        if let Some(e) = moved() {
+            return Err(e);
+        }
+        // Again at the moment of sending: connecting can take a while.
         self.guard(read)?;
-        let result = c
-            .req_packed_command(cmd)
-            .await
-            .and_then(Value::extract_error);
+        let mut c = socket.conn.clone();
+        let result = c.req_packed_command(cmd).await;
+        self.answered(&socket, &result);
+        let result = result.and_then(Value::extract_error);
         // A server error (NOPERM from a managed service) leaves the socket good.
         if result.as_ref().is_err_and(RedisError::is_io_error) {
-            self.state.lock().await.sockets.remove(ep);
+            self.forget(ep, socket.id);
+            if !read {
+                self.rediscover_after_lost_write().await;
+            }
         }
         result
     }
@@ -453,12 +941,12 @@ impl Transport {
         if pipeline.cmd_iter().any(|c| !read_route(c).0) {
             self.guard(false)?;
         }
-        let mut state = self.state.lock().await;
-        let mut c = self.connection(&mut state, ep).await?;
-        drop(state);
+        let socket = self.connection(ep).await?;
+        let mut c = socket.conn.clone();
         let result = c.req_packed_commands(&pipeline, 0, names.len() * 2).await;
+        self.answered(&socket, &result);
         if result.is_err() {
-            self.state.lock().await.sockets.remove(ep);
+            self.forget(ep, socket.id);
         }
         result
     }
@@ -480,28 +968,31 @@ impl Transport {
     async fn request_inner(&self, cmd: &Cmd) -> RedisResult<Value> {
         let read = read_route(cmd).0;
         self.guard(read)?;
-        let mut state = self.state.lock().await;
-        self.refresh_if_stale(&mut state).await?;
+        self.refresh_if_stale().await.map_err(not_sent)?;
         let slot = if self.profile.deployment == Deployment::Cluster {
-            self.cluster_slot(&mut state, cmd).await?
+            self.cluster_slot(cmd).await?
         } else {
             None
         };
-        let route = |state: &State| route_slot(state, slot);
         // A script's own error reply can look like `TRYAGAIN` or `MOVED`
         // after it has already written, and so can a module command's. Only
         // commands whose behaviour is known are ever sent twice.
         let opaque = never_resent(cmd);
-        let mut ep = route(&state);
+        let mut ep = self.route(slot);
+        // `ep` came from a redirect rather than from the topology. A
+        // `MOVED` outranks a discovery that has not caught up with it.
+        let mut redirected = false;
         let mut asking = false;
         for attempt in 0..4 {
             // Set once the command is on the wire. A failure before that, such
             // as a node that refuses the connection, proves nothing ran.
             let mut sent = false;
+            // The cached socket the attempt used, if any.
+            let mut used = None;
             let result = async {
                 if asking {
                     // Dedicated socket keeps ASKING and the redirected command adjacent.
-                    let raw = state.clients.get(&ep).cloned();
+                    let raw = self.state().clients.get(&ep).cloned();
                     let raw = match raw {
                         Some(raw) => raw,
                         None => {
@@ -521,12 +1012,36 @@ impl Transport {
                         .await
                         .and_then(Value::extract_error)
                 } else {
-                    let mut c = self.connection(&mut state, &ep).await?;
+                    let mut socket = self.connection(&ep).await?;
+                    if !read {
+                        socket = self.for_write(&ep, socket).await?;
+                        // A write lost while this one waited for its socket
+                        // leaves the route in doubt: nothing is sent until a
+                        // discovery after that loss has finished. A discovery
+                        // that finished meanwhile may have moved the route:
+                        // the write follows it.
+                        let mut waits = 0;
+                        while self.profile.deployment != Deployment::Standalone
+                            && (self.unsettled() || (!redirected && self.route(slot) != ep))
+                        {
+                            if waits == 3 {
+                                return Err(error(WRITE_UNSETTLED));
+                            }
+                            waits += 1;
+                            self.refresh_if_stale().await.map_err(not_sent)?;
+                            ep = self.route(slot);
+                            redirected = false;
+                            socket = self.connection(&ep).await?;
+                            socket = self.for_write(&ep, socket).await?;
+                        }
+                    }
+                    used = Some(socket.id);
+                    let mut c = socket.conn.clone();
                     self.guard(read)?;
                     sent = true;
-                    c.req_packed_command(cmd)
-                        .await
-                        .and_then(Value::extract_error)
+                    let reply = c.req_packed_command(cmd).await;
+                    self.answered(&socket, &reply);
+                    reply.and_then(Value::extract_error)
                 }
             }
             .await;
@@ -546,9 +1061,7 @@ impl Transport {
                             if slot == Some(redirect) {
                                 // Likely genuine: refresh so the next attempt
                                 // goes to the right node, without resending.
-                                if let Err(refresh) = self.discover(&mut state).await {
-                                    state.warning = Some(refresh.to_string());
-                                }
+                                let _ = self.rediscover().await;
                                 return Err(error(format!(
                                     "{e}; the command was not sent again, because its reply cannot prove it never ran. The topology was refreshed, so try again"
                                 )));
@@ -564,41 +1077,12 @@ impl Transport {
                         let target = endpoint(&address).map_err(|e| error(e.to_string()))?;
                         asking = e.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::Ask);
                         if !asking {
-                            if let Err(refresh) = self.discover(&mut state).await {
-                                state.warning = Some(refresh.to_string());
-                            }
+                            let _ = self.rediscover().await;
                             // A MOVED is authoritative for this slot even if discovery is unavailable.
-                            for n in &mut state.nodes {
-                                let mut ranges = Vec::new();
-                                for &(a, b) in &n.slots {
-                                    if slot < a || slot > b {
-                                        ranges.push((a, b));
-                                    } else {
-                                        if a < slot {
-                                            ranges.push((a, slot - 1));
-                                        }
-                                        if slot < b {
-                                            ranges.push((slot + 1, b));
-                                        }
-                                    }
-                                }
-                                n.slots = ranges;
-                            }
-                            if let Some(n) = state.nodes.iter_mut().find(|n| n.endpoint() == target)
-                            {
-                                n.primary = true;
-                                n.slots.push((slot, slot));
-                            } else {
-                                state.nodes.push(Node {
-                                    id: "MOVED".into(),
-                                    host: target.0.clone(),
-                                    port: target.1,
-                                    primary: true,
-                                    slots: vec![(slot, slot)],
-                                });
-                            }
+                            self.moved(slot, &target);
                         }
                         ep = target;
+                        redirected = true;
                         continue;
                     }
                     let refused = rejected_unrun(&e) && !(opaque && sent);
@@ -608,21 +1092,20 @@ impl Transport {
                         if opaque
                             && rejected_unrun(&e)
                             && self.profile.deployment != Deployment::Standalone
-                            && let Err(refresh) = self.discover(&mut state).await
                         {
-                            state.warning = Some(refresh.to_string());
+                            let _ = self.rediscover().await;
                         }
                         return Err(e);
                     }
-                    state.sockets.remove(&ep);
+                    // A failure before a socket was in hand, such as a refused
+                    // connection, leaves another caller's socket alone.
+                    if let Some(id) = used {
+                        self.forget(&ep, id);
+                    }
                     if !read && sent && !refused {
                         // Never resent, but the next command should not be
                         // aimed at a primary that is gone.
-                        if self.profile.deployment != Deployment::Standalone
-                            && let Err(refresh) = self.discover(&mut state).await
-                        {
-                            state.warning = Some(refresh.to_string());
-                        }
+                        self.rediscover_after_lost_write().await;
                         return Err(error(format!(
                             "Write outcome unknown; command was not retried: {e}"
                         )));
@@ -637,14 +1120,15 @@ impl Transport {
                     }
                     tokio::time::sleep(Duration::from_millis(50 * (1 << attempt))).await;
                     if self.profile.deployment != Deployment::Standalone
-                        && let Err(refresh) = self.discover(&mut state).await
+                        && let Err(refresh) = self.rediscover().await
+                        && self.profile.deployment == Deployment::Sentinel
                     {
-                        state.warning = Some(refresh.to_string());
-                        if self.profile.deployment == Deployment::Sentinel {
-                            return Err(refresh);
-                        }
+                        // Every earlier attempt was refused unrun, so nothing
+                        // from this command has reached a server.
+                        return Err(not_sent(refresh));
                     }
-                    ep = route(&state);
+                    ep = self.route(slot);
+                    redirected = false;
                     asking = false;
                 }
             }
@@ -681,35 +1165,53 @@ impl Transport {
             }
             return Ok(values.into_iter().skip(offset).take(count).collect());
         }
-        let mut state = self.state.lock().await;
-        self.refresh_if_stale(&mut state).await?;
-        let ep = state.default.clone();
-        let mut c = self.connection(&mut state, &ep).await?;
+        self.refresh_if_stale().await.map_err(not_sent)?;
+        let mut ep = self.state().default.clone();
+        let mut socket = self.connection(&ep).await?;
+        if writes {
+            socket = self.for_write(&ep, socket).await?;
+            // As for a single write: wait out a lost write, and follow a
+            // discovery that moved the primary while the socket was checked.
+            let mut waits = 0;
+            while self.profile.deployment != Deployment::Standalone
+                && (self.unsettled() || self.state().default != ep)
+            {
+                if waits == 3 {
+                    return Err(error(BATCH_UNSETTLED));
+                }
+                waits += 1;
+                self.refresh_if_stale().await.map_err(not_sent)?;
+                ep = self.state().default.clone();
+                socket = self.connection(&ep).await?;
+                socket = self.for_write(&ep, socket).await?;
+            }
+        }
         self.guard(!writes)?;
-        let result = c
-            .req_packed_commands(pipeline, offset, count)
-            .await
-            .and_then(|values| values.into_iter().map(Value::extract_error).collect());
+        let mut c = socket.conn.clone();
+        let result = c.req_packed_commands(pipeline, offset, count).await;
+        self.answered(&socket, &result);
+        let result =
+            result.and_then(|values| values.into_iter().map(Value::extract_error).collect());
         if let Err(e) = &result {
-            state.sockets.remove(&ep);
+            // A server error leaves the shared socket working.
+            if e.is_io_error() {
+                self.forget(&ep, socket.id);
+            }
             // A Sentinel primary demoted during failover refuses writes as a
             // replica. Find the new primary now, so a retry reaches it.
             if self.profile.deployment == Deployment::Sentinel && writes && rejected_unrun(e) {
-                if let Err(refresh) = self.discover(&mut state).await {
-                    state.warning = Some(refresh.to_string());
-                }
+                let _ = self.rediscover().await;
                 return Err(error(format!(
                     "The primary stopped accepting writes partway through this batch ({e}); commands before that point may have been applied. The topology was refreshed; try again to reach the new primary"
                 )));
             }
             if e.is_io_error() {
-                if self.profile.deployment == Deployment::Sentinel
-                    && let Err(refresh) = self.discover(&mut state).await
-                {
-                    state.warning = Some(refresh.to_string());
+                if writes {
+                    self.rediscover_after_lost_write().await;
+                } else if self.profile.deployment == Deployment::Sentinel {
+                    let _ = self.rediscover().await;
                 }
                 if !pipeline.is_transaction() && pipeline.cmd_iter().all(|cmd| read_route(cmd).0) {
-                    drop(state);
                     let mut values = Vec::new();
                     for cmd in pipeline.cmd_iter() {
                         values.push(self.request(cmd).await?);
@@ -738,17 +1240,21 @@ impl Transport {
         count: usize,
     ) -> RedisResult<Vec<Value>> {
         let cmds: Vec<&Cmd> = pipeline.cmd_iter().collect();
-        let mut state = self.state.lock().await;
-        self.refresh_if_stale(&mut state).await?;
-        let mut groups: Vec<(Endpoint, Vec<usize>)> = Vec::new();
+        self.refresh_if_stale().await?;
         let mut slots = Vec::with_capacity(cmds.len());
-        for (i, cmd) in cmds.iter().enumerate() {
-            let slot = self.cluster_slot(&mut state, cmd).await?;
-            slots.push(slot);
-            let ep = route_slot(&state, slot);
-            match groups.iter_mut().find(|(e, _)| *e == ep) {
-                Some((_, indices)) => indices.push(i),
-                None => groups.push((ep, vec![i])),
+        for cmd in &cmds {
+            slots.push(self.cluster_slot(cmd).await?);
+        }
+        // Every command is routed by the same view of the topology.
+        let mut groups: Vec<(Endpoint, Vec<usize>)> = Vec::new();
+        {
+            let state = self.state();
+            for (i, slot) in slots.iter().enumerate() {
+                let ep = route_slot(&state, *slot);
+                match groups.iter_mut().find(|(e, _)| *e == ep) {
+                    Some((_, indices)) => indices.push(i),
+                    None => groups.push((ep, vec![i])),
+                }
             }
         }
         let mut replies: Vec<Option<RedisResult<Value>>> = cmds.iter().map(|_| None).collect();
@@ -771,8 +1277,9 @@ impl Transport {
                     ep.0, ep.1
                 ))
             };
-            let mut c = match self.connection(&mut state, ep).await {
-                Ok(c) => c,
+            let socket = match async { self.for_write(ep, self.connection(ep).await?).await }.await
+            {
+                Ok(socket) => socket,
                 Err(e) if sent == 0 => return Err(e),
                 Err(e) => return Err(earlier("its commands were not sent", &e)),
             };
@@ -787,7 +1294,10 @@ impl Transport {
                     &error("writes were locked or the write lease expired mid-batch"),
                 ));
             }
-            match c.req_packed_commands(&sub, 0, indices.len()).await {
+            let mut c = socket.conn.clone();
+            let reply = c.req_packed_commands(&sub, 0, indices.len()).await;
+            self.answered(&socket, &reply);
+            match reply {
                 Ok(values) => {
                     for (&i, value) in indices.iter().zip(values) {
                         let opaque = never_resent(cmds[i]);
@@ -806,15 +1316,12 @@ impl Transport {
                     }
                 }
                 Err(e) => {
-                    state.sockets.remove(ep);
-                    if let Err(refresh) = self.discover(&mut state).await {
-                        state.warning = Some(refresh.to_string());
-                    }
+                    self.forget(ep, socket.id);
+                    self.rediscover_after_lost_write().await;
                     return Err(earlier("outcome unknown for its commands", &e));
                 }
             }
         }
-        drop(state);
         // Redirected and refused commands never ran, so each is safe to send
         // once more, through the single-command path that follows redirects.
         // Among them the batch's order is kept; on one key it can only differ
@@ -840,6 +1347,10 @@ impl Transport {
             // have run: it must not read as a batch refused before sending.
             Err(e) if denied(&e) && (resent || groups.len() > 1) => Err(error(format!(
                 "Pipeline stopped: writes were locked or the write lease expired before every command was sent; commands already sent may have been applied. {e}"
+            ))),
+            // Likewise a resend refused because the route was in doubt.
+            Err(e) if unsent(&e) && (resent || groups.len() > 1) => Err(error(format!(
+                "Pipeline stopped before every command was sent; commands already sent may have been applied. {e}"
             ))),
             Err(e) => Err(e),
         }
@@ -902,6 +1413,20 @@ fn rejected_unrun(e: &RedisError) -> bool {
                 | redis::ServerErrorKind::MasterDown
                 | redis::ServerErrorKind::BusyLoading
         )
+    )
+}
+
+/// A node-addressed change that only means something on the node that listed
+/// it: `CLIENT KILL` for a client id, `SLOWLOG RESET` for that node's log.
+fn node_bound(cmd: &Cmd) -> bool {
+    let args = simple_args(cmd);
+    let word = |i: usize| {
+        args.get(i)
+            .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
+    };
+    matches!(
+        (word(0).as_deref(), word(1).as_deref()),
+        (Some("CLIENT"), Some("KILL")) | (Some("SLOWLOG"), Some("RESET"))
     )
 }
 
