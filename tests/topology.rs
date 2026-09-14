@@ -1284,16 +1284,11 @@ async fn standalone_write_refused_as_readonly_is_returned_without_retrying() {
     let client = Client::connect(server.profile(Deployment::Standalone))
         .await
         .unwrap();
-    let started = std::time::Instant::now();
     let e = client.set_string("key", "v").await.unwrap_err().to_string();
     assert!(e.contains("read only") || e.contains("READONLY"), "{e}");
+    // One attempt is the proof there was no retry. A wall-clock bound on top
+    // failed under a loaded parallel run.
     assert_eq!(writes.load(Ordering::SeqCst), 1);
-    // No backoff: the retry schedule would sleep at least 50ms.
-    assert!(
-        started.elapsed() < Duration::from_millis(50),
-        "{:?}",
-        started.elapsed()
-    );
 }
 
 /// Wait, bounded, until nothing accepts connections on `port`.
