@@ -83,6 +83,24 @@ and drop the binary on your `PATH`. To build from source instead:
 cargo install --git https://github.com/TarasKovalenko/Rediscope
 ```
 
+### Package managers
+
+These commands work once the tap, bucket and packages have been set up (see
+[`packaging/README.md`](packaging/README.md)). Until then, use the scripts
+above.
+
+```sh
+brew install TarasKovalenko/tap/rediscope          # macOS and Linux
+yay -S rediscope-bin                               # Arch Linux, from the AUR
+cargo install rediscope --locked                   # any platform, builds from source
+```
+
+```powershell
+scoop bucket add rediscope https://github.com/TarasKovalenko/scoop-bucket
+scoop install rediscope/rediscope
+winget install TarasKovalenko.Rediscope
+```
+
 Prebuilt targets: macOS `aarch64` / `x86_64`, Linux `x86_64` and `aarch64`
 (both glibc and musl), Windows `x86_64` and `aarch64` (MSVC). Unix builds ship
 as `.tar.gz`, Windows builds as `.zip`.
@@ -982,6 +1000,11 @@ publishes the tarballs and Windows zips plus `SHA256SUMS`, which is what
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
+
+After the release is up, the same run renders the Homebrew, Scoop, winget and
+AUR manifests from that `SHA256SUMS` and publishes them, and publishes the crate
+to crates.io. Each of those steps is skipped until its secret is set;
+[`packaging/README.md`](packaging/README.md) has the one-time setup.
 
 Each archive gets a signed GitHub build provenance attestation, and the run
 publishes `rediscope-dependencies.spdx.json`, an SPDX inventory of the locked
