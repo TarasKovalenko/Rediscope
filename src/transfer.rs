@@ -1453,19 +1453,48 @@ pub fn parse_commands(bytes: &[u8]) -> Result<Vec<CommandLine>> {
 /// A file written under a temporary name beside its final one and moved into
 /// place only when it is complete. An export that fails halfway leaves the
 /// file it would have replaced exactly as it was, and no partial file.
+///
+/// A target that is a symlink stays one: the file it points to is the one
+/// replaced. On Unix the temporary file is created `0600`, since an export
+/// can hold secrets, and a file being replaced passes its own permissions on,
+/// so an export over a private file never makes it readable to others. A new
+/// file stays `0600`.
 pub struct PendingFile {
     temp: std::path::PathBuf,
     target: std::path::PathBuf,
     done: bool,
 }
 
+/// Follow `path` through symlinks to the file they finally name, which need
+/// not exist yet. A loop, or a chain longer than the kernel would follow, is
+/// an error.
+fn resolve_links(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(parent) if link.is_relative() => parent.join(link),
+                    _ => link,
+                };
+            }
+            _ => return Ok(path),
+        }
+    }
+    Err(std::io::Error::other(
+        "the path is a chain of too many symlinks",
+    ))
+}
+
 impl PendingFile {
-    /// Create the temporary file in the target's own directory, so the final
-    /// rename never crosses a file system.
+    /// Create the temporary file in the directory of the file the target
+    /// finally names, so the final rename never crosses a file system and
+    /// never replaces a symlink.
     pub fn create(target: impl AsRef<std::path::Path>) -> std::io::Result<(Self, std::fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let target = target.as_ref().to_path_buf();
+        let target = resolve_links(target.as_ref())?;
         let name = target.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1485,12 +1514,25 @@ impl PendingFile {
                 N.fetch_add(1, Ordering::Relaxed)
             ));
             let temp = dir.join(temp_name);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&temp) {
                 Ok(file) => {
+                    // The umask can only narrow the mode, but say it exactly.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                        {
+                            let _ = std::fs::remove_file(&temp);
+                            return Err(e);
+                        }
+                    }
                     let pending = Self {
                         temp,
                         target,
@@ -1505,7 +1547,13 @@ impl PendingFile {
     }
 
     /// Move the finished file into place. Close every handle to it first.
+    /// A file already there gives the new one its permissions first, read at
+    /// this moment, so a change made during the export is kept too.
     pub fn commit(mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(&self.target) {
+            std::fs::set_permissions(&self.temp, meta.permissions())?;
+        }
         std::fs::rename(&self.temp, &self.target)?;
         self.done = true;
         Ok(())
@@ -2404,6 +2452,80 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(listing(), ["out.json"]);
         assert!(PendingFile::create(dir.join("missing").join("out.json")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_file_keeps_permissions_and_writes_through_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("rediscope-pending-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let write = |p: &std::path::Path, text: &str| {
+            let (pending, mut file) = PendingFile::create(p).unwrap();
+            // The partial file is private from the start.
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            file.write_all(text.as_bytes()).unwrap();
+            drop(file);
+            pending.commit().unwrap();
+        };
+
+        // An existing file keeps its own mode, tighter or looser.
+        for existing in [0o600, 0o640, 0o644] {
+            let path = dir.join(format!("kept-{existing:o}.json"));
+            std::fs::write(&path, "old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(existing)).unwrap();
+            write(&path, "new");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+            assert_eq!(mode(&path), existing, "{existing:o}");
+        }
+
+        // A new file may hold secrets: only its owner can read it.
+        let fresh = dir.join("fresh.json");
+        write(&fresh, "new");
+        assert_eq!(mode(&fresh), 0o600);
+
+        // A symlink stays a symlink, and the file it points at is replaced.
+        let real = dir.join("real").join("export.json");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink("real/export.json", &link).unwrap();
+        write(&link, "through the link");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "through the link");
+        assert_eq!(mode(&real), 0o640);
+
+        // A link to a file that does not exist yet creates that file.
+        let dangling = dir.join("dangling.json");
+        std::os::unix::fs::symlink(dir.join("real").join("later.json"), &dangling).unwrap();
+        write(&dangling, "created");
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("real").join("later.json")).unwrap(),
+            "created"
+        );
+
+        // No temporary file is left anywhere.
+        for sub in [dir.clone(), dir.join("real")] {
+            for entry in std::fs::read_dir(sub).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(!name.contains(".rediscope-"), "{name}");
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

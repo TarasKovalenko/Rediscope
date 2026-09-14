@@ -791,7 +791,10 @@ while it is read, is left out with a warning. So is an empty stream in CSV or a
 commands file, which have no way to write one. `rediscope export` stops at 5,000
 keys, like the key tree; narrow `--pattern` to export more. An export to a file
 is written beside it and renamed into place when it is complete, so an export
-that fails leaves an existing file as it was.
+that fails leaves an existing file as it was. If the path is a symlink, the file
+it points to is replaced and the link stays. A file that is replaced keeps its
+permissions; a new export file is created `0600`, readable only by you, because
+it can hold secrets. Loosen it yourself if others need to read it.
 
 **Importing.** The format is read from the file's content. A `dump` file is
 restored with `RESTORE`, as before. For the other formats, without overwrite a
