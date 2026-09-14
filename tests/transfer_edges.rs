@@ -2476,7 +2476,9 @@ async fn a_big_key_goes_out_in_bounded_pipelines_and_replaces_the_old_one_whole(
         started.iter().all(|c| c.is_some_and(|c| c <= 256)),
         "{started:?}"
     );
-    assert!(started.len() > 20, "{}", started.len());
+    // Without vector sets (older servers) the list, hash and zset alone
+    // still need well over one pipeline each.
+    assert!(started.len() >= 10, "{}", started.len());
 }
 
 #[tokio::test]
