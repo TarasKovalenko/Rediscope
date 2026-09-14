@@ -428,6 +428,48 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_separators_are_word_boundaries_counted_in_characters() {
+        let chars = |s: &str| s.chars().collect::<Vec<char>>();
+        let text = chars("a🙂b→c🙂🙂d");
+        let smile = chars("🙂");
+        let arrow = chars("→");
+        let pair = chars("🙂🙂");
+        // Indices are characters, so the emoji is one step, not four bytes.
+        assert!(after_separator(&text, 2, &smile));
+        assert!(!after_separator(&text, 1, &smile));
+        assert!(after_separator(&text, 4, &arrow));
+        assert!(after_separator(&text, 7, &pair));
+        assert!(
+            !after_separator(&text, 6, &pair),
+            "one of the two is not enough"
+        );
+        assert!(after_separator(&text, 6, &smile));
+        assert!(
+            !after_separator(&text, 0, &smile),
+            "nothing before the start"
+        );
+        assert!(
+            !after_separator(&text, 1, &pair),
+            "longer than what precedes"
+        );
+        assert!(!after_separator(&text, 3, &[]), "no separator");
+        // `🙃` is not `🙂`, though their bytes nearly agree.
+        assert!(!after_separator(&chars("a🙃b"), 2, &smile));
+
+        for sep in ["→", "🙂", "🙂🙂"] {
+            let joined = format!("ab{sep}c");
+            let near = format!("ab{}c", "x".repeat(sep.chars().count()));
+            let mid = |text: &str| fuzzy_split("c", text, sep).unwrap();
+            assert!(mid(&joined).0 > mid(&near).0, "{sep}");
+            // The matched index is a character index into the name.
+            let (_, at) = mid(&joined);
+            assert_eq!(joined.chars().nth(at[0]), Some('c'), "{sep}");
+            let (_, at) = fuzzy_split("🍕c", &format!("🍕{sep}c"), sep).unwrap();
+            assert_eq!(at, [0, 1 + sep.chars().count()], "{sep}");
+        }
+    }
+
+    #[test]
     fn a_shorter_text_wins_a_tie() {
         assert!(score("user", "user") > score("user", "user:with:a:long:tail"));
     }

@@ -663,3 +663,226 @@ fn moving_through_a_filtered_feed_stays_within_what_is_listed() {
     assert!(text.contains("90 total"), "{text}");
     assert!(!text.contains("noise"), "{text}");
 }
+
+// ---- the listed count across everything that changes it ------------------------
+
+use rediscope::app::PUBSUB_LIMIT;
+
+fn feed_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+    common::isolate_config();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.screen = Screen::Browser;
+    (app, rx)
+}
+
+fn feed(app: &App) -> &PubSubState {
+    match &app.modal {
+        Some(Modal::PubSub(state)) => state,
+        _ => panic!("the feed is not open: {}", app.status),
+    }
+}
+
+/// The cached count matches a recount, the cursor is on a listed message
+/// (the newest while following), and the feed draws small and large.
+fn check_feed(app: &mut App, when: &str) {
+    let state = feed(app);
+    let listed = state.shown().len();
+    assert_eq!(state.shown_len(), listed, "{when}");
+    assert!(
+        state.scroll < listed.max(1),
+        "{when}: scroll {} of {listed}",
+        state.scroll
+    );
+    if state.follow {
+        assert_eq!(state.scroll, listed.saturating_sub(1), "{when}");
+    }
+    for (w, h) in [(10, 5), (80, 24)] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| rediscope::ui::draw(f, app))
+            .unwrap_or_else(|e| panic!("{when}: {e}"));
+    }
+}
+
+fn batch(app: &mut App, from: usize, count: usize, dbs: i64) {
+    let lines = (from..from + count)
+        .map(|i| line(Some(i as i64 % dbs), &format!("c{i}")))
+        .collect();
+    app.on_msg(Msg::MonitorBatch { lines, dropped: 3 });
+}
+
+#[test]
+fn the_monitor_count_holds_through_overflow_d_clear_and_pause() {
+    let (mut app, _rx) = feed_app();
+    let mut state = PubSubState::monitor(vec![]);
+    state.current_db = 1;
+    app.modal = Some(Modal::PubSub(state));
+    check_feed(&mut app, "empty");
+
+    let mut next = 0;
+    let mut push = |app: &mut App, count: usize, when: &str| {
+        batch(app, next, count, 3);
+        next += count;
+        check_feed(app, when);
+    };
+    push(&mut app, 120, "a first batch");
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    check_feed(&mut app, "d: db1");
+    assert_eq!(feed(&app).db_filter, Some(1));
+
+    // Past the buffer while filtered, following.
+    for round in 0..6 {
+        push(&mut app, 500, &format!("filtered batch {round}"));
+    }
+    assert_eq!(feed(&app).messages.len(), PUBSUB_LIMIT);
+
+    // Paused at the bottom: pushes past the cap drop old listed commands and
+    // the cursor stays within the list.
+    app.on_key(KeyEvent::from(KeyCode::End));
+    app.on_key(KeyEvent::from(KeyCode::Char('f')));
+    assert!(!feed(&app).follow);
+    check_feed(&mut app, "paused at the bottom");
+    for round in 0..3 {
+        push(&mut app, 500, &format!("paused batch {round}"));
+    }
+    for code in ['d', 'd', 'd', 'd'] {
+        app.on_key(KeyEvent::from(KeyCode::Char(code)));
+        let when = format!("d while paused, now {:?}", feed(&app).db_filter);
+        check_feed(&mut app, &when);
+        push(&mut app, 250, &format!("{when}, then a push"));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Char('f')));
+    check_feed(&mut app, "following again");
+
+    app.on_key(KeyEvent::from(KeyCode::Char('c')));
+    check_feed(&mut app, "cleared");
+    assert_eq!(feed(&app).shown_len(), 0);
+    push(&mut app, 7, "a push after clearing");
+
+    // Cursor at the bottom, then everything at once.
+    app.on_key(KeyEvent::from(KeyCode::End));
+    for i in 0..(PUBSUB_LIMIT * 2) / 500 {
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        push(&mut app, 500, &format!("d and a full batch {i}"));
+        if i % 2 == 0 {
+            app.on_key(KeyEvent::from(KeyCode::Char('f')));
+            check_feed(&mut app, &format!("pause toggled {i}"));
+        }
+    }
+    app.on_key(KeyEvent::from(KeyCode::Char('c')));
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    check_feed(&mut app, "cleared, then d");
+    push(&mut app, 1, "one more");
+}
+
+/// `s` closes the feed for its form; the monitor it starts is a new feed
+/// with its own count, and clearing the filter starts another.
+#[tokio::test]
+async fn setting_and_clearing_the_monitor_filter_keeps_the_count() {
+    let Some(conn) = conn(Environment::Development) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let client = Client::connect(conn).await.unwrap();
+    let (mut app, _rx) = feed_app();
+    app.client = Some(client);
+
+    app.on_key(KeyEvent::from(KeyCode::Char('W')));
+    check_feed(&mut app, "opened");
+    batch(&mut app, 0, PUBSUB_LIMIT + 300, 2);
+    check_feed(&mut app, "past the cap");
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    check_feed(&mut app, "d");
+    let db = feed(&app).db_filter;
+    assert_eq!(db, Some(0));
+
+    app.on_key(KeyEvent::from(KeyCode::Char('s')));
+    assert!(matches!(app.modal, Some(Modal::Form { .. })));
+    // A batch arriving while the form is open goes nowhere and panics nothing.
+    batch(&mut app, 0, 10, 2);
+    for c in "get*".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    check_feed(&mut app, "filter set");
+    assert_eq!(feed(&app).patterns, ["get*"]);
+    assert_eq!(feed(&app).db_filter, db, "the database filter carries over");
+    batch(&mut app, 0, 900, 2);
+    check_feed(&mut app, "filtered pushes");
+    app.on_key(KeyEvent::from(KeyCode::End));
+    app.on_key(KeyEvent::from(KeyCode::Char('f')));
+    batch(&mut app, 900, PUBSUB_LIMIT, 2);
+    check_feed(&mut app, "paused past the cap");
+
+    app.on_key(KeyEvent::from(KeyCode::Char('s')));
+    for _ in 0.."get*".len() {
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    check_feed(&mut app, "filter cleared");
+    assert!(feed(&app).patterns.is_empty());
+    batch(&mut app, 0, 50, 2);
+    check_feed(&mut app, "a push after clearing the filter");
+    app.on_key(KeyEvent::from(KeyCode::Char('c')));
+    check_feed(&mut app, "cleared");
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    assert!(app.modal.is_none());
+}
+
+/// The pub/sub and keyspace feeds share the state: they never filter by
+/// database, so everything they receive is listed, including what arrives
+/// while the feed is set aside for the publish form.
+#[test]
+fn pubsub_and_keyspace_feeds_count_every_message() {
+    for (patterns, keyspace) in [
+        (vec!["news.*".to_string()], false),
+        (vec!["__keyevent@0__:*".to_string()], true),
+    ] {
+        let (mut app, _rx) = feed_app();
+        app.modal = Some(Modal::PubSub(PubSubState::new(patterns, keyspace)));
+        let what = if keyspace { "keyspace" } else { "pubsub" };
+        check_feed(&mut app, what);
+        let send = |app: &mut App, from: usize, count: usize| {
+            for i in from..from + count {
+                app.on_msg(Msg::PubSub {
+                    channel: format!("news.{}", i % 5),
+                    payload: format!("m{i} ключ 🙂"),
+                });
+            }
+        };
+        send(&mut app, 0, PUBSUB_LIMIT + 123);
+        check_feed(&mut app, &format!("{what}: past the cap"));
+        assert_eq!(feed(&app).shown_len(), PUBSUB_LIMIT);
+
+        // `d` belongs to the monitor only.
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(feed(&app).db_filter, None, "{what}");
+        check_feed(&mut app, &format!("{what}: d does nothing"));
+
+        app.on_key(KeyEvent::from(KeyCode::End));
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        send(&mut app, 0, 40);
+        check_feed(&mut app, &format!("{what}: paused"));
+
+        // Held behind the publish form, still counting.
+        app.on_key(KeyEvent::from(KeyCode::Char('w')));
+        assert!(matches!(app.modal, Some(Modal::Form { .. })), "{what}");
+        send(&mut app, 0, 500);
+        assert_eq!(
+            app.held_feed.as_ref().map(|f| f.shown_len()),
+            app.held_feed.as_ref().map(|f| f.shown().len()),
+            "{what}"
+        );
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        check_feed(&mut app, &format!("{what}: back from the form"));
+        assert_eq!(feed(&app).shown_len(), PUBSUB_LIMIT);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('c')));
+        check_feed(&mut app, &format!("{what}: cleared"));
+        send(&mut app, 0, 3);
+        check_feed(&mut app, &format!("{what}: after clearing"));
+        assert_eq!(feed(&app).shown_len(), 3);
+    }
+}

@@ -212,6 +212,65 @@ fn percent_encoded_socket_paths_and_passwords_are_decoded() {
     assert_eq!(c.endpoint(), "/tmp/my dir/r.sock");
 }
 
+/// The address shown for a socket profile is a URL; pasted back in, it has to
+/// name the same socket and database, whatever the path holds.
+#[test]
+fn a_socket_address_parses_back_to_the_same_path() {
+    for path in [
+        "/tmp/r.sock",
+        "/tmp/my dir/r.sock",
+        "/tmp/100%/r.sock",
+        "/tmp/%20literal/r.sock",
+        "/tmp/%/r.sock",
+        "/tmp/what?/r.sock",
+        "/tmp/a?db=9/r.sock",
+        "/tmp/#hash/r.sock",
+        "/tmp/ #?%/r.sock",
+        "/tmp/café/r.sock",
+        "/tmp/日本語/レディス.sock",
+        "/tmp/🙂 sock/r🍕.sock",
+        "/tmp/%E2%82%AC/r.sock",
+        "/tmp/end%",
+        "/tmp/end?",
+        "/tmp/end#",
+        "/tmp/trailing space ",
+        "/tmp/a+b/r.sock",
+        "/tmp/a&b=c;d/r.sock",
+        "/tmp/back\\slash/r.sock",
+        "/tmp/tab\there/r.sock",
+        "/tmp/[x]{y}|^`/r.sock",
+        "//tmp//r.sock",
+    ] {
+        for db in [0, 7, 15] {
+            let conn = Connection {
+                name: "p".into(),
+                socket: path.into(),
+                db,
+                ..Default::default()
+            };
+            let address = conn.address();
+            assert!(address.starts_with("unix://"), "{address}");
+            assert!(
+                address.ends_with(&format!("?db={db}")),
+                "the only query is the database: {address}"
+            );
+            // Whatever needs escaping is escaped: no raw `#`, `?` or space
+            // before the query, and every `%` starts an escape.
+            let before_query = &address[..address.rfind("?db=").unwrap()];
+            assert!(
+                !before_query.contains(['#', '?', ' ']),
+                "{path:?} -> {address}"
+            );
+            let parsed = Connection::from_url(&address)
+                .unwrap_or_else(|e| panic!("{path:?} -> {address}: {e:#}"));
+            // Surrounding whitespace is not part of the path the profile dials.
+            assert_eq!(parsed.socket, path.trim(), "{path:?} -> {address}");
+            assert_eq!(parsed.db, db, "{address}");
+            assert_eq!(parsed.address(), address, "stable on a second trip");
+        }
+    }
+}
+
 #[test]
 fn a_socket_url_without_an_absolute_path_is_refused() {
     for url in [

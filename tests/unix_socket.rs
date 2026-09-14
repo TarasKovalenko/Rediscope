@@ -409,6 +409,146 @@ async fn the_sort_order_survives_a_database_switch() {
     setup.execute_raw("FLUSHALL").await.unwrap();
 }
 
+/// Wait for the reconnect to `db` and the key listing that follows it.
+async fn pump_db(app: &mut App, rx: &mut Rx, db: i64) {
+    pump(app, rx, &format!("db{db}"), |a| {
+        !a.connecting && a.client.as_ref().is_some_and(|c| c.conn.db == db) && !a.loading
+    })
+    .await;
+}
+
+fn sorted_key_names(app: &App) -> Vec<String> {
+    let mut names = key_names(app);
+    names.sort();
+    names
+}
+
+/// The session is kept per profile, not per database: the sort, the search
+/// pattern and the open folders go along to each database switched to, and
+/// every switch writes the view it leaves.
+#[tokio::test]
+async fn ctrl_d_there_and_back_keeps_the_sort_pattern_and_folders() {
+    let Some(server) = server().await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let eleven = Client::connect(profile(&server, 11)).await.unwrap();
+    let twelve = Client::connect(profile(&server, 12)).await.unwrap();
+    eleven.execute_raw("FLUSHDB").await.unwrap();
+    twelve.execute_raw("FLUSHDB").await.unwrap();
+    for key in ["a:1", "a:2", "b:1"] {
+        eleven.set_string(key, "x").await.unwrap();
+    }
+    for key in ["a:9", "c:1"] {
+        twelve.set_string(key, "x").await.unwrap();
+    }
+
+    let (mut app, mut rx) = browser_app(Store {
+        connections: vec![profile(&server, 11)],
+        ..Default::default()
+    });
+    open_browser(&mut app, &mut rx, profile(&server, 11)).await;
+    assert_eq!(sorted_key_names(&app), ["a:1", "a:2", "b:1"]);
+
+    press(&mut app, KeyCode::Char('/'));
+    for c in "a*".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    pump(&mut app, &mut rx, "the search", |a| {
+        !a.loading && a.pattern == "a*" && a.keys.len() == 2
+    })
+    .await;
+    press(&mut app, KeyCode::Char('o'));
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.sort, SortMode::Type);
+    assert!(app.expanded.contains("a"), "{:?}", app.expanded);
+
+    switch_db(&mut app, 12);
+    pump_db(&mut app, &mut rx, 12).await;
+    assert_eq!(app.sort, SortMode::Type, "status: {}", app.status);
+    assert_eq!(app.pattern, "a*", "the pattern is the profile's");
+    assert_eq!(sorted_key_names(&app), ["a:9"]);
+    assert!(app.expanded.contains("a"), "{:?}", app.expanded);
+    let saved = &app.store.sessions["socket"];
+    assert_eq!(
+        (saved.db, saved.pattern.as_str(), saved.sort),
+        (11, "a*", SortMode::Type),
+        "the view left behind was saved"
+    );
+    let text = std::fs::read_to_string(rediscope::config::config_file()).unwrap();
+    assert!(text.contains(r#""sort": "type""#), "{text}");
+
+    // Change the order here, then go back.
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.sort, SortMode::Name);
+    switch_db(&mut app, 11);
+    pump_db(&mut app, &mut rx, 11).await;
+    assert_eq!(
+        app.sort,
+        SortMode::Name,
+        "the order set in db12 comes along"
+    );
+    assert_eq!(app.pattern, "a*");
+    assert_eq!(sorted_key_names(&app), ["a:1", "a:2"]);
+    let saved = &app.store.sessions["socket"];
+    assert_eq!((saved.db, saved.sort), (12, SortMode::Name));
+    let text = std::fs::read_to_string(rediscope::config::config_file()).unwrap();
+    assert!(
+        !text.contains(r#""sort""#),
+        "name order is the default and is not written: {text}"
+    );
+
+    press(&mut app, KeyCode::Char('o'));
+    switch_db(&mut app, 12);
+    pump_db(&mut app, &mut rx, 12).await;
+    assert_eq!(app.sort, SortMode::Ttl);
+    eleven.execute_raw("FLUSHDB").await.unwrap();
+    twelve.execute_raw("FLUSHDB").await.unwrap();
+}
+
+/// A connections.json that could not be read is left alone: switching the
+/// database still saves the session in memory, so the order survives, but
+/// nothing is written over the file.
+#[tokio::test]
+async fn ctrl_d_on_a_store_that_failed_to_load_does_not_write_the_file() {
+    let Some(server) = server().await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let setup = Client::connect(profile(&server, 11)).await.unwrap();
+    setup.execute_raw("FLUSHDB").await.unwrap();
+    setup.set_string("k:1", "x").await.unwrap();
+
+    let path = rediscope::config::config_file();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "{ not json, and the user's profiles are in here }";
+    std::fs::write(&path, original).unwrap();
+
+    let (mut app, mut rx) = browser_app(Store {
+        connections: vec![profile(&server, 11)],
+        read_error: Some("permission denied".into()),
+        ..Default::default()
+    });
+    open_browser(&mut app, &mut rx, profile(&server, 11)).await;
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.sort, SortMode::Ttl);
+
+    switch_db(&mut app, 12);
+    pump_db(&mut app, &mut rx, 12).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(app.sort, SortMode::Ttl, "kept in memory: {}", app.status);
+    assert_eq!(app.store.sessions["socket"].db, 11);
+
+    switch_db(&mut app, 11);
+    pump_db(&mut app, &mut rx, 11).await;
+    assert_eq!(key_names(&app), ["k:1"]);
+    ctrl(&mut app, 'n'); // back to the server list, which saves again
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let _ = std::fs::remove_file(&path);
+    setup.execute_raw("FLUSHDB").await.unwrap();
+}
+
 #[tokio::test]
 async fn t_probes_a_socket_profile_from_the_server_list() {
     let Some(server) = server().await else {

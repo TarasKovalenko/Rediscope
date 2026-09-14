@@ -856,3 +856,227 @@ fn memory_prefixes_keep_empty_segments_and_survive_odd_depths() {
     blank.measure("solo", 1);
     assert_eq!(prefixes(&blank, 1), ["solo", "u:"]);
 }
+
+// ---- escapes against separators that share their characters ------------------
+
+/// Encode each raw name the way the server's bytes reach the tree.
+fn encoded(raw: &[&[u8]]) -> Vec<String> {
+    raw.iter().map(|b| encode_key(b)).collect()
+}
+
+fn tree_of(names: &[String], separator: &str) -> Tree {
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    Tree::build(&keys(&refs), separator, SortMode::Name)
+}
+
+/// A backslash separator next to escapes and doubled backslashes: the split
+/// always lands on a whole doubled backslash, never on the one that starts
+/// an escape or on half of a pair.
+#[test]
+fn a_backslash_separator_never_splits_an_escape_or_half_a_pair() {
+    let names = encoded(&[
+        b"a\\\xff",    // `a\\\xff`: a literal backslash, then a byte
+        b"\xff\\b",    // `\xff\\b`
+        b"\\\xfe",     // `\\\xfe`: the separator first
+        b"a\xffb",     // `a\xffb`: an escape and no separator at all
+        b"a\\\\b",     // two literal backslashes: an empty folder between
+        b"\x0a\\\x0b", // control bytes are valid UTF-8, so not escaped
+    ]);
+    assert_eq!(names[0], "a\\\\\\xff");
+    assert_eq!(names[3], "a\\xffb");
+    let tree = tree_of(&names, "\\");
+    assert_consistent(&tree, "\\\\");
+    let mut drawn: Vec<(Option<String>, String)> = placements(&tree)
+        .into_iter()
+        .map(|(folder, label, _)| (folder, label))
+        .collect();
+    drawn.sort();
+    let s = |t: &str| t.to_string();
+    let mut want = vec![
+        (Some(s("a")), s("\\xff")),
+        (Some(s("\\xff")), s("b")),
+        (Some(s("")), s("\\xfe")),
+        (None, s("a\\xffb")),
+        (Some(s("a\\\\")), s("b")),
+        (Some(s("\n")), s("\u{b}")),
+    ];
+    want.sort();
+    assert_eq!(drawn, want);
+    for row in open_rows(&tree) {
+        if let Some(path) = &row.folder_path {
+            // A path never ends in the lone backslash of an escape or half of
+            // a doubled one.
+            let trailing = path.chars().rev().take_while(|c| *c == '\\').count();
+            assert_eq!(trailing % 2, 0, "{path:?}");
+        }
+    }
+}
+
+/// With `\x` as the separator the tree matches `\\x`, a literal backslash
+/// and an `x`. A literal backslash followed by an escaped byte, `\\\xff`,
+/// also holds `\\x` from its second character, but the raw name has no `\x`
+/// in it.
+#[test]
+fn a_backslash_x_separator_is_not_found_across_a_pair_and_an_escape() {
+    let names = encoded(&[b"dir\\xfile", b"dir\\xother", b"\\\xff", b"k\\\xfe\\xv"]);
+    assert_eq!(names[2], "\\\\\\xff");
+    let tree = tree_of(&names, "\\x");
+    assert_consistent(&tree, "\\\\x");
+    let drawn: Vec<(Option<String>, String, String)> = placements(&tree);
+    assert!(
+        drawn.contains(&(Some("dir".into()), "file".into(), names[0].clone())),
+        "{drawn:?}"
+    );
+    assert!(
+        drawn.contains(&(Some("k\\\\\\xfe".into()), "v".into(), names[3].clone())),
+        "only the real `\\x` splits: {drawn:?}"
+    );
+    // And the folder it is drawn in is one folder, not `k\` holding `fe`.
+    assert!(
+        !tree.all_folder_paths().contains(&"k\\".to_string()),
+        "{:?}",
+        tree.all_folder_paths()
+    );
+    assert!(
+        drawn.contains(&(None, names[2].clone(), names[2].clone())),
+        "the raw name holds no `\\x`, so it stays at the root: {drawn:?}"
+    );
+}
+
+/// `x`, `0` and `f` all appear inside `\xNN` escapes. A raw name without the
+/// separator in it should not be cut into a folder ending in half an escape.
+#[test]
+fn separators_made_of_escape_characters_do_not_cut_escapes() {
+    let mut wrong = Vec::new();
+    for (separator, raw, want_folder, want_label) in [
+        ("x", b"a\xffb".as_slice(), None, "a\\xffb"),
+        ("x", b"box\xff", Some("bo"), "\\xff"),
+        ("0", b"a\xf0b", None, "a\\xf0b"),
+        ("0", b"v0\xf0", Some("v"), "\\xf0"),
+        ("f", b"a\xffb", None, "a\\xffb"),
+        ("f", b"of\xfe", Some("o"), "\\xfe"),
+    ] {
+        let names = encoded(&[raw]);
+        let tree = tree_of(&names, separator);
+        let drawn = placements(&tree);
+        let want = [(
+            want_folder.map(str::to_string),
+            want_label.to_string(),
+            names[0].clone(),
+        )];
+        if drawn != want {
+            wrong.push(format!(
+                "separator {separator:?}, name {:?}: drawn {drawn:?}, want {want:?}",
+                names[0]
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// ---- multibyte separators and names -------------------------------------------
+
+#[test]
+fn split_last_cuts_on_whole_multibyte_separators() {
+    use rediscope::tree::split_last;
+    assert_eq!(split_last("a→b→c", "→"), Some(("a→b", "c")));
+    assert_eq!(split_last("🙂🙂x", "🙂"), Some(("🙂", "x")));
+    assert_eq!(split_last("x🙂", "🙂"), Some(("x", "")));
+    assert_eq!(split_last("🙂", "🙂"), Some(("", "")));
+    assert_eq!(
+        split_last("🙃x", "🙂"),
+        None,
+        "one byte short of the separator"
+    );
+    // An emoji whose bytes start like the separator's.
+    assert_eq!(split_last("😀a🙂b", "🙂"), Some(("😀a", "b")));
+    assert_eq!(split_last("家👨‍👩‍👧→🍕", "→"), Some(("家👨‍👩‍👧", "🍕")));
+    assert_eq!(split_last("", "→"), None);
+    // Overlapping emoji separators split from the left.
+    assert_eq!(split_last("a🙂🙂🙂b", "🙂🙂"), Some(("a", "🙂b")));
+}
+
+#[test]
+fn emoji_and_arrow_separators_build_trees_with_whole_labels() {
+    for separator in ["→", "🙂", "🙂🙂"] {
+        let names: Vec<String> = [
+            "🍕{s}topping{s}1",
+            "🍕{s}topping{s}2",
+            "{s}lead",
+            "trail{s}",
+            "日本{s}東京",
+            "plain🙃",
+        ]
+        .iter()
+        .map(|n| n.replace("{s}", separator))
+        .collect();
+        let tree = tree_of(&names, separator);
+        assert_consistent(&tree, separator);
+        let mut paths = sorted_paths(&tree);
+        paths.sort();
+        let mut want: Vec<String> = ["", "🍕", "🍕{s}topping", "trail", "日本"]
+            .iter()
+            .map(|p| p.replace("{s}", separator))
+            .collect();
+        want.sort();
+        assert_eq!(paths, want, "{separator}");
+        for row in open_rows(&tree) {
+            // Labels are whole characters and never hold the separator.
+            assert!(
+                !row.label.contains(separator),
+                "{separator}: {:?}",
+                row.label
+            );
+        }
+    }
+}
+
+#[test]
+fn a_new_key_prefix_under_an_emoji_separator_ends_with_it() {
+    let mut app = browser("🙂", &["🍕🙂topping🙂1", "🍕🙂solo", "flat😀"]);
+    select_folder(&mut app, "🍕🙂topping");
+    assert_eq!(app.new_key_prefix(), "🍕🙂topping🙂");
+    select_key(&mut app, "🍕🙂topping🙂1");
+    assert_eq!(app.new_key_prefix(), "🍕🙂topping🙂");
+    select_key(&mut app, "🍕🙂solo");
+    assert_eq!(app.new_key_prefix(), "🍕🙂");
+    select_key(&mut app, "flat😀");
+    assert_eq!(app.new_key_prefix(), "", "a root key starts at the root");
+    select_folder(&mut app, "🍕");
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Modal::Form { fields, .. }) = &app.modal else {
+        panic!("no new-key form")
+    };
+    assert_eq!(fields[0].input.value(), "🍕🙂");
+    render_sizes(&mut app);
+
+    let mut app = browser("→", &["a→b→c"]);
+    select_key(&mut app, "a→b→c");
+    assert_eq!(app.new_key_prefix(), "a→b→");
+    render_sizes(&mut app);
+}
+
+#[test]
+fn the_palette_ranks_a_word_after_an_emoji_or_arrow_separator_first() {
+    for separator in ["→", "🙂"] {
+        let names = ["xcart".to_string(), format!("user{separator}cart")];
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut app = browser(separator, &refs);
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "cart");
+        let Some(Modal::Palette(state)) = &app.modal else {
+            panic!("no palette")
+        };
+        let first_key = state
+            .hits
+            .iter()
+            .find(|h| matches!(h.target, rediscope::palette::Target::Key { .. }))
+            .unwrap();
+        assert_eq!(first_key.text, names[1], "{separator}");
+        render_sizes(&mut app);
+        // Typing the separator itself into the query does not panic.
+        type_str(&mut app, separator);
+        render_sizes(&mut app);
+        press(&mut app, KeyCode::Esc);
+    }
+}
