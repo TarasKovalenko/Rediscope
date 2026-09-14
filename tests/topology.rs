@@ -2974,3 +2974,125 @@ async fn cluster_keyspace_events_merge_every_primary_and_survive_a_lost_node() {
     assert_eq!(count(&nodes.a_log, "PSUBSCRIBE", None), 1);
     assert_eq!(b_subscriptions.load(Ordering::SeqCst), 2);
 }
+
+// ---- feeds: MONITOR on Sentinel and Cluster -------------------------------
+
+fn monitor_line(client_port: u16, args: &str) -> String {
+    format!("+1718000000.123456 [0 127.0.0.1:{client_port}] {args}\r\n")
+}
+fn command_on(event: &FeedEvent, needle: &str) -> Option<Option<String>> {
+    match event {
+        FeedEvent::Command { node, line } if line.contains(needle) => Some(node.clone()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn cluster_monitor_runs_on_every_primary_and_labels_each_line() {
+    let b_monitors = Arc::new(AtomicUsize::new(0));
+    let b_count = b_monitors.clone();
+    let nodes = TwoNodes::start(move |node, _, args| {
+        if args[0] != "MONITOR" {
+            return None;
+        }
+        Some(Some(match node {
+            'a' => "+OK\r\n".to_string() + &monitor_line(1, r#""set" "on-a" "1""#),
+            _ if b_count.fetch_add(1, Ordering::SeqCst) == 0 => {
+                "+OK\r\n".to_string() + &monitor_line(2, r#""set" "on-b" "1""#) + CLOSE
+            }
+            _ => "+OK\r\n".to_string() + &monitor_line(2, r#""del" "on-b-again""#),
+        }))
+    });
+    let client = nodes.client().await;
+    assert_eq!(client.primary_count(), 2);
+    // A single MONITOR connection cannot stand in for the whole cluster.
+    assert!(client.monitor().await.is_err());
+    let mut feed = client.monitor_feed().await.unwrap();
+    assert_eq!(feed.nodes(), 2);
+    let events = events_until(&mut feed, |seen| {
+        seen.iter().any(|e| command_on(e, "on-b-again").is_some())
+            && seen.iter().any(|e| command_on(e, "on-a").is_some())
+    })
+    .await;
+    let node_of = |needle: &str| events.iter().find_map(|e| command_on(e, needle)).unwrap();
+    let label = |port: u16| Some(format!("127.0.0.1:{port}"));
+    assert_eq!(node_of("on-a"), label(nodes.a.port));
+    assert_eq!(node_of("\"on-b\""), label(nodes.b.port));
+    assert_eq!(node_of("on-b-again"), label(nodes.b.port));
+    position(
+        &events,
+        notice_with(format!("Lost node 127.0.0.1:{}", nodes.b.port)),
+    );
+    assert_eq!(count(&nodes.a_log, "MONITOR", None), 1);
+    assert_eq!(b_monitors.load(Ordering::SeqCst), 2);
+    // The lines parse like a standalone server's, and carry their node.
+    let line = events
+        .iter()
+        .find_map(|e| match e {
+            FeedEvent::Command { line, .. } if line.contains("on-a") => Some(line.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let parsed = rediscope::redis_client::parse_monitor_line(&line).unwrap();
+    assert_eq!((parsed.command.as_str(), parsed.db), ("SET", Some(0)));
+}
+
+#[tokio::test]
+async fn sentinel_monitor_watches_the_primary() {
+    let primary_log: Log = Arc::default();
+    let seen = primary_log.clone();
+    let primary = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        Some(match args[0].as_str() {
+            "ROLE" => "*1\r\n$6\r\nmaster\r\n".into(),
+            "MONITOR" => "+OK\r\n".to_string() + &monitor_line(3, r#""get" "on-primary""#),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    let port = primary.port;
+    let sentinel = Peer::start(move |_, args| match args[0].as_str() {
+        "SENTINEL" => Some(format!(
+            "*2\r\n{}{}",
+            bulk("127.0.0.1"),
+            bulk(&port.to_string())
+        )),
+        _ => Some("+OK\r\n".into()),
+    });
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "service".into();
+    let client = Client::connect(profile).await.unwrap();
+    assert_eq!(client.primary_count(), 1);
+    let mut feed = client.monitor_feed().await.unwrap();
+    let events = events_until(&mut feed, |seen| {
+        seen.iter().any(|e| command_on(e, "on-primary").is_some())
+    })
+    .await;
+    assert_eq!(command_on(&events[0], "on-primary"), Some(None));
+    assert_eq!(count(&primary_log, "MONITOR", None), 1);
+    // The plain MONITOR connection goes to the primary as well.
+    let monitor = client.monitor().await.unwrap();
+    drop(monitor);
+    assert_eq!(count(&primary_log, "MONITOR", None), 2);
+}
+
+#[tokio::test]
+async fn production_cluster_monitor_prompt_names_the_primaries_it_will_slow() {
+    use crossterm::event::{KeyCode, KeyEvent};
+    use rediscope::app::{Action, App, Modal, Msg, Screen};
+    let nodes = TwoNodes::start(|_, _, _| None);
+    let mut profile = nodes.profile();
+    profile.environment = rediscope::config::Environment::Production;
+    let client = Client::connect(profile).await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(rediscope::config::Store::default(), tx);
+    app.screen = Screen::Browser;
+    app.client = Some(client);
+    app.on_key(KeyEvent::from(KeyCode::Char('W')));
+    let Some(Modal::Confirm { message, action }) = &app.modal else {
+        panic!("expected a confirmation, status: {}", app.status)
+    };
+    assert!(matches!(action, Action::Monitor));
+    assert!(message.contains("every primary"), "{message}");
+    assert!(message.contains("2 of them"), "{message}");
+    assert!(message.contains("throughput"), "{message}");
+}

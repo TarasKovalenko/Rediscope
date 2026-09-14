@@ -633,3 +633,88 @@ async fn failover(sentinel: &Server, replica: &Server) {
     }
     panic!("Sentinel never failed over to {}", replica.port);
 }
+
+/// The node a `MONITOR` line naming `needle` came from, if one arrived.
+fn monitored_on(events: &[FeedEvent], needle: &str) -> Option<Option<String>> {
+    events.iter().find_map(|e| match e {
+        FeedEvent::Command { node, line } if line.contains(needle) => Some(node.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_cluster_monitor_merges_every_primary_with_node_labels() {
+    let _serial = SERIAL.lock().await;
+    let servers = start_cluster().await;
+    let client = Client::connect(servers[0].profile(Deployment::Cluster))
+        .await
+        .unwrap();
+    let nodes = client.refresh_topology().await.unwrap();
+    let primaries: Vec<_> = nodes.iter().filter(|n| n.primary).cloned().collect();
+    assert_eq!(client.primary_count(), 3);
+    let mut feed = client.monitor_feed().await.unwrap();
+    assert_eq!(feed.nodes(), 3);
+    let keys: Vec<(String, u16)> = primaries
+        .iter()
+        .map(|n| (key_owned_by(n, "monitored:key:"), n.port))
+        .collect();
+    for (key, _) in &keys {
+        client.set_string(key, "watched").await.unwrap();
+    }
+    let events = read_until(&mut feed, 10, |seen| {
+        keys.iter().all(|(k, _)| monitored_on(seen, k).is_some())
+    })
+    .await;
+    for (key, port) in &keys {
+        assert_eq!(
+            monitored_on(&events, key),
+            Some(Some(format!("127.0.0.1:{port}"))),
+            "{key}"
+        );
+        let line = events
+            .iter()
+            .find_map(|e| match e {
+                FeedEvent::Command { line, .. } if line.contains(key.as_str()) => Some(line),
+                _ => None,
+            })
+            .unwrap();
+        let parsed = rediscope::redis_client::parse_monitor_line(line).unwrap();
+        assert_eq!((parsed.command.as_str(), parsed.db), ("SET", Some(0)));
+    }
+    drop(feed);
+    drop(servers);
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_sentinel_monitor_watches_the_primary() {
+    let _serial = SERIAL.lock().await;
+    let primary = Server::start(false, None).await;
+    let sentinel = Server::start(false, Some(primary.port)).await;
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "test-primary".into();
+    let client = Client::connect(profile).await.unwrap();
+    let mut feed = client.monitor_feed().await.unwrap();
+    assert_eq!(feed.nodes(), 1);
+    client
+        .set_string("sentinel:monitored", "seen")
+        .await
+        .unwrap();
+    let events = read_until(&mut feed, 10, |seen| {
+        monitored_on(seen, "sentinel:monitored").is_some()
+    })
+    .await;
+    assert_eq!(monitored_on(&events, "sentinel:monitored"), Some(None));
+    // Only the primary runs the command a client sends it.
+    redis::cmd("SET")
+        .arg("sentinel:raw")
+        .arg("x")
+        .query_async::<()>(&mut primary.raw().await)
+        .await
+        .unwrap();
+    read_until(&mut feed, 10, |seen| {
+        monitored_on(seen, "sentinel:raw").is_some()
+    })
+    .await;
+}

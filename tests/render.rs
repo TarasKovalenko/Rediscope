@@ -1222,6 +1222,7 @@ async fn the_monitor_lists_one_database_after_d() {
             command: "GET".into(),
             detail: format!("db{db} 10.0.0.7:51234  \"{key}\""),
             db: Some(db),
+            node: None,
         });
     }
     a.modal = Some(Modal::PubSub(feed));

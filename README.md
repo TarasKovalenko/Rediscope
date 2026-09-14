@@ -316,8 +316,15 @@ rediscope
   the rate, the totals and that 500 per batch still cover every database. The
   `MONITOR` connection closes with the feed, however the feed goes away.
   A production profile asks before starting it, because `MONITOR` costs the
-  server real throughput while it runs; `Esc` stops it. Standalone profiles
-  only for now.
+  server real throughput while it runs; `Esc` stops it. A Sentinel profile
+  monitors the primary and moves to the new one after a failover. `MONITOR`
+  only sees the node it runs on, so a Cluster profile opens one `MONITOR`
+  connection per primary and merges them into the one feed, naming each
+  command's node when the terminal is wide enough. The 500 per 100 ms cap
+  covers the merged feed, not each node, and `d` still works, though a
+  cluster only has database 0. On a production cluster the prompt says how
+  many primaries will be slowed. A node that drops out is reported in the feed
+  and the others keep streaming.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
   evicted live. Needs `notify-keyspace-events` set on the server. A cluster
@@ -816,8 +823,7 @@ the current default node, which can differ from it after a failover. `PUBLISH`
   `COMMAND GETKEYS` before they are routed.
 - **No transactions** (`MULTI`/`EXEC`) on a cluster, and database 0 only.
 
-Cluster memory rollups and discovered-profile `MONITOR` are not available
-yet. Managed services exposing a single proxy endpoint can keep a
+Cluster memory rollups are not available yet. Managed services exposing a single proxy endpoint can keep a
 standalone profile.
 
 Saved connections live in `connections.json` under your platform config dir, and

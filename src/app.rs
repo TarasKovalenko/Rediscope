@@ -1006,7 +1006,7 @@ impl PubSubState {
         {
             self.dbs.insert(slot, db);
         }
-        self.push_entry(line.command, line.detail, line.db, None, at);
+        self.push_entry(line.command, line.detail, line.db, line.node, at);
     }
 
     /// Whether `message` passes the database filter.
@@ -3816,6 +3816,8 @@ impl App {
                         node,
                     },
                     FeedEvent::Notice(text) => Msg::FeedNotice(text),
+                    // A subscription never carries `MONITOR` lines.
+                    FeedEvent::Command { .. } => continue,
                 };
                 if tx.send(msg).is_err() {
                     return;
@@ -3831,18 +3833,24 @@ impl App {
         let Some(client) = &self.client else {
             return;
         };
-        if client.conn.deployment != crate::config::Deployment::Standalone {
-            self.status =
-                "MONITOR watches one server; it is not available for Cluster or Sentinel profiles yet"
-                    .into();
-            return;
-        }
         if client.production() {
-            self.modal = Some(Modal::Confirm {
-                message: format!(
+            let message = match client.conn.deployment {
+                crate::config::Deployment::Cluster => format!(
+                    "MONITOR runs on every primary of '{}' at once, {} of them by the last discovery, and streams every command they receive to this terminal. It can cut the throughput of each of those nodes sharply while it runs. Start it? (y/n)",
+                    client.conn.name,
+                    client.primary_count()
+                ),
+                crate::config::Deployment::Sentinel => format!(
+                    "MONITOR streams every command the primary of '{}' receives to this terminal and can cut its throughput sharply while it runs. Start it? (y/n)",
+                    client.conn.name
+                ),
+                crate::config::Deployment::Standalone => format!(
                     "MONITOR streams every command '{}' receives to this terminal and can cut the server's throughput sharply while it runs. Start it? (y/n)",
                     client.conn.name
                 ),
+            };
+            self.modal = Some(Modal::Confirm {
+                message,
                 action: Action::Monitor,
             });
             return;
@@ -3874,32 +3882,46 @@ impl App {
             .collect();
         let tx = self.tx.clone();
         state.task = Some(tokio::spawn(async move {
-            use futures_util::StreamExt;
-            let monitor = match client.monitor().await {
-                Ok(m) => m,
+            let mut feed = match client.monitor_feed().await {
+                Ok(feed) => feed,
                 Err(e) => {
-                    let _ = tx.send(Msg::Error(format!("cannot start MONITOR: {e}")));
+                    let _ = tx.send(Msg::Error(format!("cannot start MONITOR: {e:#}")));
                     return;
                 }
             };
-            let mut stream = monitor.into_on_message::<String>();
             let mut tick = tokio::time::interval(MONITOR_FLUSH);
             let mut batch: Vec<MonitorLine> = Vec::new();
             let mut dropped = 0u64;
             loop {
                 tokio::select! {
-                    line = stream.next() => {
-                        let Some(line) = line else {
-                            let _ = tx.send(Msg::MonitorBatch {
-                                lines: std::mem::take(&mut batch),
-                                dropped,
-                            });
-                            let _ = tx.send(Msg::Error("MONITOR connection closed".into()));
-                            return;
+                    event = feed.next() => {
+                        let (node, line) = match event {
+                            Some(FeedEvent::Command { node, line }) => (node, line),
+                            Some(FeedEvent::Notice(text)) => {
+                                // What arrived before the notice is listed first.
+                                let _ = tx.send(Msg::MonitorBatch {
+                                    lines: std::mem::take(&mut batch),
+                                    dropped: std::mem::take(&mut dropped),
+                                });
+                                if tx.send(Msg::FeedNotice(text)).is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            Some(FeedEvent::Message { .. }) => continue,
+                            None => {
+                                let _ = tx.send(Msg::MonitorBatch {
+                                    lines: std::mem::take(&mut batch),
+                                    dropped,
+                                });
+                                let _ = tx.send(Msg::Error("MONITOR connection closed".into()));
+                                return;
+                            }
                         };
-                        let Some(parsed) = crate::redis_client::parse_monitor_line(&line) else {
+                        let Some(mut parsed) = crate::redis_client::parse_monitor_line(&line) else {
                             continue;
                         };
+                        parsed.node = node;
                         // Filtered on the whole line, then cut for the feed.
                         if !patterns.is_empty() {
                             let text = format!("{} {}", parsed.command, parsed.detail)
@@ -7450,6 +7472,27 @@ mod tests {
     }
 
     #[test]
+    fn a_merged_monitor_keeps_each_commands_node_and_lists_notices() {
+        let mut app = tick_app(vec![]);
+        app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
+        let mut on_b = command("SET", 0, "\"k\" \"v\"");
+        on_b.node = Some("10.0.0.2:7001".into());
+        app.on_msg(Msg::MonitorBatch {
+            lines: vec![command("GET", 0, "\"k\""), on_b],
+            dropped: 0,
+        });
+        app.on_msg(Msg::FeedNotice("Lost node 10.0.0.3:7002".into()));
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("the feed stays open");
+        };
+        let nodes: Vec<Option<&str>> = state.messages.iter().map(|m| m.node.as_deref()).collect();
+        assert_eq!(nodes, vec![None, Some("10.0.0.2:7001"), None]);
+        assert!(state.messages[2].notice);
+        assert_eq!(state.total, 2, "a notice is not a command");
+        assert_eq!(app.status, "Lost node 10.0.0.3:7002");
+    }
+
+    #[test]
     fn monitor_batches_feed_the_monitor_and_count_what_was_dropped() {
         let mut app = tick_app(vec![]);
         app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
@@ -7502,6 +7545,7 @@ mod tests {
             command: name.into(),
             detail: format!("db{db} 1.2.3.4:5  {args}"),
             db: Some(db),
+            node: None,
         }
     }
 

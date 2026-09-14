@@ -768,13 +768,33 @@ impl Client {
     }
 
     /// A `MONITOR` connection of its own: every command the server runs, as
-    /// it runs it. Dropping it ends the monitoring.
+    /// it runs it. Dropping it ends the monitoring. On a Sentinel profile it
+    /// watches the primary. A cluster runs `MONITOR` per node, so it needs
+    /// [`monitor_feed`](Self::monitor_feed) instead.
     pub async fn monitor(&self) -> Result<redis::aio::Monitor> {
-        anyhow::ensure!(
-            self.conn.deployment == Deployment::Standalone,
-            "MONITOR watches one server, and is not supported for discovered deployments yet"
-        );
-        Ok(self.raw.get_async_monitor().await?)
+        match self.conn.deployment {
+            Deployment::Standalone => Ok(self.raw.get_async_monitor().await?),
+            Deployment::Sentinel => {
+                let ep = self.mgr.default_endpoint().await;
+                Ok(self.mgr.node_client(&ep).await?.get_async_monitor().await?)
+            }
+            Deployment::Cluster => anyhow::bail!(
+                "MONITOR on a cluster runs on every primary; use the merged monitor feed"
+            ),
+        }
+    }
+
+    /// Every command the server runs, as raw `MONITOR` lines, until the feed
+    /// is dropped. A Sentinel feed follows the primary; a cluster feed opens
+    /// one `MONITOR` per primary and labels each line with its node.
+    pub async fn monitor_feed(&self) -> Result<Feed> {
+        feed::monitor(self.mgr.clone()).await
+    }
+
+    /// How many primaries the last discovery found: one for a standalone or
+    /// Sentinel profile. Read without waiting, for a confirmation prompt.
+    pub fn primary_count(&self) -> usize {
+        self.mgr.primary_count()
     }
 
     /// Command names for console completion, and the subset flagged `write`.
@@ -2981,6 +3001,8 @@ pub struct MonitorLine {
     pub detail: String,
     /// The database the command ran against, when the line names one.
     pub db: Option<i64>,
+    /// The cluster node that ran it, when the feed merges several.
+    pub node: Option<String>,
 }
 
 impl MonitorLine {
@@ -3020,6 +3042,7 @@ pub fn parse_monitor_line(line: &str) -> Option<MonitorLine> {
             .trim_end()
             .to_string(),
         db: db.parse().ok(),
+        node: None,
     })
 }
 

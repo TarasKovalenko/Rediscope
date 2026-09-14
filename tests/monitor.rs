@@ -531,6 +531,7 @@ fn line(db: Option<i64>, text: &str) -> MonitorLine {
         command: "GET".into(),
         detail: format!("db{} 1.2.3.4:5  \"{text}\"", db.unwrap_or(-1)),
         db,
+        node: None,
     }
 }
 

@@ -1,4 +1,5 @@
-//! Live feeds on every kind of profile: pub/sub and keyspace events.
+//! Live feeds on every kind of profile: pub/sub, keyspace events and
+//! `MONITOR`.
 //!
 //! A feed needs connections of its own, because a subscribed connection can
 //! do nothing else. Where they go depends on the deployment:
@@ -8,9 +9,10 @@
 //!   new primary after a failover.
 //! - A cluster broadcasts `PUBLISH` to every node, so channel messages need one
 //!   subscription on the default node, followed to another node if it goes.
-//! - Keyspace notifications never leave the node that raised them, so on a
-//!   cluster a keyspace feed subscribes on every primary and merges what they
-//!   send, labelled by node. A lost node is reported and the others go on.
+//! - Keyspace notifications never leave the node that raised them, and
+//!   `MONITOR` only sees the node it runs on, so on a cluster those feeds open
+//!   a connection on every primary and merge what they send, labelled by node.
+//!   A lost node is reported and the others go on.
 use super::topology::Transport;
 use crate::config::Deployment;
 use anyhow::{Context, Result};
@@ -30,6 +32,9 @@ pub enum FeedEvent {
         channel: String,
         payload: String,
     },
+    /// One raw `MONITOR` line. `node` names the node that ran the command
+    /// when the feed merges several.
+    Command { node: Option<String>, line: String },
     /// Something the viewer should know about the feed itself: a node lost,
     /// a reconnection.
     Notice(String),
@@ -71,11 +76,14 @@ const RETRY_MAX: Duration = Duration::from_secs(5);
 /// The connection a feed reads from.
 enum Link {
     PubSub(redis::aio::PubSub),
+    Monitor(redis::aio::Monitor),
 }
 
-/// What a feed is made of.
+/// What a feed is made of: `PSUBSCRIBE` to `patterns`, or `MONITOR` when
+/// there are none.
 #[derive(Clone)]
 struct Spec {
+    monitor: bool,
     patterns: Vec<String>,
 }
 
@@ -90,6 +98,9 @@ pub fn label(ep: &Endpoint) -> String {
 async fn open(transport: &Transport, ep: &Endpoint, spec: &Spec) -> Result<Link> {
     let work = async {
         let client = transport.node_client(ep).await?;
+        if spec.monitor {
+            return anyhow::Ok(Link::Monitor(client.get_async_monitor().await?));
+        }
         let mut pubsub = client.get_async_pubsub().await?;
         for pattern in &spec.patterns {
             pubsub.psubscribe(pattern).await?;
@@ -120,6 +131,19 @@ async fn pump(link: Link, node: Option<String>, tx: &mpsc::Sender<FeedEvent>) ->
             }
             true
         }
+        Link::Monitor(monitor) => {
+            let mut stream = monitor.into_on_message::<String>();
+            while let Some(line) = stream.next().await {
+                let event = FeedEvent::Command {
+                    node: node.clone(),
+                    line,
+                };
+                if tx.send(event).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        }
     }
 }
 
@@ -130,8 +154,21 @@ pub(super) async fn subscribe(
     patterns: Vec<String>,
     node_local: bool,
 ) -> Result<Feed> {
-    let spec = Spec { patterns };
+    let spec = Spec {
+        monitor: false,
+        patterns,
+    };
     let every_primary = node_local && transport.deployment() == Deployment::Cluster;
+    start(transport, spec, every_primary).await
+}
+
+/// `MONITOR`, on every primary of a cluster.
+pub(super) async fn monitor(transport: Transport) -> Result<Feed> {
+    let spec = Spec {
+        monitor: true,
+        patterns: Vec::new(),
+    };
+    let every_primary = transport.deployment() == Deployment::Cluster;
     start(transport, spec, every_primary).await
 }
 
@@ -167,7 +204,7 @@ async fn start(transport: Transport, spec: Spec, every_primary: bool) -> Result<
     }
     for (ep, e) in &failed {
         let _ = tx.try_send(FeedEvent::Notice(format!(
-            "Cannot reach node {}; its events are missing until it answers: {e}",
+            "Cannot reach node {}; it is missing from the feed until it answers: {e}",
             label(ep)
         )));
     }

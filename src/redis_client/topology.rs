@@ -33,6 +33,8 @@ pub(super) struct Transport {
     safety: crate::safety::Safety,
     audit: crate::audit::Audit,
     state: Arc<Mutex<State>>,
+    /// Primaries the last discovery found, readable without the lock.
+    primary_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 struct State {
     clients: HashMap<Endpoint, redis::Client>,
@@ -97,6 +99,7 @@ impl Transport {
                 refreshed: Instant::now(),
                 warning: None,
             })),
+            primary_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         };
         let result = this.refresh().await;
         this.audit.record(
@@ -271,6 +274,9 @@ impl Transport {
                         .or_else(|| nodes.iter().find(|n| n.primary))
                         .ok_or_else(|| error("No primary discovered"))?
                         .endpoint();
+                    let primaries = nodes.iter().filter(|n| n.primary).count();
+                    self.primary_count
+                        .store(primaries.max(1), std::sync::atomic::Ordering::Relaxed);
                     state.nodes = nodes;
                     state.refreshed = Instant::now();
                     state.warning = None;
@@ -395,6 +401,10 @@ impl Transport {
     }
     pub fn deployment(&self) -> Deployment {
         self.profile.deployment
+    }
+    pub fn primary_count(&self) -> usize {
+        self.primary_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     /// A client for one node, with the profile's data credentials and TLS,
     /// for a connection that cannot be shared: pub/sub or `MONITOR`. On a
