@@ -216,7 +216,7 @@ impl Rollup {
 /// there is nothing left to group it with.
 fn prefix_of(key: &str, depth: usize, separator: &str) -> String {
     let mut out = String::with_capacity(key.len());
-    for (i, segment) in key.split(separator).enumerate() {
+    for (i, segment) in crate::tree::split(key, separator).enumerate() {
         if i == depth {
             // Truncated, so the trailing separator says "and everything below".
             out.push_str(separator);

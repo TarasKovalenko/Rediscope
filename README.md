@@ -98,7 +98,8 @@ rediscope -H 127.0.0.1 -p 6379
 Your first minute, in order:
 
 1. The key tree fills on the left. Keys split on `:`, so `user:42:profile` sits
-   under `user` → `42`. A profile can split on something else, like `/`. Move with `j` / `k`, open a folder with `Enter` or `l`.
+   under `user` → `42`. A profile can split on something else, like `/`.
+   Move with `j` / `k`, open a folder with `Enter` or `l`.
 2. Selecting a key loads its value on the right, with its type and TTL in the
    header. `Tab` moves focus into the value pane and back.
 3. Press `/` and type `session` to filter. A bare word becomes `*session*`;
@@ -120,8 +121,9 @@ rediscope
 
 ### Browsing
 
-- **Namespace tree.** Keys grouped by `:` into collapsible folders, with a
-  per-folder key count and a type badge on every leaf.
+- **Namespace tree.** Keys grouped by `:`, or the profile's own separator, into
+  collapsible folders, with a per-folder key count and a type badge on every
+  leaf.
 - **Sorting that reads right** (`o`). Keys sort naturally, so `order:9` comes
   before `order:10`, ignoring case. `o` switches the keys in each folder to
   soonest expiry first (keys without a TTL go last), then to grouped by type,
@@ -818,6 +820,9 @@ the left, so that key is `:b` in folder `a`.
 A backslash separator matches a single literal backslash in a key name.
 Key names are shown with a real backslash doubled (see [Notes](#notes)), so
 the folders and prefixes the tree and memory report show carry it doubled too.
+A byte that isn't valid UTF-8 is shown as `\xNN`, and a separator is never
+matched inside one of those, so `x` or `f` as a separator won't cut a binary
+name apart.
 
 ```json
 { "name": "assets", "host": "10.0.2.9", "port": 6379, "separator": "/" }

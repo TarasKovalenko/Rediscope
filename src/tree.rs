@@ -202,7 +202,7 @@ impl Tree {
         for k in keys {
             let mut cur = &mut root;
             if let Some((folders, _)) = split_last(&k.name, separator) {
-                for part in folders.split(separator) {
+                for part in split(folders, separator) {
                     // Looked up before inserting, so a folder already seen
                     // costs no allocation for its name.
                     if !cur.folders.contains_key(part) {
@@ -256,8 +256,79 @@ pub fn effective(separator: &str) -> Cow<'_, str> {
 /// `::` in `a:::b`, splits into `a` and `:b` from the left but `a:` and `b`
 /// from the right, and the tree splits from the left.
 pub fn split_last<'a>(name: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
-    let (at, _) = name.match_indices(separator).last()?;
+    let at = matches(name, separator).last()?;
     Some((&name[..at], &name[at + separator.len()..]))
+}
+
+/// `name` split on every separator [`matches`] finds.
+pub fn split<'a>(name: &'a str, separator: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    let mut start = 0;
+    let mut cuts = matches(name, separator);
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        match cuts.next() {
+            Some(at) => {
+                let part = &name[start..at];
+                start = at + separator.len();
+                Some(part)
+            }
+            None => {
+                done = true;
+                Some(&name[start..])
+            }
+        }
+    })
+}
+
+/// Where `separator` occurs in `name`, left to right without overlap, counting
+/// only matches that start and end between whole characters of the encoded
+/// name. [`encode_key`](crate::redis_client::encode_key) writes a backslash as
+/// `\\` and a byte that is not UTF-8 as `\xNN`, and a separator such as `x`,
+/// `f` or `\x` must not be found inside or across one of those.
+pub fn matches<'a>(name: &'a str, separator: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        if separator.is_empty() {
+            return None;
+        }
+        while let Some(found) = name.get(from..)?.find(separator) {
+            let at = from + found;
+            let end = at + separator.len();
+            if unit_boundary(name, at) && unit_boundary(name, end) {
+                from = end;
+                return Some(at);
+            }
+            from = at + name[at..].chars().next().map_or(1, char::len_utf8);
+        }
+        None
+    })
+}
+
+/// True when byte `i` of an encoded key name falls between two whole
+/// characters: not inside a multibyte character, a doubled backslash or a
+/// `\xNN` escape.
+pub fn unit_boundary(name: &str, i: usize) -> bool {
+    let bytes = name.as_bytes();
+    if i > bytes.len() || !name.is_char_boundary(i) {
+        return false;
+    }
+    // Every escape starts with a backslash, so a name without one before `i`
+    // has nothing to be inside of.
+    if !bytes[..i].contains(&b'\\') {
+        return true;
+    }
+    let mut p = 0;
+    while p < i {
+        p += match (bytes[p], bytes.get(p + 1)) {
+            (b'\\', Some(b'\\')) => 2,
+            (b'\\', Some(b'x')) if p + 3 < bytes.len() => 4,
+            _ => name[p..].chars().next().map_or(1, char::len_utf8),
+        };
+    }
+    p == i
 }
 
 /// `parent` is the path of the folder these nodes sit in, `None` at the root.
@@ -519,5 +590,196 @@ mod tests {
     fn an_empty_separator_means_the_default() {
         let tree = Tree::build(&[key("user:1")], "", SortMode::Name);
         assert_eq!(tree.all_folder_paths(), ["user"]);
+    }
+
+    /// A piece of a name as the slow comparator sees it.
+    enum Token {
+        /// A run of ASCII digits: the run as written, and without its
+        /// leading zeros.
+        Digits(String, String),
+        /// Any other character, lowercased.
+        Char(Vec<char>),
+    }
+
+    fn tokens(s: &str) -> Vec<Token> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_ascii_digit() {
+                let run: String = chars[i..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                i += run.len();
+                let value = run.trim_start_matches('0').to_string();
+                out.push(Token::Digits(run, value));
+            } else {
+                out.push(Token::Char(chars[i].to_lowercase().collect()));
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The folded order written the obvious way: split both names into
+    /// tokens from the start, with no shortcuts.
+    fn slow_folded(a: &str, b: &str) -> Ordering {
+        let (x, y) = (tokens(a), tokens(b));
+        for (s, t) in x.iter().zip(y.iter()) {
+            let order = match (s, t) {
+                // By value: more significant digits is bigger, then digit by
+                // digit.
+                (Token::Digits(_, p), Token::Digits(_, q)) => {
+                    p.len().cmp(&q.len()).then_with(|| p.cmp(q))
+                }
+                // A digit against anything else compares as a character.
+                (Token::Digits(run, _), Token::Char(c)) => {
+                    [run.chars().next().unwrap()].as_slice().cmp(c.as_slice())
+                }
+                (Token::Char(c), Token::Digits(run, _)) => {
+                    c.as_slice().cmp([run.chars().next().unwrap()].as_slice())
+                }
+                (Token::Char(c), Token::Char(d)) => c.cmp(d),
+            };
+            if order != Ordering::Equal {
+                return order;
+            }
+        }
+        x.len().cmp(&y.len())
+    }
+
+    /// The whole order: folded, and where that ties (case, or leading zeros),
+    /// the bytes.
+    fn slow_cmp(a: &str, b: &str) -> Ordering {
+        slow_folded(a, b).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+    }
+
+    #[test]
+    fn the_shared_prefix_skip_agrees_with_the_slow_comparator() {
+        let cases = [
+            ("a19", "a100", Ordering::Less),
+            ("x09", "x1", Ordering::Greater),
+            ("v1.10", "v1.9", Ordering::Greater),
+            ("file007", "file07", Ordering::Less),
+            ("file07", "file7", Ordering::Less),
+            ("file007", "file7", Ordering::Less),
+            ("é1", "é10", Ordering::Less),
+            ("é10", "é9", Ordering::Greater),
+            ("日本2", "日本10", Ordering::Less),
+            // `本` and `末` share their first two bytes.
+            ("日本2", "日末1", "本".cmp("末")),
+            ("ABCx2", "abcX10", Ordering::Less),
+            (
+                "tenant:0042:user:ABCx2",
+                "tenant:0042:user:abcX10",
+                Ordering::Less,
+            ),
+            ("tenant:0042:x", "tenant:42:x", Ordering::Less),
+            ("tenant:0042:b", "tenant:42:a", Ordering::Greater),
+            ("12345678901", "12345678910", Ordering::Less),
+            ("abcdefgh99", "abcdefgh100", Ordering::Less),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(natural_cmp(a, b), want, "{a:?} {b:?}");
+            assert_eq!(natural_cmp(b, a), want.reverse(), "{b:?} {a:?}");
+            assert_eq!(slow_cmp(a, b), want, "the reference, {a:?} {b:?}");
+            assert_eq!(natural_folded(a, b), slow_folded(a, b), "{a:?} {b:?}");
+        }
+        // Equal but for leading zeros: the folded part ties.
+        assert_eq!(natural_folded("file007", "file7"), Ordering::Equal);
+        assert_eq!(natural_folded("ABCx10", "abcX010"), Ordering::Equal);
+        // Where the skip lands: the start of the digit run, the start of the
+        // character.
+        assert_eq!(shared_start(b"a19", b"a100"), 1);
+        assert_eq!(shared_start(b"file007", b"file07"), 4);
+        assert_eq!(shared_start("日本2".as_bytes(), "日末1".as_bytes()), 3);
+        assert_eq!(shared_start("é1".as_bytes(), "é10".as_bytes()), 2);
+    }
+
+    /// A small linear congruential generator, so the property test is the
+    /// same on every run without pulling in a crate.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const ALPHABET: [char; 17] = [
+        '0', '0', '1', '2', '9', 'a', 'A', 'ß', 'İ', 'é', 'É', '日', ':', '/', '.', ' ', 'x',
+    ];
+
+    fn random_name(rng: &mut Lcg, max: usize) -> String {
+        let len = rng.below(max + 1);
+        (0..len)
+            .map(|_| ALPHABET[rng.below(ALPHABET.len())])
+            .collect()
+    }
+
+    /// Usually a name sharing a prefix with `base`, since the prefix skip is
+    /// what is under test; sometimes one with nothing in common.
+    fn related_name(rng: &mut Lcg, base: &str) -> String {
+        if rng.below(5) == 0 {
+            return random_name(rng, 8);
+        }
+        let chars: Vec<char> = base.chars().collect();
+        let keep = rng.below(chars.len() + 1);
+        let mut out: String = chars[..keep].iter().collect();
+        out.push_str(&random_name(rng, 5));
+        out
+    }
+
+    #[test]
+    fn natural_order_matches_the_slow_comparator_on_random_names() {
+        let mut rng = Lcg(0x5EED_CAFE_F00D_0001);
+        for round in 0..20_000 {
+            let a = random_name(&mut rng, 10);
+            let b = related_name(&mut rng, &a);
+            let from = if rng.below(2) == 0 { &a } else { &b };
+            let c = related_name(&mut rng, from);
+            let names = [a.as_str(), b.as_str(), c.as_str()];
+            for x in names {
+                for y in names {
+                    let got = natural_cmp(x, y);
+                    assert_eq!(got, slow_cmp(x, y), "round {round}: {x:?} {y:?}");
+                    assert_eq!(
+                        natural_folded(x, y),
+                        slow_folded(x, y),
+                        "round {round}: folded {x:?} {y:?}"
+                    );
+                    assert_eq!(
+                        got,
+                        natural_cmp(y, x).reverse(),
+                        "round {round}: antisymmetry {x:?} {y:?}"
+                    );
+                    assert_eq!(got == Ordering::Equal, x == y, "round {round}: {x:?} {y:?}");
+                }
+            }
+            for x in names {
+                for y in names {
+                    for z in names {
+                        if natural_cmp(x, y) != Ordering::Greater
+                            && natural_cmp(y, z) != Ordering::Greater
+                        {
+                            assert_ne!(
+                                natural_cmp(x, z),
+                                Ordering::Greater,
+                                "round {round}: transitivity {x:?} <= {y:?} <= {z:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

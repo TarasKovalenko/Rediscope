@@ -3011,7 +3011,11 @@ impl App {
                 let under: Vec<String> = self
                     .keys
                     .iter()
-                    .filter(|k| k.name == path || k.name.starts_with(&prefix))
+                    .filter(|k| {
+                        k.name == path
+                            || (k.name.starts_with(&prefix)
+                                && crate::tree::unit_boundary(&k.name, prefix.len()))
+                    })
                     .map(|k| k.name.clone())
                     .collect();
                 let all_marked = under.iter().all(|n| self.marked.contains(n));
@@ -4366,7 +4370,7 @@ impl App {
     /// Select a loaded key in the tree, opening every folder above it.
     fn jump_to_key(&mut self, name: &str) {
         let separator = crate::tree::effective(&self.separator).to_string();
-        let parts: Vec<&str> = name.split(separator.as_str()).collect();
+        let parts: Vec<&str> = crate::tree::split(name, &separator).collect();
         for depth in 1..parts.len() {
             self.expanded.insert(parts[..depth].join(&separator));
         }
