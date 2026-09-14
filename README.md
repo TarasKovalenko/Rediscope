@@ -783,7 +783,10 @@ repeats discovery after connection loss. If a Sentinel discovery fails, the
 next command discovers again before it is sent and is refused if that fails
 too, so a stale address is never used. That includes changes made from the
 diagnostics tabs, and the tabs show the discovery error instead of reading
-the old primary. Reads use bounded retries and backoff.
+the old primary. A `CONFIG SET` from the Config tab is refused, unsent, once
+a discovery has found a different primary than the one the tab was read from;
+disconnecting a client or resetting the slow log still goes to the node that
+listed it. Reads use bounded retries and backoff.
 A node that stops answering only holds up the commands sent to it; reads and
 writes for other nodes carry on, and callers that need a fresh topology at
 the same moment share a single discovery. A command that just failed never
@@ -795,13 +798,16 @@ write whose connection failed before it was sent is also tried again; a bulk
 batch that cannot reach one of its nodes stops instead. A write whose
 reply is lost reports an unknown outcome and is never replayed, and the
 topology is refreshed at once so the next command finds the new primary.
-Writes that arrive while that refresh runs wait for it.
+Writes that arrive while that refresh runs wait for it. Reads wait for it
+too, so the first commands after a lost write can take as long as that
+discovery, up to 10 seconds.
 A load balancer or firewall can drop a quiet connection without telling
 either side, so a write about to go out on a connection that has not answered
 anything for 30 seconds sends a `PING` first; if that fails, the write has not
 been sent, and it goes out once on a new connection instead of ending as an
 unknown outcome. Writes that pick up the same quiet connection at once wait
-for that one `PING` and follow its answer.
+for that one `PING` and follow its answer. If a discovery moves the primary
+while a write waits for that `PING`, the write goes to the new primary.
 The shared console refuses connection-state commands such as `AUTH` and `MULTI`;
 use profile settings for authentication and the database selector (or `SELECT`
 in the TUI) to open a fresh database connection.

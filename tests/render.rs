@@ -1436,3 +1436,34 @@ async fn batches_from_a_replaced_feed_never_reach_or_stop_the_feed_that_replaced
     assert_eq!(state.total, 10);
     render_all_sizes(&mut a);
 }
+
+/// When diagnostics could not be read, every diagnostics tab says why instead
+/// of looking empty.
+#[tokio::test]
+async fn diagnostics_that_could_not_be_read_say_why_on_every_tab() {
+    let mut a = app();
+    populate(&mut a);
+    let reason = "Cannot confirm the primary, so nothing was read: Discovery failed";
+    let diag = rediscope::redis_client::Diagnostics {
+        cluster: vec![
+            ("deployment".into(), "sentinel".into()),
+            ("diagnostics_error".into(), reason.into()),
+        ],
+        ..Default::default()
+    };
+    a.on_msg(Msg::Info(Box::new(Ok((
+        ServerInfo::parse("# Server\nredis_version:7.2.4\n"),
+        diag,
+    )))));
+    for tab in ["Slowlog", "Clients", "Config", "Latency", "Cluster"] {
+        let index = rediscope::app::INFO_TABS
+            .iter()
+            .position(|t| *t == tab)
+            .unwrap();
+        press(&mut a, KeyCode::Char(char::from(b'1' + index as u8)));
+        let text = render_text(&mut a, 200, 40);
+        assert!(text.contains(reason), "{tab}:\n{text}");
+        assert!(!text.contains("was refused"), "{tab}:\n{text}");
+        assert!(!text.contains("nothing has crossed"), "{tab}:\n{text}");
+    }
+}

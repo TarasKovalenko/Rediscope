@@ -484,8 +484,25 @@ impl InfoState {
         filter_rows(rows, &self.query)
     }
 
+    /// Why nothing could be read, when diagnostics were skipped as a whole:
+    /// the tab then says so instead of looking empty.
+    fn unavailable(&self, head: &str) -> Option<Vec<InfoRow>> {
+        let (_, reason) = self
+            .diag
+            .cluster
+            .iter()
+            .find(|(k, _)| k == "diagnostics_error")?;
+        Some(vec![
+            InfoRow::Head(head.into()),
+            InfoRow::Field("unavailable".into(), reason.clone()),
+        ])
+    }
+
     /// Slowest commands first: the log is what explains a latency spike.
     fn slowlog(&self) -> Vec<InfoRow> {
+        if let Some(rows) = self.unavailable("Slow log") {
+            return rows;
+        }
         if self.diag.slowlog.is_empty() {
             return vec![
                 InfoRow::Head("Slow log".into()),
@@ -513,6 +530,9 @@ impl InfoState {
     /// Connected clients, longest idle first — an idle client holding a
     /// connection is the one worth seeing.
     fn clients(&self) -> Vec<InfoRow> {
+        if let Some(rows) = self.unavailable("Clients") {
+            return rows;
+        }
         if self.diag.clients.is_empty() {
             return vec![
                 InfoRow::Head("Clients".into()),
@@ -543,6 +563,9 @@ impl InfoState {
     }
 
     fn config(&self) -> Vec<InfoRow> {
+        if let Some(rows) = self.unavailable("Config") {
+            return rows;
+        }
         if self.diag.config.is_empty() {
             return vec![
                 InfoRow::Head("Config".into()),
@@ -563,6 +586,9 @@ impl InfoState {
     }
 
     fn latency(&self) -> Vec<InfoRow> {
+        if let Some(rows) = self.unavailable("Latency") {
+            return rows;
+        }
         let mut rows = vec![InfoRow::Head("Latency".into())];
         rows.extend(
             self.diag

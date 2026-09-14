@@ -134,6 +134,38 @@ fn denied(e: &RedisError) -> bool {
     own_error(e) && matches!(e.detail(), Some(DENIED | PIPELINE_DENIED))
 }
 
+/// Refusals made before anything was sent, because the route could not be
+/// trusted. They are audited as failures even for a batch or a script, whose
+/// other errors leave the outcome unknown. Matched like the guard's refusals:
+/// by kind, and by exact text or the `UNSENT` prefix.
+const WRITE_UNSETTLED: &str =
+    "The topology kept changing while this write waited; nothing was sent, so try again";
+const BATCH_UNSETTLED: &str =
+    "The topology kept changing while this batch waited; nothing was sent, so try again";
+const SENTINEL_UNSETTLED: &str =
+    "The Sentinel primary is being rediscovered after a failure; nothing was sent, so try again";
+const UNSENT: &str = "Nothing was sent: ";
+
+fn unsent(e: &RedisError) -> bool {
+    own_error(e)
+        && e.detail().is_some_and(|d| {
+            matches!(d, WRITE_UNSETTLED | BATCH_UNSETTLED | SENTINEL_UNSETTLED)
+                || d.starts_with(UNSENT)
+        })
+}
+
+/// `e`, a failure to confirm the route, as a refusal that sent nothing.
+fn not_sent(e: RedisError) -> RedisError {
+    if unsent(&e) {
+        return e;
+    }
+    let reason = match e.detail() {
+        Some(detail) if own_error(&e) => detail.to_string(),
+        _ => e.to_string(),
+    };
+    error(format!("{UNSENT}{reason}"))
+}
+
 fn error(message: impl Into<String>) -> RedisError {
     RedisError::from((
         redis::ErrorKind::InvalidClientConfig,
@@ -253,6 +285,7 @@ impl Transport {
         let outcome = match result {
             Ok(_) => "success",
             Err(e) if denied(e) => "denied",
+            Err(e) if unsent(e) => "failure",
             // A batch that fails may have run part of itself, and a script or
             // module command may have written before its error.
             Err(_) if pipeline || opaque => "unknown",
@@ -853,17 +886,34 @@ impl Transport {
         // failed, or a write was lost since, it may name a demoted primary:
         // a change is only sent once discovery has succeeded again.
         let checked = !read && self.profile.deployment == Deployment::Sentinel;
+        // A client id or a slow log belongs to the node that listed it, even
+        // once that node is no longer the primary. Any other change was meant
+        // for the primary, and must not reach one that was replaced.
+        let primary_only = checked && !node_bound(cmd);
+        let moved = || {
+            let now = self.state().default.clone();
+            (primary_only && now != *ep).then(|| {
+                error(format!(
+                    "{UNSENT}the Sentinel primary moved from {}:{} to {}:{} since this node was listed; refresh and try again",
+                    ep.0, ep.1, now.0, now.1
+                ))
+            })
+        };
         if checked {
-            self.refresh_if_stale().await?;
+            self.refresh_if_stale().await.map_err(not_sent)?;
+            if let Some(e) = moved() {
+                return Err(e);
+            }
         }
         let mut socket = self.connection(ep).await?;
         if !read {
             socket = self.for_write(ep, socket).await?;
         }
         if checked && self.unsettled() {
-            return Err(error(
-                "The Sentinel primary is being rediscovered after a failure; nothing was sent, so try again",
-            ));
+            return Err(error(SENTINEL_UNSETTLED));
+        }
+        if let Some(e) = moved() {
+            return Err(e);
         }
         // Again at the moment of sending: connecting can take a while.
         self.guard(read)?;
@@ -918,7 +968,7 @@ impl Transport {
     async fn request_inner(&self, cmd: &Cmd) -> RedisResult<Value> {
         let read = read_route(cmd).0;
         self.guard(read)?;
-        self.refresh_if_stale().await?;
+        self.refresh_if_stale().await.map_err(not_sent)?;
         let slot = if self.profile.deployment == Deployment::Cluster {
             self.cluster_slot(cmd).await?
         } else {
@@ -929,6 +979,9 @@ impl Transport {
         // commands whose behaviour is known are ever sent twice.
         let opaque = never_resent(cmd);
         let mut ep = self.route(slot);
+        // `ep` came from a redirect rather than from the topology. A
+        // `MOVED` outranks a discovery that has not caught up with it.
+        let mut redirected = false;
         let mut asking = false;
         for attempt in 0..4 {
             // Set once the command is on the wire. A failure before that, such
@@ -964,19 +1017,20 @@ impl Transport {
                         socket = self.for_write(&ep, socket).await?;
                         // A write lost while this one waited for its socket
                         // leaves the route in doubt: nothing is sent until a
-                        // discovery after that loss has finished.
+                        // discovery after that loss has finished. A discovery
+                        // that finished meanwhile may have moved the route:
+                        // the write follows it.
                         let mut waits = 0;
                         while self.profile.deployment != Deployment::Standalone
-                            && self.unsettled()
+                            && (self.unsettled() || (!redirected && self.route(slot) != ep))
                         {
                             if waits == 3 {
-                                return Err(error(
-                                    "The topology kept changing while this write waited; nothing was sent, so try again",
-                                ));
+                                return Err(error(WRITE_UNSETTLED));
                             }
                             waits += 1;
-                            self.refresh_if_stale().await?;
+                            self.refresh_if_stale().await.map_err(not_sent)?;
                             ep = self.route(slot);
+                            redirected = false;
                             socket = self.connection(&ep).await?;
                             socket = self.for_write(&ep, socket).await?;
                         }
@@ -1028,6 +1082,7 @@ impl Transport {
                             self.moved(slot, &target);
                         }
                         ep = target;
+                        redirected = true;
                         continue;
                     }
                     let refused = rejected_unrun(&e) && !(opaque && sent);
@@ -1071,6 +1126,7 @@ impl Transport {
                         return Err(refresh);
                     }
                     ep = self.route(slot);
+                    redirected = false;
                     asking = false;
                 }
             }
@@ -1107,20 +1163,22 @@ impl Transport {
             }
             return Ok(values.into_iter().skip(offset).take(count).collect());
         }
-        self.refresh_if_stale().await?;
+        self.refresh_if_stale().await.map_err(not_sent)?;
         let mut ep = self.state().default.clone();
         let mut socket = self.connection(&ep).await?;
         if writes {
             socket = self.for_write(&ep, socket).await?;
+            // As for a single write: wait out a lost write, and follow a
+            // discovery that moved the primary while the socket was checked.
             let mut waits = 0;
-            while self.profile.deployment != Deployment::Standalone && self.unsettled() {
+            while self.profile.deployment != Deployment::Standalone
+                && (self.unsettled() || self.state().default != ep)
+            {
                 if waits == 3 {
-                    return Err(error(
-                        "The topology kept changing while this batch waited; nothing was sent, so try again",
-                    ));
+                    return Err(error(BATCH_UNSETTLED));
                 }
                 waits += 1;
-                self.refresh_if_stale().await?;
+                self.refresh_if_stale().await.map_err(not_sent)?;
                 ep = self.state().default.clone();
                 socket = self.connection(&ep).await?;
                 socket = self.for_write(&ep, socket).await?;
@@ -1288,6 +1346,10 @@ impl Transport {
             Err(e) if denied(&e) && (resent || groups.len() > 1) => Err(error(format!(
                 "Pipeline stopped: writes were locked or the write lease expired before every command was sent; commands already sent may have been applied. {e}"
             ))),
+            // Likewise a resend refused because the route was in doubt.
+            Err(e) if unsent(&e) && (resent || groups.len() > 1) => Err(error(format!(
+                "Pipeline stopped before every command was sent; commands already sent may have been applied. {e}"
+            ))),
             Err(e) => Err(e),
         }
     }
@@ -1349,6 +1411,20 @@ fn rejected_unrun(e: &RedisError) -> bool {
                 | redis::ServerErrorKind::MasterDown
                 | redis::ServerErrorKind::BusyLoading
         )
+    )
+}
+
+/// A node-addressed change that only means something on the node that listed
+/// it: `CLIENT KILL` for a client id, `SLOWLOG RESET` for that node's log.
+fn node_bound(cmd: &Cmd) -> bool {
+    let args = simple_args(cmd);
+    let word = |i: usize| {
+        args.get(i)
+            .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
+    };
+    matches!(
+        (word(0).as_deref(), word(1).as_deref()),
+        (Some("CLIENT"), Some("KILL")) | (Some("SLOWLOG"), Some("RESET"))
     )
 }
 

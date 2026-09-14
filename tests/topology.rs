@@ -5525,3 +5525,163 @@ async fn a_standalone_discovery_whose_ping_fails_drops_that_socket() {
     assert_eq!(gets.len(), 2);
     assert_ne!(gets[0], gets[1], "kept the socket whose PING failed");
 }
+
+// ---- a discovery that succeeds while a write waits for its socket --------
+
+/// A primary whose `PING` takes a second while `slow` is set, logging every
+/// command.
+fn slow_ping_primary(slow: Arc<AtomicBool>) -> (Peer, Log) {
+    let log: Log = Arc::default();
+    let seen = log.clone();
+    let peer = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        Some(match args[0].as_str() {
+            "ROLE" => "*1\r\n$6\r\nmaster\r\n".into(),
+            "PING" => {
+                if slow.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_secs(1));
+                }
+                "+PONG\r\n".into()
+            }
+            "UNLINK" => ":1\r\n".into(),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    (peer, log)
+}
+
+/// A Sentinel naming `target`, or dropping the connection while `broken`.
+fn switchable_sentinel(target: Arc<AtomicUsize>, broken: Arc<AtomicBool>) -> Peer {
+    Peer::start(move |_, args| match args[0].as_str() {
+        "SENTINEL" if broken.load(Ordering::SeqCst) => None,
+        "SENTINEL" => Some(format!(
+            "*2\r\n{}{}",
+            bulk("127.0.0.1"),
+            bulk(&target.load(Ordering::SeqCst).to_string())
+        )),
+        _ => Some("+OK\r\n".into()),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_waiting_on_an_idle_check_follows_a_discovery_that_moved_the_primary() {
+    for batch in [false, true] {
+        let slow = Arc::new(AtomicBool::new(false));
+        let (first, first_log) = slow_ping_primary(slow.clone());
+        let (second, second_log) = slow_ping_primary(Arc::default());
+        let target = Arc::new(AtomicUsize::new(first.port as usize));
+        let sentinel = switchable_sentinel(target.clone(), Arc::default());
+        let client = sentinel_client(&sentinel).await;
+        client.set_string("before", "v").await.unwrap();
+        client.idle_ping_after(Duration::ZERO);
+        slow.store(true, Ordering::SeqCst);
+
+        let pings = count(&first_log, "PING", None);
+        let c = client.clone();
+        let write = tokio::spawn(async move {
+            if batch {
+                c.delete_keys(&["a".into()]).await.map(|_| ())
+            } else {
+                c.set_string("a", "v").await
+            }
+        });
+        eventually("the idle check on the old primary", 10, || {
+            count(&first_log, "PING", None) > pings
+        })
+        .await;
+        // The primary moves, and a discovery finds it while the write waits.
+        target.store(second.port as usize, Ordering::SeqCst);
+        client.refresh_topology().await.unwrap();
+        write.await.unwrap().unwrap();
+
+        let head = if batch { "UNLINK" } else { "SET" };
+        assert_eq!(
+            count(&first_log, head, Some("a")),
+            0,
+            "batch={batch}: sent to the address from before the discovery"
+        );
+        assert_eq!(count(&second_log, head, Some("a")), 1, "batch={batch}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusals_that_send_nothing_are_audited_as_failures_for_scripts_and_batches() {
+    let slow = Arc::new(AtomicBool::new(false));
+    let (first, first_log) = slow_ping_primary(slow.clone());
+    let target = Arc::new(AtomicUsize::new(first.port as usize));
+    let broken = Arc::new(AtomicBool::new(false));
+    let sentinel = switchable_sentinel(target.clone(), broken.clone());
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "service".into();
+    profile.name = unique("unsent-audit", sentinel.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    client.idle_ping_after(Duration::ZERO);
+    slow.store(true, Ordering::SeqCst);
+
+    for (action, head) in [("SCRIPT", "EVAL"), ("PIPELINE", "UNLINK")] {
+        broken.store(false, Ordering::SeqCst);
+        client.refresh_topology().await.unwrap();
+        let pings = count(&first_log, "PING", None);
+        let c = client.clone();
+        let write = tokio::spawn(async move {
+            if head == "EVAL" {
+                c.execute_raw("EVAL return 1 0").await.map(|_| ())
+            } else {
+                c.delete_keys(&["a".into()]).await.map(|_| ())
+            }
+        });
+        eventually("the idle check", 10, || {
+            count(&first_log, "PING", None) > pings
+        })
+        .await;
+        // Discovery fails while the write waits, and keeps failing.
+        broken.store(true, Ordering::SeqCst);
+        assert!(client.refresh_topology().await.is_err());
+        let e = write.await.unwrap().unwrap_err().to_string();
+        assert!(e.contains("othing was sent"), "{action}: {e}");
+        assert_eq!(count(&first_log, head, None), 0, "{action} was sent");
+        assert_eq!(
+            audit_outcomes(&profile.name, action),
+            vec!["started", "failure"],
+            "{action}: {e}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sentinel_config_change_for_a_primary_that_moved_is_refused() {
+    let (first, first_log) = primary_peer();
+    let (second, second_log) = primary_peer();
+    let target = Arc::new(AtomicUsize::new(first.port as usize));
+    let sentinel = switchable_sentinel(target.clone(), Arc::default());
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "service".into();
+    profile.name = unique("moved-config", sentinel.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    let old = client.diagnostics().await.unwrap().node;
+    assert_eq!(old, Some(("127.0.0.1".to_string(), first.port)));
+
+    target.store(second.port as usize, Ordering::SeqCst);
+    client.refresh_topology().await.unwrap();
+    let e = client
+        .config_set_on(&old, "maxmemory", "1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("othing was sent"), "{e}");
+    assert!(e.contains(&second.port.to_string()), "{e}");
+    assert_eq!(count(&first_log, "CONFIG", Some("SET")), 0);
+    assert_eq!(count(&second_log, "CONFIG", Some("SET")), 0);
+    assert_eq!(
+        audit_outcomes(&profile.name, "CONFIG"),
+        vec!["started", "failure"]
+    );
+
+    // The current primary takes it, and a client id still goes to the node
+    // that listed it.
+    let new = client.diagnostics().await.unwrap().node;
+    client.config_set_on(&new, "maxmemory", "1").await.unwrap();
+    assert_eq!(count(&second_log, "CONFIG", Some("SET")), 1);
+    client.client_kill_on(&old, "5").await.unwrap();
+    assert_eq!(count(&first_log, "CLIENT", Some("KILL")), 1);
+}
