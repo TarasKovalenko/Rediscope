@@ -30,6 +30,16 @@ struct Cli {
     #[arg(short = 'p', long, default_value_t = 6379)]
     port: u16,
 
+    /// Unix domain socket path. Given, rediscope connects through it straight
+    /// away instead of host and port.
+    #[arg(
+        short = 's',
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["host", "url", "tls", "tls_ca", "tls_cert", "tls_key", "tls_insecure", "ssh"]
+    )]
+    socket: Option<String>,
+
     /// Database index.
     #[arg(short = 'n', long, default_value_t = 0)]
     db: i64,
@@ -68,7 +78,8 @@ struct Cli {
     #[arg(long)]
     tls_insecure: bool,
 
-    /// Connect via URL, e.g. redis://user:pass@host:6379/2. Overrides the other flags.
+    /// Connect via URL, e.g. redis://user:pass@host:6379/2 or
+    /// unix:///run/redis.sock?db=2. Overrides the other flags.
     #[arg(long)]
     url: Option<String>,
 
@@ -149,7 +160,7 @@ enum Command {
     },
     /// Estimate which key prefixes hold the memory.
     MemReport {
-        /// How many `:`-separated segments to group by.
+        /// How many name segments to group by, split on the profile's key separator.
         #[arg(long, default_value_t = 1)]
         depth: usize,
         #[arg(long)]
@@ -174,6 +185,19 @@ impl Cli {
             conn.tls_key_file = tls_key_file;
             conn.tls_insecure = self.tls_insecure;
             self.apply_extras(&mut conn);
+            return Ok(Some(conn));
+        }
+        if let Some(socket) = &self.socket {
+            let mut conn = Connection {
+                name: socket.clone(),
+                socket: socket.clone(),
+                db: self.db,
+                username: self.username.clone(),
+                password: self.password.clone(),
+                ..Default::default()
+            };
+            self.apply_extras(&mut conn);
+            conn.validate_socket()?;
             return Ok(Some(conn));
         }
         let Some(host) = &self.host else {

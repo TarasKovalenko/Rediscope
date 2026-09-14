@@ -20,11 +20,11 @@ use crate::memory::{PrefixRow, Rollup};
 use crate::palette::{PaletteState, Target};
 use crate::redis_client::{
     Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT,
-    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, ServerInfo, Similar, SimilarTo, StreamGroup,
-    StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
+    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, MonitorLine, ServerInfo, Similar, SimilarTo,
+    StreamGroup, StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
 };
 use crate::theme::Theme;
-use crate::tree::{Tree, VisibleRow};
+use crate::tree::{SortMode, Tree, VisibleRow};
 
 /// The "copy to" target that means the connection already open.
 pub const THIS_CONNECTION: &str = "(this connection)";
@@ -103,7 +103,7 @@ pub enum Msg {
     /// Commands seen by `MONITOR` since the last batch, as (command, detail),
     /// and how many more arrived than a batch keeps.
     MonitorBatch {
-        lines: Vec<(String, String)>,
+        lines: Vec<MonitorLine>,
         dropped: u64,
     },
     /// Consumer groups of the open stream.
@@ -218,7 +218,10 @@ pub enum Action {
     /// Start `MONITOR`, after a production profile confirmed it.
     Monitor,
     /// Restart `MONITOR` keeping only commands matching the typed patterns.
-    MonitorFilter,
+    /// The database the feed was showing comes back with it.
+    MonitorFilter {
+        db: Option<i64>,
+    },
     /// Publish a message from the pub/sub feed.
     Publish,
     /// Delete every marked key.
@@ -840,6 +843,8 @@ pub struct FeedMessage {
     pub at: std::time::Instant,
     pub channel: String,
     pub payload: String,
+    /// The database a monitored command ran against. `None` for pub/sub.
+    pub db: Option<i64>,
 }
 
 pub struct PubSubState {
@@ -873,6 +878,18 @@ pub struct PubSubState {
     pub peak: u32,
     /// Messages per channel, in the order the channels first appeared.
     pub channels: Vec<(String, u64)>,
+    /// The database the monitored profile has open, offered first by `d`.
+    pub current_db: i64,
+    /// The one database the monitor shows, or `None` for all of them. Only
+    /// what is listed changes: the rate and totals still count everything.
+    pub db_filter: Option<i64>,
+    /// Every database a command has been seen in, in order.
+    pub dbs: Vec<i64>,
+    /// How many of `messages` pass `db_filter`, and the filter and message
+    /// count it was taken for. Kept up to date as commands arrive, so a busy
+    /// monitor does not recount the whole buffer for every one of them.
+    listed: usize,
+    listed_for: (Option<i64>, usize),
 }
 
 /// How many messages the feed keeps.
@@ -904,6 +921,11 @@ impl PubSubState {
             total: 0,
             peak: 0,
             channels: Vec::new(),
+            current_db: 0,
+            db_filter: None,
+            dbs: Vec::new(),
+            listed: 0,
+            listed_for: (None, 0),
         }
     }
 
@@ -938,6 +960,95 @@ impl PubSubState {
     }
 
     pub fn push_at(&mut self, channel: String, payload: String, at: std::time::Instant) {
+        self.push_entry(channel, payload, None, at);
+    }
+
+    /// One command from `MONITOR`, grouped under its name and tagged with its
+    /// database.
+    pub fn push_command(&mut self, line: MonitorLine) {
+        self.push_command_at(line, std::time::Instant::now());
+    }
+
+    pub fn push_command_at(&mut self, line: MonitorLine, at: std::time::Instant) {
+        if let Some(db) = line.db
+            && let Err(slot) = self.dbs.binary_search(&db)
+        {
+            self.dbs.insert(slot, db);
+        }
+        self.push_entry(line.command, line.detail, line.db, at);
+    }
+
+    /// Whether `message` passes the database filter.
+    fn shows(&self, message: &FeedMessage) -> bool {
+        self.db_filter.is_none() || message.db == self.db_filter
+    }
+
+    /// The messages the feed lists, oldest first. `scroll` indexes into this.
+    pub fn shown(&self) -> Vec<&FeedMessage> {
+        self.shown_iter().collect()
+    }
+
+    /// [`shown`](Self::shown) without collecting it.
+    pub fn shown_iter(&self) -> impl Iterator<Item = &FeedMessage> {
+        self.messages.iter().filter(|m| self.shows(m))
+    }
+
+    /// How many messages the feed lists. Constant time while the count is
+    /// current, which it is unless `messages` or `db_filter` was changed
+    /// from outside.
+    pub fn shown_len(&self) -> usize {
+        if self.listed_for == (self.db_filter, self.messages.len()) {
+            self.listed
+        } else {
+            self.shown_iter().count()
+        }
+    }
+
+    /// Recount what is listed if the filter or the messages changed from
+    /// outside since the last count.
+    fn sync_listed(&mut self) {
+        self.listed = self.shown_len();
+        self.listed_for = (self.db_filter, self.messages.len());
+    }
+
+    /// `d` in the monitor: every database, then the profile's own, then each
+    /// other database seen so far, then every database again. The cursor goes
+    /// to the newest command that is still listed.
+    pub fn cycle_db(&mut self) {
+        let mut order: Vec<Option<i64>> = vec![None, Some(self.current_db)];
+        order.extend(
+            self.dbs
+                .iter()
+                .filter(|db| **db != self.current_db)
+                .map(|db| Some(*db)),
+        );
+        let at = order.iter().position(|f| *f == self.db_filter).unwrap_or(0);
+        self.db_filter = order[(at + 1) % order.len()];
+        self.sync_listed();
+        let last = self.listed.saturating_sub(1);
+        self.scroll = if self.follow {
+            last
+        } else {
+            self.scroll.min(last)
+        };
+    }
+
+    /// Which databases the monitor lists, for its header.
+    pub fn db_scope(&self) -> String {
+        match self.db_filter {
+            None => "all databases".into(),
+            Some(db) => format!("db{db} only"),
+        }
+    }
+
+    fn push_entry(
+        &mut self,
+        channel: String,
+        payload: String,
+        db: Option<i64>,
+        at: std::time::Instant,
+    ) {
+        self.sync_listed();
         self.advance_to(at);
         self.rate[self.slot(self.bucket)] += 1;
         self.peak = self.peak.max(self.rate[self.slot(self.bucket)]);
@@ -947,18 +1058,30 @@ impl PubSubState {
             None => self.channels.push((channel.clone(), 1)),
         }
 
-        self.messages.push(FeedMessage {
+        let message = FeedMessage {
             at,
             channel,
             payload,
-        });
+            db,
+        };
+        if self.shows(&message) {
+            self.listed += 1;
+        }
+        self.messages.push(message);
         if self.messages.len() > PUBSUB_LIMIT {
             let overflow = self.messages.len() - PUBSUB_LIMIT;
+            // The cursor counts listed messages, so only those move it.
+            let listed = self.messages[..overflow]
+                .iter()
+                .filter(|m| self.shows(m))
+                .count();
             self.messages.drain(..overflow);
-            self.scroll = self.scroll.saturating_sub(overflow);
+            self.listed -= listed;
+            self.scroll = self.scroll.saturating_sub(listed);
         }
+        self.listed_for = (self.db_filter, self.messages.len());
         if self.follow {
-            self.scroll = self.messages.len().saturating_sub(1);
+            self.scroll = self.listed.saturating_sub(1);
         }
     }
 
@@ -993,6 +1116,7 @@ impl PubSubState {
     pub fn clear(&mut self) {
         self.dropped = 0;
         self.messages.clear();
+        self.sync_listed();
         self.channels.clear();
         self.rate = [0; PUBSUB_RATE_WINDOW];
         self.total = 0;
@@ -1020,10 +1144,16 @@ impl PubSubState {
 
     pub fn title(&self) -> String {
         if self.monitor {
-            return if self.patterns.is_empty() {
-                "Command monitor — every command".into()
+            let what = if self.patterns.is_empty() {
+                "every command".to_string()
             } else {
-                format!("Command monitor — {}", self.patterns.join(" "))
+                self.patterns.join(" ")
+            };
+            // Every database is the usual case, and the title is already
+            // long enough to be cut off, so only a narrowed feed says so.
+            return match self.db_filter {
+                None => format!("Command monitor — {what}"),
+                Some(_) => format!("Command monitor — {what} · {}", self.db_scope()),
             };
         }
         let what = if self.keyspace {
@@ -1197,6 +1327,12 @@ pub struct App {
     pub held_feed: Option<PubSubState>,
     /// The keys behind the tree, kept so a TTL can expire one locally.
     pub keys: Vec<KeyInfo>,
+    /// What the open profile splits key names on: the tree's folders, marking
+    /// a folder, the memory report and the new-key prefill all use it.
+    pub separator: String,
+    /// How the tree orders the keys in each folder, cycled with `o` and
+    /// remembered per profile.
+    pub sort: SortMode,
     pub tree: Tree,
     pub expanded: HashSet<String>,
     pub rows: Vec<VisibleRow>,
@@ -1283,6 +1419,8 @@ impl App {
             held_feed: None,
             server_line: String::new(),
             keys: Vec::new(),
+            separator: crate::config::DEFAULT_SEPARATOR.to_string(),
+            sort: SortMode::default(),
             tree: Tree::default(),
             expanded: HashSet::new(),
             rows: Vec::new(),
@@ -1336,7 +1474,7 @@ impl App {
             let _ = client.lock_writes();
         }
         self.connecting = true;
-        self.status = format!("Connecting to {}:{} ...", conn.host, conn.port);
+        self.status = format!("Connecting to {} ...", conn.endpoint());
         self.spawn(async move {
             Msg::Connected(Box::new(
                 Client::connect(conn).await.map_err(|e| e.to_string()),
@@ -1546,7 +1684,7 @@ impl App {
         self.keys.retain(|k| k.ttl > 0 || k.ttl == -1);
         self.key_count = self.keys.len();
         self.dbsize = self.dbsize.saturating_sub(expired.len() as u64);
-        self.tree = Tree::build(&self.keys);
+        self.tree = Tree::build(&self.keys, &self.separator, self.sort);
         self.rebuild_rows();
         if self.rows.is_empty() {
             self.tree_state.select(None);
@@ -1604,26 +1742,14 @@ impl App {
                             Msg::Commands(Box::new(names.command_names().await.unwrap_or_default()))
                         });
                         let session = self.store.sessions.get(&client.conn.name).cloned();
+                        self.separator = client.conn.key_separator().to_string();
                         self.client = Some(client);
                         self.screen = Screen::Browser;
                         self.status.clear();
                         self.current = None;
                         self.value = None;
                         self.marked.clear();
-                        self.expanded.clear();
-                        // Reopen where this profile was left: same filter, same
-                        // folders, same key.
-                        self.pattern = "*".into();
-                        self.pending_selection = None;
-                        if let Some(session) = session {
-                            if !session.pattern.is_empty() {
-                                self.pattern = session.pattern;
-                            }
-                            self.expanded.extend(session.expanded);
-                            if !session.selected_key.is_empty() {
-                                self.pending_selection = Some(session.selected_key);
-                            }
-                        }
+                        self.restore_session(session);
                         self.reload_keys();
                     }
                     Err(e) => self.status = format!("Connection failed: {e}"),
@@ -1659,7 +1785,7 @@ impl App {
                 self.truncated = truncated;
                 self.dbsize = dbsize;
                 self.pattern = pattern;
-                self.tree = Tree::build(&keys);
+                self.tree = Tree::build(&keys, &self.separator, self.sort);
                 self.keys = keys.clone();
                 // A narrow result set is more useful expanded than collapsed.
                 if keys.len() <= 200 {
@@ -1817,8 +1943,8 @@ impl App {
                 };
                 match feed {
                     Some(state) => {
-                        for (command, detail) in lines {
-                            state.push(command, detail);
+                        for line in lines {
+                            state.push_command(line);
                         }
                         state.push_dropped(dropped);
                     }
@@ -2137,6 +2263,7 @@ impl App {
             .filter(|(_, c)| {
                 c.name.to_lowercase().contains(&needle)
                     || c.host.to_lowercase().contains(&needle)
+                    || c.socket.to_lowercase().contains(&needle)
                     || c.group_name()
                         .is_some_and(|g| g.to_lowercase().contains(&needle))
             })
@@ -2368,7 +2495,7 @@ impl App {
         };
         let name = conn.name.clone();
         self.testing = Some(name.clone());
-        self.status = format!("Testing {}:{} ...", conn.host, conn.port);
+        self.status = format!("Testing {} ...", conn.endpoint());
         self.spawn(async move {
             let result = Client::probe(conn).await.map_err(|e| e.to_string());
             Msg::Probe(name, Box::new(result))
@@ -2465,6 +2592,7 @@ impl App {
                 Field::text("Group (optional)", c.group_name().unwrap_or_default()),
                 Field::text("Host", &c.host),
                 Field::text("Port", &c.port.to_string()),
+                Field::text("Unix socket (blank uses host and port)", &c.socket),
                 Field::text("Database", &c.db.to_string()),
                 Field::boolean(
                     "Read-only (refuse every write from this profile)",
@@ -2517,6 +2645,11 @@ impl App {
                         crate::config::Environment::Staging => 1,
                         crate::config::Environment::Production => 2,
                     },
+                ),
+                Field::section("Key tree"),
+                Field::text(
+                    "Key separator (splits names into folders, : by default)",
+                    c.key_separator(),
                 ),
             ],
             focus: 1,
@@ -2599,6 +2732,7 @@ impl App {
             KeyCode::Char('v') => self.open_view_picker(),
             KeyCode::Char('+') => self.load_more(),
             KeyCode::Char('f') => self.prompt_element_filter(),
+            KeyCode::Char('o') => self.cycle_sort(),
             _ => match self.focus {
                 Focus::Tree => self.tree_key(key),
                 Focus::Value => self.value_key(key),
@@ -2774,8 +2908,16 @@ impl App {
         let Some(client) = &self.client else {
             return;
         };
-        let session = crate::config::Session {
-            db: client.conn.db,
+        let (name, session) = (client.conn.name.clone(), self.session(client.conn.db));
+        self.store.sessions.insert(name, session);
+        let _ = self.store.save();
+    }
+
+    /// The view as a session to save: database, pattern, open folders,
+    /// selected key and sort order.
+    fn session(&self, db: i64) -> crate::config::Session {
+        crate::config::Session {
+            db,
             pattern: self.pattern.clone(),
             expanded: {
                 let mut folders: Vec<String> = self.expanded.iter().cloned().collect();
@@ -2787,11 +2929,54 @@ impl App {
                 .as_ref()
                 .map(|k| k.name.clone())
                 .unwrap_or_default(),
+            sort: self.sort,
+        }
+    }
+
+    /// Reopen where a profile was left: same filter, same folders, same key,
+    /// same order. With no session, the defaults.
+    fn restore_session(&mut self, session: Option<crate::config::Session>) {
+        self.expanded.clear();
+        self.pattern = "*".into();
+        self.pending_selection = None;
+        self.sort = SortMode::default();
+        if let Some(session) = session {
+            if !session.pattern.is_empty() {
+                self.pattern = session.pattern;
+            }
+            self.expanded.extend(session.expanded);
+            if !session.selected_key.is_empty() {
+                self.pending_selection = Some(session.selected_key);
+            }
+            self.sort = session.sort;
+        }
+    }
+
+    /// `o`: order the keys in each folder by name, then TTL, then type,
+    /// keeping the cursor on the row it was on.
+    fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        let (key, folder) = match self.selected_row() {
+            Some(row) => (
+                row.key.as_ref().map(|k| k.name.clone()),
+                row.folder_path.clone(),
+            ),
+            None => (None, None),
         };
-        self.store
-            .sessions
-            .insert(client.conn.name.clone(), session);
-        let _ = self.store.save();
+        self.tree = Tree::build(&self.keys, &self.separator, self.sort);
+        self.rebuild_rows();
+        let index = self.rows.iter().position(|r| {
+            (key.is_some() && r.key.as_ref().map(|k| &k.name) == key.as_ref())
+                || (folder.is_some() && r.folder_path == folder)
+        });
+        if let Some(index) = index {
+            self.tree_state.select(Some(index));
+        }
+        self.status = match self.sort {
+            SortMode::Name => "Keys sorted by name".into(),
+            SortMode::Ttl => "Keys sorted by TTL, soonest expiry first".into(),
+            SortMode::Type => "Keys sorted by type".into(),
+        };
     }
 
     fn back_to_connections(&mut self) {
@@ -2822,11 +3007,15 @@ impl App {
                 }
             }
             (None, Some(path)) => {
-                let prefix = format!("{path}:");
+                let prefix = format!("{path}{}", crate::tree::effective(&self.separator));
                 let under: Vec<String> = self
                     .keys
                     .iter()
-                    .filter(|k| k.name == path || k.name.starts_with(&prefix))
+                    .filter(|k| {
+                        k.name == path
+                            || (k.name.starts_with(&prefix)
+                                && crate::tree::unit_boundary(&k.name, prefix.len()))
+                    })
                     .map(|k| k.name.clone())
                     .collect();
                 let all_marked = under.iter().all(|n| self.marked.contains(n));
@@ -2983,17 +3172,38 @@ impl App {
             return;
         }
         let types: Vec<&str> = NEW_KEY_TYPES.iter().map(|t| t.name()).collect();
+        let prefix = self.new_key_prefix();
         self.modal = Some(Modal::Form {
             title: "New key".into(),
             hint: "Tab/↑↓ move · ←→ pick type · Enter creates · Esc cancels".into(),
             fields: vec![
-                Field::text("Key name", ""),
+                Field::text("Key name", &prefix),
                 Field::choice("Type", &types, 0),
             ],
             focus: 0,
             error: None,
             action: Action::NewKey,
         });
+    }
+
+    /// Where a new key starts: inside the folder under the cursor, or the
+    /// folder holding the key under the cursor, as that folder's path and a
+    /// separator. Empty at the root.
+    pub fn new_key_prefix(&self) -> String {
+        let Some(row) = self.selected_row() else {
+            return String::new();
+        };
+        let separator = crate::tree::effective(&self.separator);
+        let folder = match (&row.folder_path, &row.key) {
+            (Some(path), _) => Some(path.as_str()),
+            // The same cut the tree makes, so this is the folder the key is
+            // drawn in.
+            (None, Some(k)) => {
+                crate::tree::split_last(&k.name, &separator).map(|(parent, _)| parent)
+            }
+            _ => None,
+        };
+        folder.map_or_else(String::new, |f| format!("{f}{separator}"))
     }
 
     fn confirm_delete_key(&mut self) {
@@ -3580,7 +3790,7 @@ impl App {
             });
             return;
         }
-        self.start_monitor(Vec::new());
+        self.start_monitor(Vec::new(), None);
     }
 
     /// Open a `MONITOR` connection and stream what it sees into the feed.
@@ -3588,7 +3798,7 @@ impl App {
     /// A busy server runs far more commands than a terminal can show, so the
     /// reader batches them every [`MONITOR_FLUSH`] and keeps at most
     /// [`MONITOR_BATCH`] per batch; the rest are counted, not queued.
-    fn start_monitor(&mut self, filters: Vec<String>) {
+    fn start_monitor(&mut self, filters: Vec<String>, db_filter: Option<i64>) {
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -3596,6 +3806,9 @@ impl App {
             old.stop();
         }
         let mut state = PubSubState::monitor(filters.clone());
+        state.current_db = client.conn.db;
+        state.db_filter = db_filter;
+        state.dbs.extend(db_filter);
         // Lowercased once here, and each line once below, rather than both
         // for every pattern on every command.
         let patterns: Vec<Vec<u8>> = filters
@@ -3614,7 +3827,7 @@ impl App {
             };
             let mut stream = monitor.into_on_message::<String>();
             let mut tick = tokio::time::interval(MONITOR_FLUSH);
-            let mut batch: Vec<(String, String)> = Vec::new();
+            let mut batch: Vec<MonitorLine> = Vec::new();
             let mut dropped = 0u64;
             loop {
                 tokio::select! {
@@ -3642,8 +3855,7 @@ impl App {
                             }
                         }
                         if batch.len() < MONITOR_BATCH {
-                            let parsed = parsed.shortened();
-                            batch.push((parsed.command, parsed.detail));
+                            batch.push(parsed.shortened());
                         } else {
                             dropped += 1;
                         }
@@ -3791,8 +4003,10 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let state = MemoryState::new(self.dbsize);
+        let mut state = MemoryState::new(self.dbsize);
+        state.rollup = Rollup::with_separator(&self.separator);
         let stride = state.stride();
+        let separator = self.separator.clone();
         let cancel = state.cancel.clone();
         self.modal = Some(Modal::Memory(state));
 
@@ -3801,7 +4015,7 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let mut scan = crate::redis_client::MemoryScan::default();
-            let mut rollup = Rollup::default();
+            let mut rollup = Rollup::with_separator(&separator);
             let mut last = std::time::Instant::now();
             loop {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4081,6 +4295,9 @@ impl App {
             Screen::Connections => crate::palette::CONNECTIONS,
         };
         let mut state = PaletteState::new(commands);
+        if self.screen == Screen::Browser {
+            state.separator = crate::tree::effective(&self.separator).into_owned();
+        }
         self.refresh_palette(&mut state);
         self.modal = Some(Modal::Palette(state));
     }
@@ -4152,9 +4369,10 @@ impl App {
 
     /// Select a loaded key in the tree, opening every folder above it.
     fn jump_to_key(&mut self, name: &str) {
-        let parts: Vec<&str> = name.split(':').collect();
+        let separator = crate::tree::effective(&self.separator).to_string();
+        let parts: Vec<&str> = crate::tree::split(name, &separator).collect();
         for depth in 1..parts.len() {
-            self.expanded.insert(parts[..depth].join(":"));
+            self.expanded.insert(parts[..depth].join(&separator));
         }
         self.rebuild_rows();
         let Some(index) = self
@@ -4682,20 +4900,30 @@ impl App {
                 KeyCode::Char('f') => {
                     state.follow = !state.follow;
                     if state.follow {
-                        state.scroll = state.messages.len().saturating_sub(1);
+                        state.scroll = state.shown_len().saturating_sub(1);
                     }
                 }
                 KeyCode::Char('s') if state.monitor => {
                     state.stop();
                     let current = state.patterns.join(" ");
+                    let db = state.db_filter;
                     self.modal = Some(Modal::Form {
                         title: "Monitor filter".into(),
                         hint: "Space-separated globs or words, matched against the command and its arguments · empty watches everything".into(),
                         fields: vec![Field::text("Keep commands matching", &current)],
                         focus: 0,
                         error: None,
-                        action: Action::MonitorFilter,
+                        action: Action::MonitorFilter { db },
                     });
+                }
+                KeyCode::Char('d') if state.monitor => {
+                    state.cycle_db();
+                    let own = if state.db_filter == Some(state.current_db) {
+                        ", the database this profile has open"
+                    } else {
+                        ""
+                    };
+                    self.status = format!("Command monitor: {}{own}", state.db_scope());
                 }
                 KeyCode::Char('w') if state.monitor => {
                     self.status = "Publishing belongs to the pub/sub feed (P)".into();
@@ -4734,7 +4962,7 @@ impl App {
                 }
                 KeyCode::Char('y') => {
                     let text = state
-                        .messages
+                        .shown()
                         .iter()
                         .map(|m| format!("{}  {}", m.channel, m.payload))
                         .collect::<Vec<_>>()
@@ -4744,7 +4972,7 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     state.follow = false;
-                    state.scroll = (state.scroll + 1).min(state.messages.len().saturating_sub(1));
+                    state.scroll = (state.scroll + 1).min(state.shown_len().saturating_sub(1));
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.follow = false;
@@ -4752,7 +4980,7 @@ impl App {
                 }
                 KeyCode::PageDown => {
                     state.follow = false;
-                    state.scroll = (state.scroll + 10).min(state.messages.len().saturating_sub(1));
+                    state.scroll = (state.scroll + 10).min(state.shown_len().saturating_sub(1));
                 }
                 KeyCode::PageUp => {
                     state.follow = false;
@@ -4763,7 +4991,7 @@ impl App {
                     state.scroll = 0;
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    state.scroll = state.messages.len().saturating_sub(1);
+                    state.scroll = state.shown_len().saturating_sub(1);
                     state.follow = true;
                 }
                 _ => {}
@@ -4930,6 +5158,9 @@ impl App {
         if let Some(client) = &self.client {
             let _ = client.lock_writes();
         }
+        // The reconnect restores the profile's session, so save this view
+        // first or the sort order and filter fall back to what was saved last.
+        self.save_session();
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -5063,6 +5294,7 @@ impl App {
                         if h.is_empty() { "127.0.0.1".into() } else { h }
                     },
                     port: v(f::PORT).trim().parse().unwrap_or(6379),
+                    socket: v(f::SOCKET).trim().to_string(),
                     db: v(f::DATABASE).trim().parse().unwrap_or(0),
                     read_only: v(f::READ_ONLY) == "true",
                     username: v(f::USERNAME).trim().to_string(),
@@ -5100,6 +5332,8 @@ impl App {
                         "staging" => crate::config::Environment::Staging,
                         _ => crate::config::Environment::Development,
                     },
+                    // Not trimmed: a space is a separator someone may want.
+                    separator: v(f::SEPARATOR),
                 };
                 let new_name = conn.name.clone();
                 self.store.upsert(conn, replacing.as_deref());
@@ -5258,10 +5492,10 @@ impl App {
             Action::StreamDel { key, id } => self.mutate("Entry deleted", move |c| async move {
                 c.stream_delete(&key, &id).await
             }),
-            Action::Monitor => self.start_monitor(Vec::new()),
-            Action::MonitorFilter => {
+            Action::Monitor => self.start_monitor(Vec::new(), None),
+            Action::MonitorFilter { db } => {
                 let filters = v(0).split_whitespace().map(str::to_string).collect();
-                self.start_monitor(filters);
+                self.start_monitor(filters, db);
             }
             Action::Subscribe => {
                 let patterns: Vec<String> = v(0).split_whitespace().map(str::to_string).collect();
@@ -5659,26 +5893,28 @@ mod conn_field {
     pub const GROUP: usize = 1;
     pub const HOST: usize = 2;
     pub const PORT: usize = 3;
-    pub const DATABASE: usize = 4;
-    pub const READ_ONLY: usize = 5;
-    pub const USERNAME: usize = 6;
-    pub const PASSWORD: usize = 7;
-    pub const KEYCHAIN: usize = 8;
-    pub const TLS: usize = 9;
-    pub const TLS_CA: usize = 10;
-    pub const TLS_CERT: usize = 11;
-    pub const TLS_KEY: usize = 12;
-    pub const TLS_INSECURE: usize = 13;
-    pub const SSH_HOST: usize = 14;
-    pub const SSH_USER: usize = 15;
-    pub const SSH_PORT: usize = 16;
-    pub const SSH_KEY: usize = 17;
-    pub const DEPLOYMENT: usize = 18;
-    pub const SEEDS: usize = 19;
-    pub const SENTINEL_MASTER: usize = 20;
-    pub const SENTINEL_USERNAME: usize = 21;
-    pub const SENTINEL_PASSWORD: usize = 22;
-    pub const ENVIRONMENT: usize = 23;
+    pub const SOCKET: usize = 4;
+    pub const DATABASE: usize = 5;
+    pub const READ_ONLY: usize = 6;
+    pub const USERNAME: usize = 7;
+    pub const PASSWORD: usize = 8;
+    pub const KEYCHAIN: usize = 9;
+    pub const TLS: usize = 10;
+    pub const TLS_CA: usize = 11;
+    pub const TLS_CERT: usize = 12;
+    pub const TLS_KEY: usize = 13;
+    pub const TLS_INSECURE: usize = 14;
+    pub const SSH_HOST: usize = 15;
+    pub const SSH_USER: usize = 16;
+    pub const SSH_PORT: usize = 17;
+    pub const SSH_KEY: usize = 18;
+    pub const DEPLOYMENT: usize = 19;
+    pub const SEEDS: usize = 20;
+    pub const SENTINEL_MASTER: usize = 21;
+    pub const SENTINEL_USERNAME: usize = 22;
+    pub const SENTINEL_PASSWORD: usize = 23;
+    pub const ENVIRONMENT: usize = 24;
+    pub const SEPARATOR: usize = 25;
 }
 
 /// Field-level validation that must happen before the modal closes.
@@ -5710,6 +5946,28 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
             }
             if get(f::DATABASE).parse::<i64>().is_err() {
                 return Some("Database must be a number".into());
+            }
+            if !get(f::SOCKET).is_empty() {
+                if !cfg!(unix) {
+                    return Some("Unix sockets are not available on this platform".into());
+                }
+                if matches!(get(f::DEPLOYMENT), "cluster" | "sentinel") {
+                    return Some(
+                        "A Unix socket reaches one server; Cluster and Sentinel need host and port"
+                            .into(),
+                    );
+                }
+                if get(f::TLS) == "true" {
+                    return Some("TLS does not apply to a Unix socket".into());
+                }
+                if !get(f::SSH_HOST).is_empty() {
+                    return Some(
+                        "A Unix socket is local; it cannot go through an SSH tunnel".into(),
+                    );
+                }
+            }
+            if values.get(f::SEPARATOR).is_some_and(|s| s.is_empty()) {
+                return Some("Key separator cannot be empty (: is the default)".into());
             }
             if get(f::DEPLOYMENT) == "cluster" && get(f::DATABASE) != "0" {
                 return Some("Cluster supports database 0 only".into());
@@ -6250,6 +6508,149 @@ mod tests {
             pattern: "*".into(),
         });
         app
+    }
+
+    /// A browser over `keys` for a profile that splits names on `separator`.
+    fn split_app(separator: &str, keys: &[&str]) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        app.screen = Screen::Browser;
+        app.separator = separator.into();
+        app.on_msg(Msg::Keys {
+            warnings: vec![],
+            dbsize: keys.len() as u64,
+            keys: keys.iter().map(|k| info(k, -1)).collect(),
+            truncated: false,
+            pattern: "*".into(),
+        });
+        app
+    }
+
+    fn select_label(app: &mut App, label: &str) {
+        let index = app
+            .rows
+            .iter()
+            .position(|r| r.label == label)
+            .unwrap_or_else(|| panic!("no row {label}"));
+        app.tree_state.select(Some(index));
+        app.on_tree_move();
+    }
+
+    #[test]
+    fn o_cycles_the_sort_and_keeps_the_cursor_on_its_key() {
+        let mut app = tick_app(vec![
+            info("job:10", -1),
+            info("job:2", 90),
+            info("job:9", 5),
+            info("job:1", -1),
+        ]);
+        let leaves = |app: &App| -> Vec<String> {
+            app.rows
+                .iter()
+                .filter(|r| r.key.is_some())
+                .map(|r| r.label.clone())
+                .collect()
+        };
+        assert_eq!(leaves(&app), ["1", "2", "9", "10"], "natural by default");
+        select_label(&mut app, "10");
+
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.sort, SortMode::Ttl);
+        assert_eq!(leaves(&app), ["9", "2", "1", "10"]);
+        assert_eq!(
+            app.selected_row().unwrap().label,
+            "10",
+            "the cursor follows"
+        );
+        assert!(app.status.contains("TTL"), "{}", app.status);
+
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.sort, SortMode::Type);
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.sort, SortMode::Name);
+        assert_eq!(leaves(&app), ["1", "2", "9", "10"]);
+
+        // A countdown and a rescan both keep the order that was chosen.
+        press(&mut app, KeyCode::Char('o'));
+        app.age_ttls(1);
+        assert_eq!(leaves(&app), ["9", "2", "1", "10"]);
+        app.on_msg(Msg::Keys {
+            keys: vec![info("job:3", 1), info("job:1", -1)],
+            truncated: false,
+            warnings: vec![],
+            dbsize: 2,
+            pattern: "*".into(),
+        });
+        assert_eq!(leaves(&app), ["3", "1"]);
+    }
+
+    #[test]
+    fn the_sort_order_is_saved_with_the_session_and_restored() {
+        let mut app = tick_app(vec![info("a", -1)]);
+        press(&mut app, KeyCode::Char('o'));
+        let session = app.session(3);
+        assert_eq!(session.sort, SortMode::Ttl);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut other = App::new(crate::config::Store::default(), tx);
+        other.restore_session(Some(session));
+        assert_eq!(other.sort, SortMode::Ttl);
+        // A profile with no session starts by name again.
+        other.restore_session(None);
+        assert_eq!(other.sort, SortMode::Name);
+    }
+
+    #[test]
+    fn marking_a_folder_uses_the_profile_separator() {
+        let mut app = split_app("/", &["app/user/1", "app/user/2", "app:other", "appx/1"]);
+        select_label(&mut app, "app");
+        press(&mut app, KeyCode::Char('m'));
+        let mut marked: Vec<&str> = app.marked.iter().map(String::as_str).collect();
+        marked.sort();
+        assert_eq!(marked, ["app/user/1", "app/user/2"]);
+
+        let mut app = split_app("::", &["a::b::c", "a::b::d", "a::bx"]);
+        select_label(&mut app, "b");
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.marked.len(), 2, "{:?}", app.marked);
+    }
+
+    #[test]
+    fn the_palette_opens_folders_split_on_the_profile_separator() {
+        let mut app = split_app(".", &["com.example.api.v1", "com.example.web", "other"]);
+        app.expanded.clear();
+        app.rebuild_rows();
+        ctrl(&mut app, 'p');
+        type_text(&mut app, "apiv1");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.current.as_ref().map(|k| k.name.as_str()),
+            Some("com.example.api.v1")
+        );
+        for folder in ["com", "com.example", "com.example.api"] {
+            assert!(
+                app.expanded.contains(folder),
+                "{folder}: {:?}",
+                app.expanded
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_key_starts_in_the_folder_under_the_cursor() {
+        let mut app = split_app("|", &["tenant|42|cart", "tenant|42|seen", "loose"]);
+        select_label(&mut app, "42");
+        assert_eq!(app.new_key_prefix(), "tenant|42|");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(form_fields(&app)[0], "tenant|42|");
+        press(&mut app, KeyCode::Esc);
+
+        select_label(&mut app, "cart");
+        assert_eq!(app.new_key_prefix(), "tenant|42|", "a key's own folder");
+        select_label(&mut app, "loose");
+        assert_eq!(app.new_key_prefix(), "", "the root has no prefix");
+        select_label(&mut app, "tenant");
+        assert_eq!(app.new_key_prefix(), "tenant|");
     }
 
     fn info(name: &str, ttl: i64) -> KeyInfo {
@@ -6994,9 +7395,9 @@ mod tests {
         app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
         app.on_msg(Msg::MonitorBatch {
             lines: vec![
-                ("SET".into(), "db0 1.2.3.4:5  \"k\" \"v\"".into()),
-                ("GET".into(), "db0 1.2.3.4:5  \"k\"".into()),
-                ("SET".into(), "db0 1.2.3.4:5  \"k2\" \"v\"".into()),
+                command("SET", 0, "\"k\" \"v\""),
+                command("GET", 0, "\"k\""),
+                command("SET", 0, "\"k2\" \"v\""),
             ],
             dropped: 7,
         });
@@ -7012,7 +7413,7 @@ mod tests {
         // A monitor batch never lands in a pub/sub feed.
         app.modal = Some(Modal::PubSub(PubSubState::new(vec!["*".into()], false)));
         app.on_msg(Msg::MonitorBatch {
-            lines: vec![("SET".into(), "x".into())],
+            lines: vec![command("SET", 0, "x")],
             dropped: 0,
         });
         let Some(Modal::PubSub(state)) = &app.modal else {
@@ -7032,8 +7433,154 @@ mod tests {
         let Some(Modal::Form { action, fields, .. }) = &app.modal else {
             panic!("expected the filter form")
         };
-        assert!(matches!(action, Action::MonitorFilter));
+        assert!(matches!(action, Action::MonitorFilter { db: None }));
         assert_eq!(fields[0].input.value(), "user:*");
+    }
+
+    fn command(name: &str, db: i64, args: &str) -> MonitorLine {
+        MonitorLine {
+            command: name.into(),
+            detail: format!("db{db} 1.2.3.4:5  {args}"),
+            db: Some(db),
+        }
+    }
+
+    fn listed(state: &PubSubState) -> Vec<String> {
+        state.shown().iter().map(|m| m.payload.clone()).collect()
+    }
+
+    #[test]
+    fn d_cycles_the_monitor_through_all_this_and_each_seen_database() {
+        let mut state = PubSubState::monitor(vec![]);
+        state.current_db = 2;
+        for (db, args) in [(0, "a"), (5, "b"), (2, "c"), (0, "d"), (11, "e")] {
+            state.push_command(command("GET", db, args));
+        }
+        assert_eq!(state.dbs, [0, 2, 5, 11]);
+        let dbs_listed = |state: &PubSubState| -> Vec<Option<i64>> {
+            state.shown().iter().map(|m| m.db).collect()
+        };
+        assert_eq!(state.shown().len(), 5);
+        assert_eq!(state.db_scope(), "all databases");
+        assert_eq!(state.title(), "Command monitor — every command");
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            state.cycle_db();
+            seen.push((state.db_filter, state.shown().len()));
+        }
+        assert_eq!(
+            seen,
+            [
+                (Some(2), 1),
+                (Some(0), 2),
+                (Some(5), 1),
+                (Some(11), 1),
+                (None, 5)
+            ],
+            "this database first, then the others in order"
+        );
+
+        state.cycle_db();
+        assert_eq!(state.db_scope(), "db2 only");
+        assert_eq!(dbs_listed(&state), [Some(2)]);
+        state.cycle_db();
+        assert_eq!(state.db_scope(), "db0 only");
+        assert_eq!(listed(&state), ["db0 1.2.3.4:5  a", "db0 1.2.3.4:5  d"]);
+        assert!(state.title().contains("db0 only"), "{}", state.title());
+        // The totals still count every database.
+        assert_eq!(state.total, 5);
+        assert_eq!(state.channels, [("GET".to_string(), 5)]);
+    }
+
+    #[test]
+    fn the_listed_count_follows_pushes_overflow_filters_and_clearing() {
+        let mut state = PubSubState::monitor(vec![]);
+        let check = |state: &PubSubState, when: &str| {
+            assert_eq!(state.shown_len(), state.shown().len(), "{when}");
+            if state.follow {
+                assert_eq!(state.scroll, state.shown_len().saturating_sub(1), "{when}");
+            }
+        };
+        for i in 0..PUBSUB_LIMIT + 700 {
+            state.push_command(command("GET", (i % 3) as i64, "k"));
+            if i % 250 == 0 {
+                state.cycle_db();
+            }
+            check(&state, &format!("push {i}"));
+        }
+        // Set from outside the methods: still counted right, and the next
+        // push picks the new filter up.
+        state.db_filter = Some(1);
+        check(&state, "filter set directly");
+        state.push_command(command("GET", 1, "k"));
+        check(&state, "push after the direct filter");
+        state.clear();
+        check(&state, "cleared");
+        state.push_command(command("GET", 1, "k"));
+        check(&state, "push after clearing");
+        assert_eq!(state.shown_len(), 1);
+    }
+
+    #[test]
+    fn a_database_filter_keeps_the_cursor_on_listed_commands() {
+        let mut state = PubSubState::monitor(vec![]);
+        for i in 0..10 {
+            state.push_command(command("SET", i % 2, &i.to_string()));
+        }
+        state.cycle_db(); // db0, the current one
+        assert_eq!(state.shown().len(), 5);
+        assert_eq!(state.scroll, 4, "following, so on the newest listed");
+
+        state.follow = false;
+        state.scroll = 1;
+        state.push_command(command("SET", 1, "hidden"));
+        assert_eq!(state.scroll, 1, "an unlisted command does not move it");
+
+        // Past the cap, dropping unlisted commands leaves the cursor alone.
+        let mut state = PubSubState::monitor(vec![]);
+        state.push_command(command("GET", 0, "kept"));
+        for _ in 0..PUBSUB_LIMIT {
+            state.push_command(command("GET", 1, "other"));
+        }
+        state.cycle_db();
+        assert!(state.shown().is_empty(), "db0's one command fell off");
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn d_in_the_monitor_changes_the_database_and_survives_a_new_filter() {
+        let mut app = tick_app(vec![]);
+        let mut state = PubSubState::monitor(vec![]);
+        state.push_command(command("GET", 0, "a"));
+        state.push_command(command("GET", 4, "b"));
+        app.modal = Some(Modal::PubSub(state));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(
+            app.status,
+            "Command monitor: db0 only, the database this profile has open"
+        );
+        press(&mut app, KeyCode::Char('d'));
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("feed closed")
+        };
+        assert_eq!(state.db_filter, Some(4));
+        assert!(app.status.contains("db4 only"), "{}", app.status);
+
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('s'));
+        let Some(Modal::Form { action, .. }) = &app.modal else {
+            panic!("expected the filter form")
+        };
+        assert!(matches!(action, Action::MonitorFilter { db: Some(4) }));
+
+        // A pub/sub feed has no databases to pick from.
+        app.modal = Some(Modal::PubSub(feed()));
+        press(&mut app, KeyCode::Char('d'));
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("feed closed")
+        };
+        assert_eq!(state.db_filter, None);
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub fn resolve(profile: Option<&str>, flags: Option<Connection>) -> Result<Conne
             .cloned()
             .with_context(|| format!("no saved profile called '{name}'"));
     }
-    flags.context("name a server with --host/--url, or a saved profile with --profile")
+    flags.context("name a server with --host, --socket or --url, or a saved profile with --profile")
 }
 
 /// `rediscope keys` — the keyspace as one line per key.
@@ -142,7 +142,7 @@ pub async fn mem_report(conn: Connection, depth: usize, json: bool) -> Result<()
     // The same sampling stride the TUI uses, so both give the same answer.
     let stride = (dbsize / 20_000).max(1);
     let mut scan = MemoryScan::default();
-    let mut rollup = Rollup::default();
+    let mut rollup = Rollup::with_separator(client.conn.key_separator());
     while !client.memory_batch(&mut scan, stride, &mut rollup).await? {}
 
     let rows = rollup.rows(depth.clamp(1, crate::memory::DEPTH_MAX));

@@ -98,7 +98,8 @@ rediscope -H 127.0.0.1 -p 6379
 Your first minute, in order:
 
 1. The key tree fills on the left. Keys split on `:`, so `user:42:profile` sits
-   under `user` → `42`. Move with `j` / `k`, open a folder with `Enter` or `l`.
+   under `user` → `42`. A profile can split on something else, like `/`.
+   Move with `j` / `k`, open a folder with `Enter` or `l`.
 2. Selecting a key loads its value on the right, with its type and TTL in the
    header. `Tab` moves focus into the value pane and back.
 3. Press `/` and type `session` to filter. A bare word becomes `*session*`;
@@ -120,8 +121,20 @@ rediscope
 
 ### Browsing
 
-- **Namespace tree.** Keys grouped by `:` into collapsible folders, with a
-  per-folder key count and a type badge on every leaf.
+- **Namespace tree.** Keys grouped by `:`, or the profile's own separator, into
+  collapsible folders, with a per-folder key count and a type badge on every
+  leaf.
+- **Sorting that reads right** (`o`). Keys sort naturally, so `order:9` comes
+  before `order:10`, ignoring case. `o` switches the keys in each folder to
+  soonest expiry first (keys without a TTL go last), then to grouped by type,
+  then back. Folders always stay in name order. The tree header says `by ttl`
+  or `by type` while one of those is on, and each profile remembers its choice.
+- **Your own key separator.** A profile whose keys look like `app/user/42` or
+  `com.example.cache` can split on `/`, `.`, `::`, `|` or any other string
+  instead, set under **Key tree** in the connection form. The tree, marking a
+  folder, `Ctrl+P`, the open folders a session remembers, the memory report's
+  prefixes and `mem-report` all follow it. `n` starts the new key's name in the
+  folder under the cursor, with the separator already on the end.
 - **Safe listing.** `SCAN` in batches, never `KEYS *`, 5,000 keys per view to
   start with. The header says so when a result was truncated, and `+` loads
   5,000 more, up to 50,000, rescanning so a refresh stays consistent.
@@ -152,7 +165,7 @@ rediscope
   `D` then deletes the marked set (pipelined `UNLINK`, not one round trip per
   key) and `t` sets or clears their TTLs together. `u` clears the marks.
 - **Session memory.** Each profile remembers its database, search pattern, open
-  folders and selected key, and reopens where you left it.
+  folders, selected key and sort order, and reopens where you left it.
 - **Go to anything** (`Ctrl+P`). One input line over every action on the
   screen and every loaded key, matched as you type: `u42prof` finds
   `app:user:42:profile`, `mem` finds the memory report. Choosing a key opens
@@ -273,8 +286,13 @@ rediscope
   keeps commands whose name or arguments match. A busy server runs more
   commands than a terminal can show, so the feed takes at most 500 every
   100 ms and counts the rest as "too fast to show" instead of queueing them,
-  and keeps the first 2 KiB of each command's arguments. The `MONITOR`
-  connection closes with the feed, however the feed goes away.
+  and keeps the first 2 KiB of each command's arguments. `d` narrows the list
+  to one database: the one the profile has open, then each other database a
+  command has been seen in, then all of them again. The title names the
+  database while the list is narrowed.
+  It only changes what is listed, so switching is instant and loses nothing;
+  the rate, the totals and that 500 per batch still cover every database. The
+  `MONITOR` connection closes with the feed, however the feed goes away.
   A production profile asks before starting it, because `MONITOR` costs the
   server real throughput while it runs; `Esc` stops it. Standalone profiles
   only for now, like pub/sub.
@@ -316,6 +334,11 @@ rediscope
   edits, deletes, TTLs, bulk actions, imports, and the writing commands in the
   console, which are identified from the server's own command table rather than
   a guess. The title bar says `READ-ONLY` while such a session is open.
+- **Unix sockets.** A profile can point at a socket path instead of a host and
+  port, for a server on the same machine that only listens on
+  `/run/redis/redis.sock`. So can `--socket` and a `unix://` URL. The list and
+  the title bar show the path. TLS, SSH tunnels, Cluster and Sentinel need a
+  network address, so a socket profile refuses them. Not available on Windows.
 - **SSH tunnels.** Give a profile a jump host and rediscope runs
   `ssh -N -L …` for the life of the connection, then connects through the local
   port. It uses your system ssh, so your agent, `~/.ssh/config` and
@@ -463,6 +486,7 @@ Press `?` in the app for this list at any time.
 | `w` / `I` | Export the marked keys to a file · import a file back |
 | `L` | Run a Lua script (marked keys become `KEYS[1..]`) |
 | `r` | Refresh keys and the open value |
+| `o` | Sort keys by name, TTL (soonest expiry first) or type |
 | `e` | Edit. A string opens the editor, a row opens a form |
 | `a` | Add an element to a hash / list / set / zset / stream / vector set |
 | `x` | Delete the selected element |
@@ -518,6 +542,7 @@ Press `?` in the app for this list at any time.
 | Key | Action |
 |---|---|
 | `s` | Change what the feed is subscribed to · in the command monitor, change its filter |
+| `d` | In the command monitor: all databases, the profile's own, or each one seen so far |
 | `w` | Publish a message |
 | `f` | Follow the newest message · `↑` `↓` `PgUp` `PgDn` scroll back |
 | `c` / `y` | Clear the feed and its statistics · copy it |
@@ -569,6 +594,8 @@ restores the previous one.
 rediscope                                  # start at the saved-server list
 rediscope -H 127.0.0.1 -p 6379 -n 0        # connect immediately
 rediscope --url rediss://user@host:6380/2  # or via a URL
+rediscope --socket /run/redis/redis.sock   # through a Unix socket
+rediscope --url 'unix:///run/redis/redis.sock?db=2'
 
 # TLS against a private CA, and mutual TLS
 rediscope -H cache.internal --tls-ca ~/certs/ca.pem
@@ -579,10 +606,11 @@ rediscope -H cache.internal --tls-cert ~/certs/client.crt --tls-key ~/certs/clie
 |---|---|
 | `-H`, `--host` | Redis host. Given, rediscope connects straight away and skips the server list |
 | `-p`, `--port` | Port (default `6379`) |
+| `-s`, `--socket PATH` | Connect through a Unix socket instead of host and port. Not with `--host`, `--url`, the TLS flags or `--ssh` |
 | `-n`, `--db` | Database index (default `0`) |
 | `-u`, `--username` | ACL username (Redis 6+) |
 | `-a`, `--password` | Password. Prefer `REDISCOPE_PASSWORD` |
-| `--url` | `redis://` or `rediss://` URL. Overrides the other flags |
+| `--url` | `redis://`, `rediss://` or `unix://` (also `redis+unix://`) URL. Overrides the other flags. A socket URL takes the database and credentials as `?db=2&user=ada&pass=...` |
 | `--tls` | Connect over TLS |
 | `--tls-ca FILE` | PEM root certificate for a private CA |
 | `--tls-cert FILE` | PEM client certificate (needs `--tls-key`) |
@@ -640,11 +668,11 @@ rediscope --profile prod import --file users.json \
 
 ## Connections and secrets
 
-A connection profile holds the server address, an optional group, database
-index, optional ACL username, TLS settings, a read-only switch, an optional SSH
-jump host, and how to find its password. The editor is one form with `Server`,
-`Authentication`, `TLS` and `SSH tunnel` sections (the group is set under
-`Server`); `Tab` moves between fields, `Space` toggles a switch, and the form
+A connection profile holds the server address or a Unix socket path, an
+optional group, database index, optional ACL username, TLS settings, a
+read-only switch, an optional SSH jump host, and how to find its password. The editor is one form with `Server`,
+`Authentication`, `TLS`, `SSH tunnel`, `Topology`, `Production safety` and
+`Key tree` sections (the group is set under `Server`); `Tab` moves between fields, `Space` toggles a switch, and the form
 scrolls when the terminal is short.
 
 Passwords resolve in one of three ways:
@@ -776,7 +804,41 @@ rediscope --config-path
 
 The same file keeps your theme, so the colours come back on the next run, and
 one entry per profile recording where you left it — database, search pattern,
-open folders and selected key.
+open folders, selected key and, once it is not by name, the sort order.
+
+### Key separator
+
+`separator` is the string a profile splits key names on. It is `:` unless set,
+and only written to the file when it is something else, so older files save
+back unchanged. It can be more than one character (`::`), and characters that
+mean something in a glob (`*`, `?`, `[`) are just characters here, because
+folders are matched against the loaded key names, never turned into a
+pattern. An empty value in a hand-edited file reads as `:`; the form refuses
+one. A separator that can overlap itself, like `::` in `a:::b`, splits from
+the left, so that key is `:b` in folder `a`.
+
+A backslash separator matches a single literal backslash in a key name.
+Key names are shown with a real backslash doubled (see [Notes](#notes)), so
+the folders and prefixes the tree and memory report show carry it doubled too.
+A byte that isn't valid UTF-8 is shown as `\xNN`, and a separator is never
+matched inside one of those, so `x` or `f` as a separator won't cut a binary
+name apart.
+
+```json
+{ "name": "assets", "host": "10.0.2.9", "port": 6379, "separator": "/" }
+```
+
+### Unix sockets
+
+A profile with `socket` set connects through that path and ignores `host` and
+`port`. A leading `~` is expanded. The key is left out of the file for every
+other profile, so existing files are written exactly as before. A socket
+profile has to be standalone, without TLS or an SSH host; the form and the
+connection both refuse the combination with a message saying why.
+
+```json
+{ "name": "local socket", "socket": "/run/redis/redis.sock", "db": 0 }
+```
 
 ### Connection groups
 
@@ -999,6 +1061,11 @@ production transport, the `Ctrl+W` unlock, typed confirmations, the headless
 import flags, conflict-safe edits, and the audit file's contents. Point
 `REDISCOPE_AUDIT_FILE` at a scratch path when you run it, or it appends to your
 own log.
+
+`tests/unix_socket.rs` connects through a socket. With `REDISCOPE_TEST_PORT` set
+it starts a throwaway `redis-server --unixsocket` of its own, and skips when
+there is no `redis-server` on the `PATH`. `REDISCOPE_TEST_SOCKET` points it at a
+socket you already have instead. It does not build on Windows.
 
 The TLS suite needs two more instances and a certificate set; `.github/workflows/ci.yml`
 has the exact `openssl` and `redis-server` invocations. Point it at them with

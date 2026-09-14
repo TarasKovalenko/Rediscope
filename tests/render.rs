@@ -324,6 +324,48 @@ async fn previews_structured_list_values_and_handles_long_editor_titles() {
     assert!(controls_line.contains("esc cancels"), "{controls_line}");
 }
 
+/// `o` reorders the keys inside each folder and the tree header says how.
+#[tokio::test]
+async fn the_tree_header_names_the_sort_order() {
+    let mut a = app();
+    a.screen = rediscope::app::Screen::Browser;
+    a.on_msg(Msg::Keys {
+        warnings: vec![],
+        keys: vec![
+            key("order:10", KeyType::String, -1),
+            key("order:9", KeyType::Hash, 600),
+            key("order:100", KeyType::List, 30),
+        ],
+        truncated: false,
+        dbsize: 3,
+        pattern: "*".into(),
+    });
+    let leaves = |a: &App| -> Vec<String> {
+        a.rows
+            .iter()
+            .filter(|r| r.key.is_some())
+            .map(|r| r.label.clone())
+            .collect()
+    };
+    assert_eq!(leaves(&a), ["9", "10", "100"]);
+    let screen = render_text(&mut a, 140, 10);
+    assert!(!screen.contains("by name"), "the usual order goes unsaid");
+
+    press(&mut a, KeyCode::Char('o'));
+    assert_eq!(leaves(&a), ["100", "9", "10"]);
+    let screen = render_text(&mut a, 140, 10);
+    assert!(screen.contains("by ttl"), "{screen}");
+    render_all_sizes(&mut a);
+
+    press(&mut a, KeyCode::Char('o'));
+    assert_eq!(leaves(&a), ["9", "100", "10"], "hash, list, string");
+    assert!(render_text(&mut a, 140, 10).contains("by type"));
+    render_all_sizes(&mut a);
+
+    press(&mut a, KeyCode::Char('o'));
+    assert!(!render_text(&mut a, 140, 10).contains("  by "));
+}
+
 #[tokio::test]
 async fn tree_navigation_expands_folders_and_tracks_selection() {
     let mut a = app();
@@ -400,6 +442,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         "checkout",       // Group
         "cache.example",  // Host
         "6380",           // Port
+        "",               // Unix socket, left blank
         "3",              // Database
         "",               // read-only switch, left off
         "reader",         // Username
@@ -416,7 +459,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         "",               // SSH key
     ];
     for (i, value) in inputs.iter().enumerate() {
-        if i == 9 {
+        if i == 10 {
             press(&mut a, KeyCode::Char(' ')); // switch TLS on
         } else if !value.is_empty() {
             app_ctrl(&mut a, 'u');
@@ -449,6 +492,67 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
     assert!(!c.read_only);
     assert!(c.ssh_host.is_empty());
     assert_eq!(c.ssh_port, 22);
+    assert!(c.socket.is_empty());
+}
+
+/// A socket profile shows its path where a TCP profile shows host and port,
+/// and the form refuses the settings a socket cannot use.
+#[tokio::test]
+async fn socket_profiles_show_their_path_and_refuse_tls() {
+    let mut a = app();
+    press(&mut a, KeyCode::Char('n'));
+    type_str(&mut a, "sock");
+    for _ in 0..4 {
+        press(&mut a, KeyCode::Tab); // group, host, port, socket
+    }
+    type_str(&mut a, "/tmp/redis.sock");
+    for _ in 0..6 {
+        press(&mut a, KeyCode::Tab); // on to the TLS switch
+    }
+    press(&mut a, KeyCode::Char(' '));
+    press(&mut a, KeyCode::Enter);
+    if !cfg!(unix) {
+        // Without sockets the path itself is refused, before TLS comes up.
+        let Some(Modal::Form { error, .. }) = &a.modal else {
+            panic!("a socket profile must not save here")
+        };
+        assert_eq!(
+            error.as_deref(),
+            Some("Unix sockets are not available on this platform")
+        );
+        render_all_sizes(&mut a);
+        return;
+    }
+    match &a.modal {
+        Some(Modal::Form { error, .. }) => {
+            assert_eq!(
+                error.as_deref(),
+                Some("TLS does not apply to a Unix socket")
+            );
+        }
+        _ => panic!("a socket with TLS must not save"),
+    }
+    press(&mut a, KeyCode::Char(' ')); // TLS off again
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none(), "{:?}", a.status);
+    let saved = a
+        .store
+        .connections
+        .iter()
+        .find(|c| c.name == "sock")
+        .unwrap();
+    assert_eq!(saved.socket, "/tmp/redis.sock");
+    assert!(!saved.tls);
+
+    let list = render_text(&mut a, 120, 20);
+    assert!(list.contains("unix:///tmp/redis.sock?db=0"), "{list}");
+    render_all_sizes(&mut a);
+
+    // The server-list filter finds it by path.
+    press(&mut a, KeyCode::Char('/'));
+    type_str(&mut a, "redis.sock");
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.visible_connections().len(), 1);
 }
 
 #[tokio::test]
@@ -456,7 +560,7 @@ async fn certificate_files_require_tls() {
     let mut a = app();
     press(&mut a, KeyCode::Char('n'));
     type_str(&mut a, "certs-only");
-    for _ in 0..10 {
+    for _ in 0..11 {
         press(&mut a, KeyCode::Tab); // walk to the CA certificate field
     }
     type_str(&mut a, "/tmp/ca.pem");
@@ -809,6 +913,75 @@ async fn the_info_modal_reaches_the_diagnostics_tabs() {
     }
 }
 
+/// The key separator is the form's last field. It is saved as typed, and an
+/// empty one is refused rather than splitting between every character.
+#[tokio::test]
+async fn the_key_separator_is_set_in_the_form_and_splits_the_tree() {
+    let mut a = app();
+    press(&mut a, KeyCode::Char('n'));
+    let set_separator = |a: &mut App, text: &str| {
+        let Some(Modal::Form { fields, .. }) = &mut a.modal else {
+            panic!("expected form")
+        };
+        let mut inputs: Vec<_> = fields.iter_mut().filter(|f| f.is_input()).collect();
+        assert_eq!(inputs.len(), 26, "the separator is the last input");
+        let last = inputs.last_mut().unwrap();
+        assert_eq!(last.input.value(), ":", "prefilled with the default");
+        inputs[0].input.set("slashes");
+        inputs[25].input.set(text);
+    };
+    set_separator(&mut a, "");
+    render_all_sizes(&mut a);
+    press(&mut a, KeyCode::Enter);
+    match &a.modal {
+        Some(Modal::Form { error, .. }) => {
+            assert!(
+                error.as_deref().unwrap_or("").contains("separator"),
+                "{error:?}"
+            );
+        }
+        _ => panic!("an empty separator must not save"),
+    }
+    press(&mut a, KeyCode::Esc);
+    press(&mut a, KeyCode::Char('n'));
+    set_separator(&mut a, "/");
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none());
+    let saved = a
+        .store
+        .connections
+        .iter()
+        .find(|c| c.name == "slashes")
+        .unwrap();
+    assert_eq!(saved.key_separator(), "/");
+
+    // A browser on such a profile splits keys on it, and only on it.
+    a.separator = "/".into();
+    populate_with(
+        &mut a,
+        &["app/user/1", "app/user/2", "app/queue", "legacy:colon:key"],
+    );
+    let labels: Vec<&str> = a.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["app", "user", "1", "2", "queue", "legacy:colon:key"]
+    );
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 100, 20);
+    assert!(screen.contains("legacy:colon:key"), "{screen}");
+}
+
+fn populate_with(app: &mut App, names: &[&str]) {
+    app.screen = rediscope::app::Screen::Browser;
+    app.on_msg(Msg::Keys {
+        warnings: vec![],
+        keys: names.iter().map(|n| key(n, KeyType::String, -1)).collect(),
+        truncated: false,
+        dbsize: names.len() as u64,
+        pattern: "*".into(),
+    });
+}
+
 #[tokio::test]
 async fn sentinel_form_persists_discovery_fields() {
     use rediscope::app::Modal;
@@ -820,11 +993,11 @@ async fn sentinel_form_persists_discovery_fields() {
     let mut inputs: Vec<_> = fields.iter_mut().filter(|f| f.is_input()).collect();
     inputs[0].input.set("sentinel-profile");
     inputs[3].input.set("26379");
-    inputs[18].choice = 2;
-    inputs[19].input.set("[::1]:26380,redis-b:26379");
-    inputs[20].input.set("primary-service");
-    inputs[21].input.set("sentinel-reader");
-    inputs[22].input.set("${SENTINEL_PASSWORD}");
+    inputs[19].choice = 2;
+    inputs[20].input.set("[::1]:26380,redis-b:26379");
+    inputs[21].input.set("primary-service");
+    inputs[22].input.set("sentinel-reader");
+    inputs[23].input.set("${SENTINEL_PASSWORD}");
     press(&mut a, KeyCode::Enter);
     assert!(a.modal.is_none());
     let saved = a
@@ -1030,6 +1203,40 @@ async fn the_monitor_feed_and_filtered_collections_render_at_any_size() {
     a.modal = Some(Modal::PubSub(rediscope::app::PubSubState::monitor(vec![])));
     render_all_sizes(&mut a);
     assert!(render_text(&mut a, 140, 40).contains("waiting for commands"));
+}
+
+/// `d` narrows the monitor to one database; the header names it, and only
+/// that database's commands are listed.
+#[tokio::test]
+async fn the_monitor_lists_one_database_after_d() {
+    let mut a = app();
+    populate(&mut a);
+    let mut feed = rediscope::app::PubSubState::monitor(vec![]);
+    for (db, key) in [(0, "zero:1"), (3, "three:1"), (0, "zero:2"), (3, "three:2")] {
+        feed.push_command(rediscope::redis_client::MonitorLine {
+            command: "GET".into(),
+            detail: format!("db{db} 10.0.0.7:51234  \"{key}\""),
+            db: Some(db),
+        });
+    }
+    a.modal = Some(Modal::PubSub(feed));
+    let screen = render_text(&mut a, 140, 30);
+    assert!(!screen.contains(" only"), "every database: {screen}");
+    assert!(screen.contains("d database"), "{screen}");
+    assert!(
+        screen.contains("three:2") && screen.contains("zero:2"),
+        "{screen}"
+    );
+
+    press(&mut a, KeyCode::Char('d')); // db0, this profile's
+    press(&mut a, KeyCode::Char('d')); // db3, seen in the feed
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 140, 30);
+    assert!(screen.contains("db3 only"), "{screen}");
+    assert!(screen.contains("2 shown"), "{screen}");
+    assert!(screen.contains("4 total"), "{screen}");
+    assert!(screen.contains("three:1"), "{screen}");
+    assert!(!screen.contains("zero:1"), "{screen}");
 }
 
 /// The footer drops whole hints when it runs out of room, never help and
