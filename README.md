@@ -771,7 +771,8 @@ next command after 30 seconds. Sentinel discovery verifies `ROLE master` and
 repeats discovery after connection loss. Reads use bounded retries and backoff.
 A node that stops answering only holds up the commands sent to it; reads and
 writes for other nodes carry on, and callers that need a fresh topology at
-the same moment share a single discovery.
+the same moment share a single discovery. A command that just failed never
+takes the result of a discovery that was already running when it failed.
 A write is sent again only when the server proves it never ran: a `MOVED` or
 `ASK` redirect, or a refusal such as `READONLY` from a primary demoted during
 failover, `TRYAGAIN` mid-migration, `CLUSTERDOWN` or `LOADING`. A single
@@ -780,9 +781,11 @@ batch that cannot reach one of its nodes stops instead. A write whose
 reply is lost reports an unknown outcome and is never replayed, and the
 topology is refreshed at once so the next command finds the new primary.
 A load balancer or firewall can drop a quiet connection without telling
-either side, so a write about to go out on a connection unused for 30 seconds
-sends a `PING` first; if that fails, the write has not been sent, and it goes
-out once on a new connection instead of ending as an unknown outcome.
+either side, so a write about to go out on a connection that has not answered
+anything for 30 seconds sends a `PING` first; if that fails, the write has not
+been sent, and it goes out once on a new connection instead of ending as an
+unknown outcome. Writes that pick up the same quiet connection at once wait
+for that one `PING` and follow its answer.
 The shared console refuses connection-state commands such as `AUTH` and `MULTI`;
 use profile settings for authentication and the database selector (or `SELECT`
 in the TUI) to open a fresh database connection.

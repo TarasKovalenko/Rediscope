@@ -797,8 +797,9 @@ impl Client {
         self.mgr.primary_count()
     }
 
-    /// Before a write, `PING` a cached connection that has been unused for
-    /// longer than `after` (30 seconds unless changed). Only tests change it.
+    /// Before a write, `PING` a cached connection that has not answered
+    /// anything for longer than `after` (30 seconds unless changed). Only
+    /// tests change it.
     #[doc(hidden)]
     pub fn idle_ping_after(&self, after: std::time::Duration) {
         self.mgr.idle_ping_after(after);
