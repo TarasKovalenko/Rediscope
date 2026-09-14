@@ -2844,6 +2844,128 @@ async fn import_transaction_that_ran_with_a_failed_command_says_so_and_audits_un
     );
 }
 
+/// A standalone server whose ACL refuses `MULTI` and `EXEC`, the way Redis
+/// does for a user without `@transaction`: every other command runs at once.
+fn multi_refused(log: Log, reply: impl Fn(&[String]) -> String + Send + Sync + 'static) -> Peer {
+    Peer::start(move |id, args| {
+        log.lock().unwrap().push((id, args.to_vec()));
+        Some(match args[0].to_ascii_uppercase().as_str() {
+            name @ ("MULTI" | "EXEC") => format!(
+                "-NOPERM User limited has no permissions to run the '{}' command\r\n",
+                name.to_ascii_lowercase()
+            ),
+            _ => reply(args),
+        })
+    })
+}
+
+#[tokio::test]
+async fn import_transaction_refused_at_multi_ran_its_commands_and_audits_unknown() {
+    use rediscope::transfer::{Record, Value};
+    let log: Log = Arc::default();
+    let peer = multi_refused(log.clone(), |args| {
+        match args[0].to_ascii_uppercase().as_str() {
+            "DEL" | "PEXPIRE" => ":1\r\n".into(),
+            _ => "+OK\r\n".into(),
+        }
+    });
+    let mut profile = peer.profile(Deployment::Standalone);
+    profile.name = unique("multi-refused", peer.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    let record = Record {
+        key: b"k".to_vec(),
+        ttl_ms: Some(60_000),
+        value: Value::String(b"new".to_vec()),
+    };
+    let e = client
+        .import_records(&[record], true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("not changed"), "{e}");
+    assert!(!e.contains("discarded"), "{e}");
+    assert!(e.contains("may have been partly or fully applied"), "{e}");
+    // The server ran them: they were not queued.
+    assert_eq!(count(&log, "SET", None), 1);
+    assert_eq!(
+        audit_outcomes(&profile.name, "PIPELINE"),
+        vec!["started", "unknown"]
+    );
+}
+
+#[tokio::test]
+async fn import_rename_transaction_refused_at_multi_does_not_say_the_key_was_unchanged() {
+    use rediscope::transfer::{Record, Value};
+    let log: Log = Arc::default();
+    let peer = multi_refused(log.clone(), |args| {
+        match args[0].to_ascii_uppercase().as_str() {
+            "EXISTS" => ":0\r\n".into(),
+            "RPUSH" | "DEL" | "PEXPIRE" => ":1\r\n".into(),
+            _ => "+OK\r\n".into(),
+        }
+    });
+    let mut profile = peer.profile(Deployment::Standalone);
+    profile.name = unique("multi-refused-rename", peer.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    let record = Record {
+        key: b"big".to_vec(),
+        ttl_ms: Some(60_000),
+        value: Value::List((0..2_000).map(|_| vec![b'v'; 1_000]).collect()),
+    };
+    let e = client
+        .import_records(&[record], true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("not changed"), "{e}");
+    assert!(e.contains("may have been partly or fully applied"), "{e}");
+    assert_eq!(count(&log, "RENAME", None), 1);
+    let outcomes = audit_outcomes(&profile.name, "PIPELINE");
+    assert_eq!(outcomes.last().map(String::as_str), Some("unknown"));
+}
+
+#[tokio::test]
+async fn import_transaction_aborted_at_exec_is_still_not_changed_and_a_failure() {
+    use rediscope::transfer::{Record, Value};
+    // Queueing refuses SET, so EXEC answers EXECABORT and nothing ran.
+    let open: Arc<Mutex<bool>> = Arc::default();
+    let peer = Peer::start(move |_, args| {
+        let mut open = open.lock().unwrap();
+        Some(match args[0].to_ascii_uppercase().as_str() {
+            "MULTI" => {
+                *open = true;
+                "+OK\r\n".into()
+            }
+            "EXEC" => {
+                *open = false;
+                "-EXECABORT Transaction discarded because of previous errors.\r\n".into()
+            }
+            "SET" if *open => "-NOPERM no permissions to run the 'set' command\r\n".into(),
+            _ if *open => "+QUEUED\r\n".into(),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    let mut profile = peer.profile(Deployment::Standalone);
+    profile.name = unique("exec-abort", peer.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    let record = Record {
+        key: b"k".to_vec(),
+        ttl_ms: Some(60_000),
+        value: Value::String(b"new".to_vec()),
+    };
+    let e = client
+        .import_records(&[record], true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("no permissions"), "{e}");
+    assert!(e.contains("the key was not changed"), "{e}");
+    assert_eq!(
+        audit_outcomes(&profile.name, "PIPELINE"),
+        vec!["started", "failure"]
+    );
+}
+
 #[tokio::test]
 async fn import_rename_that_ran_after_a_failed_ttl_does_not_say_the_key_was_unchanged() {
     use rediscope::transfer::{Record, Value};

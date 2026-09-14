@@ -830,6 +830,9 @@ starts with `rediscope:import-tmp:`, so `SCAN 0 MATCH rediscope:import-tmp:*`
 finds them to delete. The temporary path needs `RENAME` or `RENAMENX` on the
 target: an ACL user without them gets an error saying the key was not changed,
 and cannot import big keys, or any key other than a string without overwrite.
+An import with overwrite also needs `MULTI` and `EXEC` (`@transaction`). A
+server that refuses `MULTI` runs each command at once, so the error then says
+the key may have been partly or fully written, not that it was left unchanged.
 
 A commands file runs as written, and the overwrite switch does not change it.
 It may only hold commands that write data into a key (`SET`, `HSET`, `RPUSH`,

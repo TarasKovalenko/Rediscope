@@ -2575,6 +2575,95 @@ async fn a_replace_that_fails_leaves_the_existing_key_as_it_was() {
 }
 
 #[tokio::test]
+async fn an_import_by_a_user_without_transactions_never_says_the_key_was_unchanged() {
+    let Some(target) = Target::start().await else {
+        return;
+    };
+    let mut raw = target.raw().await;
+    // MULTI and EXEC are refused, and every command in between runs at once.
+    let _: () = redis::cmd("ACL")
+        .arg(
+            &[
+                "SETUSER",
+                "nomulti",
+                "on",
+                ">pw",
+                "~*",
+                "&*",
+                "+@all",
+                "-@transaction",
+            ][..],
+        )
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let profile = format!("edges-nomulti-{}", std::process::id());
+    let client = Client::connect(Connection {
+        username: "nomulti".into(),
+        password: "pw".into(),
+        ..target.profile(&profile)
+    })
+    .await
+    .unwrap();
+    let _: () = raw.set("small", "old").await.unwrap();
+    let small = Record {
+        key: b"small".to_vec(),
+        ttl_ms: None,
+        value: Value::Set(vec![b"a".to_vec(), b"b".to_vec()]),
+    };
+    let err = client
+        .import_records(std::slice::from_ref(&small), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no permissions"), "{err}");
+    assert!(!err.contains("not changed"), "{err}");
+    assert!(
+        err.contains("may have been partly or fully applied"),
+        "{err}"
+    );
+    // It did run: the old string is gone and the set is there.
+    let kind: String = redis::cmd("TYPE")
+        .arg("small")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(kind, "set");
+    let events = audit_events(&profile);
+    assert_eq!(
+        events[events.len() - 2..],
+        [
+            ev("PIPELINE", "started", Some(2)),
+            ev("PIPELINE", "unknown", Some(2))
+        ]
+    );
+
+    let _: () = raw.set("big", "old").await.unwrap();
+    let big = Record {
+        key: b"big".to_vec(),
+        ttl_ms: Some(900_000),
+        value: Value::List((0..100_000).map(|i| i.to_string().into_bytes()).collect()),
+    };
+    let err = client
+        .import_records(std::slice::from_ref(&big), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("not changed"), "{err}");
+    assert!(
+        err.contains("may have been partly or fully applied"),
+        "{err}"
+    );
+    assert!(err.contains("TTL and rename"), "written aside: {err}");
+    let len: i64 = raw.llen("big").await.unwrap();
+    assert_eq!(len, 100_000);
+    let size: i64 = redis::cmd("DBSIZE").query_async(&mut raw).await.unwrap();
+    assert_eq!(size, 2, "nothing temporary is left");
+    let events = audit_events(&profile);
+    assert_eq!(events.last().map(|e| e.1.as_str()), Some("unknown"));
+}
+
+#[tokio::test]
 async fn an_export_names_what_a_format_cannot_hold_and_is_audited_once() {
     let Some(target) = Target::start().await else {
         return;

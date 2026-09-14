@@ -951,8 +951,19 @@ impl Transport {
             Err(e) => self.audit_outcome(id, "PIPELINE", targets, Some(e), true, false)?,
             Ok(results) if atomic => match results.last() {
                 // EXECABORT: the server queued nothing it would run.
-                Some(Err(e)) => {
+                Some(Err(e)) if transaction_unrun(results) => {
                     self.audit_outcome(id, "PIPELINE", targets, Some(e), false, false)?
+                }
+                // MULTI refused, or EXEC failing some other way: the commands
+                // may have run on their own.
+                Some(Err(e)) => {
+                    self.audit_outcome(id, "PIPELINE", targets, Some(e), true, false)?
+                }
+                // EXEC ran, but MULTI or a queued command was refused: what
+                // ran is not what was sent as one transaction.
+                Some(Ok(_)) if results.iter().any(Result::is_err) => {
+                    let e = error("the transaction was not queued whole");
+                    self.audit_outcome(id, "PIPELINE", targets, Some(&e), true, false)?
                 }
                 // A command failed while the rest of the transaction ran.
                 Some(Ok(_)) if exec_failure(results).is_some() => {
@@ -1105,6 +1116,25 @@ fn reply_result(value: Value, atomic: bool) -> RedisResult<Value> {
         value if atomic => Ok(value),
         value => value.extract_error(),
     }
+}
+
+/// Whether a transaction's replies prove none of its commands ran: `MULTI`
+/// was accepted, every command was queued or refused while queueing, and
+/// `EXEC` answered `EXECABORT`. Anything else may have run. A server or proxy
+/// that refuses `MULTI` (an ACL user without `@transaction`) runs each command
+/// at once and then refuses `EXEC`, which is an error too, but not this one.
+pub(super) fn transaction_unrun(results: &[RedisResult<Value>]) -> bool {
+    let [first, queued @ .., last] = results else {
+        return false;
+    };
+    let queued_only = queued.iter().all(|r| match r {
+        Ok(Value::SimpleString(s)) => s.eq_ignore_ascii_case("QUEUED"),
+        Ok(_) => false,
+        Err(_) => true,
+    });
+    matches!(first, Ok(Value::Okay))
+        && queued_only
+        && matches!(last, Err(e) if e.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::ExecAbort))
 }
 
 /// The first error inside a transaction's `EXEC` reply, with its position:

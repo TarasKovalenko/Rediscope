@@ -3195,6 +3195,15 @@ return 1
         } else {
             ""
         };
+        // A refused MULTI leaves each command to run on its own, and an EXEC
+        // failing any way but EXECABORT proves nothing either.
+        if let Some(why) = results.iter().find_map(|r| r.as_ref().err())
+            && !topology::transaction_unrun(&results)
+        {
+            return Err(anyhow!(
+                "{why}; the server did not run the writes as one transaction, so they may have been partly or fully applied"
+            ));
+        }
         match results.last() {
             Some(Err(e)) => {
                 let why = queued
@@ -3322,6 +3331,16 @@ return 1
         // an error outside that array means none of them ran.
         let replies: Vec<redis::RedisResult<redis::Value>> = if cluster {
             results
+        } else if let Some(why) = results.iter().find_map(|r| r.as_ref().err())
+            && !topology::transaction_unrun(&results)
+        {
+            // MULTI refused: the TTL and the rename ran, or not, on their own.
+            // The temporary name is this import's alone, so deleting it is
+            // safe whether or not the rename moved it.
+            return Err(anyhow!(
+                "{why}; the server did not run the TTL and rename as one transaction, so they may have been partly or fully applied{}",
+                self.drop_temporary(temp).await
+            ));
         } else {
             match results.last() {
                 Some(Ok(redis::Value::Array(replies))) => replies
