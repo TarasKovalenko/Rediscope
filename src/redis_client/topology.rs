@@ -1,5 +1,6 @@
-//! Discovery and read routing. Writes are sent at most once on standalone;
-//! discovered deployments deliberately expose only browsing in this release.
+//! Discovery and routing. A write is only sent again when the server proves it
+//! never ran: a redirect, or a rejection such as `READONLY` or `TRYAGAIN`. A
+//! lost connection leaves a write's outcome unknown, and it is never replayed.
 use super::*;
 use crate::config::Deployment;
 use redis::{Cmd, RedisError, RedisFuture, RedisResult, Value, aio::ConnectionLike};
@@ -41,6 +42,19 @@ struct State {
     refreshed: Instant,
     warning: Option<String>,
 }
+/// The guard's refusals. Audit events match them exactly, by kind and text,
+/// so no server reply or script error can pass for one.
+const DENIED: &str = "Read-only profile or production write lease expired; command rejected";
+const PIPELINE_DENIED: &str = "Read-only profile: pipeline rejected";
+
+fn own_error(e: &RedisError) -> bool {
+    e.kind() == redis::ErrorKind::InvalidClientConfig
+}
+
+fn denied(e: &RedisError) -> bool {
+    own_error(e) && matches!(e.detail(), Some(DENIED | PIPELINE_DENIED))
+}
+
 fn error(message: impl Into<String>) -> RedisError {
     RedisError::from((
         redis::ErrorKind::InvalidClientConfig,
@@ -124,9 +138,7 @@ impl Transport {
     }
     fn guard(&self, read: bool) -> RedisResult<()> {
         if !read && self.read_only() {
-            return Err(error(
-                "Read-only profile or production write lease expired; command rejected",
-            ));
+            return Err(error(DENIED));
         }
         Ok(())
     }
@@ -137,11 +149,18 @@ impl Transport {
         count: Option<usize>,
         result: &RedisResult<T>,
         pipeline: bool,
+        opaque: bool,
     ) -> RedisResult<()> {
         let outcome = match result {
             Ok(_) => "success",
-            Err(e) if e.to_string().contains("Read-only") => "denied",
-            Err(e) if pipeline || e.is_io_error() || e.to_string().contains("outcome unknown") => {
+            Err(e) if denied(e) => "denied",
+            // A batch that fails may have run part of itself, and a script or
+            // module command may have written before its error.
+            Err(_) if pipeline || opaque => "unknown",
+            Err(e)
+                if e.is_io_error()
+                    || (own_error(e) && e.to_string().contains("outcome unknown")) =>
+            {
                 "unknown"
             }
             Err(_) => "failure",
@@ -267,6 +286,94 @@ impl Transport {
         Err(error(format!("Discovery failed: {}", failures.join("; "))))
     }
 
+    /// Rediscover when the topology is older than 30 seconds. Only a Sentinel
+    /// failure is an error: its primary may have moved, and a stale address
+    /// must never be written to. A cluster keeps routing on what it knows.
+    async fn refresh_if_stale(&self, state: &mut State) -> RedisResult<()> {
+        if self.profile.deployment == Deployment::Standalone
+            || state.refreshed.elapsed() < Duration::from_secs(30)
+        {
+            return Ok(());
+        }
+        if let Err(e) = self.discover(state).await {
+            state.warning = Some(e.to_string());
+            if self.profile.deployment == Deployment::Sentinel {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// The slot a command must be sent to on a cluster, or `None` when it has
+    /// no keys and can go to any primary. Refuses, before anything is sent,
+    /// keys in different slots and keyless writes that would silently touch
+    /// only one primary of many.
+    async fn cluster_slot(&self, state: &mut State, cmd: &Cmd) -> RedisResult<Option<u16>> {
+        let keys = match command_keys(cmd) {
+            Keys::Known(keys) => keys,
+            Keys::Unknown => self.server_keys(state, cmd).await?,
+        };
+        let Some(first) = keys.first() else {
+            if !read_route(cmd).0 && !keyless_on_any_node(cmd) {
+                return Err(error(format!(
+                    "{} has no key to route by, so on a cluster it would reach only one primary; run it against each node from a standalone profile",
+                    command_name(cmd)
+                )));
+            }
+            return Ok(None);
+        };
+        let slot = key_slot(first);
+        if keys.iter().any(|k| key_slot(k) != slot) {
+            return Err(error(
+                "Keys in this command hash to different cluster slots, so Redis would refuse it (CROSSSLOT); nothing was sent. Give the keys a shared hash tag, like {user:42}:a and {user:42}:b",
+            ));
+        }
+        Ok(Some(slot))
+    }
+
+    /// Ask the server which arguments are keys, for a command the local
+    /// table does not know: a module command, or a newer one.
+    async fn server_keys(&self, state: &mut State, cmd: &Cmd) -> RedisResult<Vec<Vec<u8>>> {
+        let mut probe = redis::cmd("COMMAND");
+        probe.arg("GETKEYS");
+        // The connect below can fail without anything being sent.
+        for arg in simple_args(cmd) {
+            probe.arg(arg);
+        }
+        let ep = state.default.clone();
+        let mut c = self.connection(state, &ep).await?;
+        match c
+            .req_packed_command(&probe)
+            .await
+            .and_then(Value::extract_error)
+        {
+            Ok(v) => Ok(redis::from_redis_value(v)?),
+            Err(e)
+                if e.to_string()
+                    .to_ascii_lowercase()
+                    .contains("no key arguments") =>
+            {
+                Ok(Vec::new())
+            }
+            Err(e) if e.is_io_error() => {
+                state.sockets.remove(&ep);
+                if let Err(refresh) = self.discover(state).await {
+                    state.warning = Some(refresh.to_string());
+                }
+                Err(error(format!(
+                    "Cannot look up the keys of {} on {}:{}; nothing was sent, and the topology was refreshed, so try again: {e}",
+                    command_name(cmd),
+                    ep.0,
+                    ep.1
+                )))
+            }
+            Err(e) => Err(error(format!(
+                "Cannot tell which cluster node owns the keys of {}; nothing was sent: {e}",
+                command_name(cmd)
+            ))),
+        }
+    }
+
     pub async fn refresh(&self) -> RedisResult<()> {
         let mut state = self.state.lock().await;
         let result = self.discover(&mut state).await;
@@ -274,6 +381,13 @@ impl Transport {
             state.warning = Some(e.to_string());
         }
         result
+    }
+    /// Where keyless commands go: the node diagnostics describe. Refreshed
+    /// first when stale; if that refresh fails, the last known node is used.
+    pub async fn default_endpoint(&self) -> Endpoint {
+        let mut state = self.state.lock().await;
+        let _ = self.refresh_if_stale(&mut state).await;
+        state.default.clone()
     }
     pub async fn nodes(&self) -> Vec<Node> {
         self.state.lock().await.nodes.clone()
@@ -307,19 +421,23 @@ impl Transport {
             .record(id, action, "started", count)
             .map_err(|_| error("Audit unavailable; command was not sent"))?;
         let result = self.direct_inner(ep, cmd).await;
-        self.audit_result(id, action, count, &result, false)?;
+        self.audit_result(id, action, count, &result, false, never_resent(cmd))?;
         result
     }
     async fn direct_inner(&self, ep: &Endpoint, cmd: &Cmd) -> RedisResult<Value> {
-        self.guard(read_route(cmd).0)?;
+        let read = read_route(cmd).0;
+        self.guard(read)?;
         let mut state = self.state.lock().await;
         let mut c = self.connection(&mut state, ep).await?;
         drop(state);
+        // Again at the moment of sending: the lock can take a while.
+        self.guard(read)?;
         let result = c
             .req_packed_command(cmd)
             .await
             .and_then(Value::extract_error);
-        if result.is_err() {
+        // A server error (NOPERM from a managed service) leaves the socket good.
+        if result.as_ref().is_err_and(RedisError::is_io_error) {
             self.state.lock().await.sockets.remove(ep);
         }
         result
@@ -356,40 +474,30 @@ impl Transport {
             .record(id, action, "started", count)
             .map_err(|_| error("Audit unavailable; command was not sent"))?;
         let result = self.request_inner(cmd).await;
-        self.audit_result(id, action, count, &result, false)?;
+        self.audit_result(id, action, count, &result, false, never_resent(cmd))?;
         result
     }
     async fn request_inner(&self, cmd: &Cmd) -> RedisResult<Value> {
-        let (read, key) = read_route(cmd);
+        let read = read_route(cmd).0;
         self.guard(read)?;
         let mut state = self.state.lock().await;
-        if self.profile.deployment != Deployment::Standalone
-            && state.refreshed.elapsed() >= Duration::from_secs(30)
-            && let Err(e) = self.discover(&mut state).await
-        {
-            state.warning = Some(e.to_string());
-            // A Sentinel primary may have changed: never use its stale address.
-            if self.profile.deployment == Deployment::Sentinel {
-                return Err(e);
-            }
-        }
-        let route = |state: &State| {
-            key.as_ref()
-                .and_then(|k| {
-                    let slot = key_slot(k);
-                    state
-                        .nodes
-                        .iter()
-                        .find(|n| {
-                            n.primary && n.slots.iter().any(|(a, b)| (*a..=*b).contains(&slot))
-                        })
-                        .map(Node::endpoint)
-                })
-                .unwrap_or_else(|| state.default.clone())
+        self.refresh_if_stale(&mut state).await?;
+        let slot = if self.profile.deployment == Deployment::Cluster {
+            self.cluster_slot(&mut state, cmd).await?
+        } else {
+            None
         };
+        let route = |state: &State| route_slot(state, slot);
+        // A script's own error reply can look like `TRYAGAIN` or `MOVED`
+        // after it has already written, and so can a module command's. Only
+        // commands whose behaviour is known are ever sent twice.
+        let opaque = never_resent(cmd);
         let mut ep = route(&state);
         let mut asking = false;
         for attempt in 0..4 {
+            // Set once the command is on the wire. A failure before that, such
+            // as a node that refuses the connection, proves nothing ran.
+            let mut sent = false;
             let result = async {
                 if asking {
                     // Dedicated socket keeps ASKING and the redirected command adjacent.
@@ -407,12 +515,15 @@ impl Transport {
                     };
                     let mut c = socket(&raw).await?;
                     redis::cmd("ASKING").query_async::<()>(&mut c).await?;
+                    self.guard(read)?;
+                    sent = true;
                     c.req_packed_command(cmd)
                         .await
                         .and_then(Value::extract_error)
                 } else {
                     let mut c = self.connection(&mut state, &ep).await?;
                     self.guard(read)?;
+                    sent = true;
                     c.req_packed_command(cmd)
                         .await
                         .and_then(Value::extract_error)
@@ -423,11 +534,28 @@ impl Transport {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     if self.profile.deployment == Deployment::Cluster
-                        && let Some((address, slot)) = e.redirect_node()
+                        && let Some((address, redirect)) = e.redirect_node()
                     {
-                        if slot >= 16384 {
+                        if redirect >= 16384 {
                             return Err(error("Invalid redirect slot"));
                         }
+                        // The server redirects a write before running it, and
+                        // only for the slot of its keys. Anything else is a
+                        // reply that merely looks like a redirect.
+                        if !read && (opaque || slot != Some(redirect)) {
+                            if slot == Some(redirect) {
+                                // Likely genuine: refresh so the next attempt
+                                // goes to the right node, without resending.
+                                if let Err(refresh) = self.discover(&mut state).await {
+                                    state.warning = Some(refresh.to_string());
+                                }
+                                return Err(error(format!(
+                                    "{e}; the command was not sent again, because its reply cannot prove it never ran. The topology was refreshed, so try again"
+                                )));
+                            }
+                            return Err(e);
+                        }
+                        let slot = redirect;
                         let address = if address.starts_with(':') {
                             format!("{}{address}", ep.0)
                         } else {
@@ -473,23 +601,36 @@ impl Transport {
                         ep = target;
                         continue;
                     }
-                    let transient = e.is_io_error()
-                        || matches!(
-                            e.kind(),
-                            redis::ErrorKind::Server(
-                                redis::ServerErrorKind::ReadOnly
-                                    | redis::ServerErrorKind::ClusterDown
-                                    | redis::ServerErrorKind::TryAgain
-                            )
-                        );
-                    if !transient {
+                    let refused = rejected_unrun(&e) && !(opaque && sent);
+                    if !e.is_io_error() && !refused {
+                        // Not resent, but a refusal still says the topology
+                        // moved, and the next attempt should find the new owner.
+                        if opaque
+                            && rejected_unrun(&e)
+                            && self.profile.deployment != Deployment::Standalone
+                            && let Err(refresh) = self.discover(&mut state).await
+                        {
+                            state.warning = Some(refresh.to_string());
+                        }
                         return Err(e);
                     }
                     state.sockets.remove(&ep);
-                    if !read {
+                    if !read && sent && !refused {
+                        // Never resent, but the next command should not be
+                        // aimed at a primary that is gone.
+                        if self.profile.deployment != Deployment::Standalone
+                            && let Err(refresh) = self.discover(&mut state).await
+                        {
+                            state.warning = Some(refresh.to_string());
+                        }
                         return Err(error(format!(
                             "Write outcome unknown; command was not retried: {e}"
                         )));
+                    }
+                    // A standalone server that refuses a write will refuse it
+                    // again: there is no other node to find.
+                    if !read && refused && self.profile.deployment == Deployment::Standalone {
+                        return Err(e);
                     }
                     if attempt == 3 {
                         return Err(e);
@@ -521,11 +662,18 @@ impl Transport {
         offset: usize,
         count: usize,
     ) -> RedisResult<Vec<Value>> {
-        if self.profile.deployment != Deployment::Standalone {
-            if pipeline.is_transaction() || pipeline.cmd_iter().any(|c| !read_route(c).0) {
+        let writes = pipeline.cmd_iter().any(|c| !read_route(c).0);
+        if self.read_only() && writes {
+            return Err(error(PIPELINE_DENIED));
+        }
+        if self.profile.deployment == Deployment::Cluster {
+            if pipeline.is_transaction() {
                 return Err(error(
-                    "Transactions and writes are disabled for discovered deployments",
+                    "Transactions are not supported on a cluster; nothing was sent",
                 ));
+            }
+            if writes {
+                return self.cluster_pipeline(pipeline, offset, count).await;
             }
             let mut values = Vec::new();
             for cmd in pipeline.cmd_iter() {
@@ -533,20 +681,33 @@ impl Transport {
             }
             return Ok(values.into_iter().skip(offset).take(count).collect());
         }
-        if self.read_only() && pipeline.cmd_iter().any(|c| !read_route(c).0) {
-            return Err(error("Read-only profile: pipeline rejected"));
-        }
         let mut state = self.state.lock().await;
+        self.refresh_if_stale(&mut state).await?;
         let ep = state.default.clone();
         let mut c = self.connection(&mut state, &ep).await?;
-        self.guard(pipeline.cmd_iter().all(|cmd| read_route(cmd).0))?;
+        self.guard(!writes)?;
         let result = c
             .req_packed_commands(pipeline, offset, count)
             .await
             .and_then(|values| values.into_iter().map(Value::extract_error).collect());
         if let Err(e) = &result {
             state.sockets.remove(&ep);
+            // A Sentinel primary demoted during failover refuses writes as a
+            // replica. Find the new primary now, so a retry reaches it.
+            if self.profile.deployment == Deployment::Sentinel && writes && rejected_unrun(e) {
+                if let Err(refresh) = self.discover(&mut state).await {
+                    state.warning = Some(refresh.to_string());
+                }
+                return Err(error(format!(
+                    "The primary stopped accepting writes partway through this batch ({e}); commands before that point may have been applied. The topology was refreshed; try again to reach the new primary"
+                )));
+            }
             if e.is_io_error() {
+                if self.profile.deployment == Deployment::Sentinel
+                    && let Err(refresh) = self.discover(&mut state).await
+                {
+                    state.warning = Some(refresh.to_string());
+                }
                 if !pipeline.is_transaction() && pipeline.cmd_iter().all(|cmd| read_route(cmd).0) {
                     drop(state);
                     let mut values = Vec::new();
@@ -561,6 +722,127 @@ impl Transport {
             }
         }
         result
+    }
+
+    /// A non-transactional pipeline with writes, on a cluster. Every command's
+    /// node is worked out before anything is sent, so one command that cannot
+    /// be routed fails the whole batch unsent. Each node then gets one
+    /// sub-pipeline of its own commands, in their original order. A command
+    /// the server redirected or refused unrun is sent again on its own; a
+    /// lost connection leaves the batch's outcome unknown and nothing is
+    /// retried.
+    async fn cluster_pipeline(
+        &self,
+        pipeline: &redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisResult<Vec<Value>> {
+        let cmds: Vec<&Cmd> = pipeline.cmd_iter().collect();
+        let mut state = self.state.lock().await;
+        self.refresh_if_stale(&mut state).await?;
+        let mut groups: Vec<(Endpoint, Vec<usize>)> = Vec::new();
+        let mut slots = Vec::with_capacity(cmds.len());
+        for (i, cmd) in cmds.iter().enumerate() {
+            let slot = self.cluster_slot(&mut state, cmd).await?;
+            slots.push(slot);
+            let ep = route_slot(&state, slot);
+            match groups.iter_mut().find(|(e, _)| *e == ep) {
+                Some((_, indices)) => indices.push(i),
+                None => groups.push((ep, vec![i])),
+            }
+        }
+        let mut replies: Vec<Option<RedisResult<Value>>> = cmds.iter().map(|_| None).collect();
+        let mut again = Vec::new();
+        for (sent, (ep, indices)) in groups.iter().enumerate() {
+            let mut sub = redis::pipe();
+            for &i in indices {
+                sub.add_command(cmds[i].clone());
+            }
+            // Commands earlier nodes ran are not undone. Commands those nodes
+            // redirected or refused are dropped with the rest of the batch.
+            let earlier = |this: &str, e: &RedisError| {
+                let before = if sent == 0 {
+                    String::new()
+                } else {
+                    format!(" Commands already sent to {sent} other node(s) may have been applied.")
+                };
+                error(format!(
+                    "Pipeline stopped at {}:{}: {this}.{before} Nothing was retried: {e}",
+                    ep.0, ep.1
+                ))
+            };
+            let mut c = match self.connection(&mut state, ep).await {
+                Ok(c) => c,
+                Err(e) if sent == 0 => return Err(e),
+                Err(e) => return Err(earlier("its commands were not sent", &e)),
+            };
+            // Checked as each node's commands go out: the lease can run out
+            // while the batch waits for the connection or a slower node.
+            if let Err(e) = self.guard(false) {
+                if sent == 0 {
+                    return Err(e);
+                }
+                return Err(earlier(
+                    "its commands were not sent",
+                    &error("writes were locked or the write lease expired mid-batch"),
+                ));
+            }
+            match c.req_packed_commands(&sub, 0, indices.len()).await {
+                Ok(values) => {
+                    for (&i, value) in indices.iter().zip(values) {
+                        let opaque = never_resent(cmds[i]);
+                        match Value::extract_error(value) {
+                            Err(e)
+                                if !opaque
+                                    && (e
+                                        .redirect_node()
+                                        .is_some_and(|(_, r)| slots[i] == Some(r))
+                                        || rejected_unrun(&e)) =>
+                            {
+                                again.push(i)
+                            }
+                            reply => replies[i] = Some(reply),
+                        }
+                    }
+                }
+                Err(e) => {
+                    state.sockets.remove(ep);
+                    if let Err(refresh) = self.discover(&mut state).await {
+                        state.warning = Some(refresh.to_string());
+                    }
+                    return Err(earlier("outcome unknown for its commands", &e));
+                }
+            }
+        }
+        drop(state);
+        // Redirected and refused commands never ran, so each is safe to send
+        // once more, through the single-command path that follows redirects.
+        // Among them the batch's order is kept; on one key it can only differ
+        // from the batch as a whole if the slot changed owner mid-batch.
+        again.sort_unstable();
+        let resent = !again.is_empty();
+        for i in again {
+            replies[i] = Some(self.request_inner(cmds[i]).await);
+        }
+        let total = replies.len();
+        let applied = replies.iter().filter(|r| matches!(r, Some(Ok(_)))).count();
+        let values: RedisResult<Vec<Value>> = replies
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(error("Pipeline reply missing"))))
+            .collect();
+        match values {
+            Ok(values) => Ok(values.into_iter().skip(offset).take(count).collect()),
+            // One failure must not hide the commands that did run.
+            Err(e) if applied > 0 => Err(error(format!(
+                "Pipeline partially applied: {applied} of {total} commands ran, and nothing was retried. First failure: {e}"
+            ))),
+            // A refusal met only while resending still followed sends that may
+            // have run: it must not read as a batch refused before sending.
+            Err(e) if denied(&e) && (resent || groups.len() > 1) => Err(error(format!(
+                "Pipeline stopped: writes were locked or the write lease expired before every command was sent; commands already sent may have been applied. {e}"
+            ))),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -587,7 +869,7 @@ impl ConnectionLike for Transport {
                 .record(id, "PIPELINE", "started", targets)
                 .map_err(|_| error("Audit unavailable; pipeline was not sent"))?;
             let result = self.pipeline_inner(pipeline, offset, count).await;
-            self.audit_result(id, "PIPELINE", targets, &result, true)?;
+            self.audit_result(id, "PIPELINE", targets, &result, true, false)?;
             result
         })
     }
@@ -596,16 +878,200 @@ impl ConnectionLike for Transport {
     }
 }
 
-// An explicit allowlist prevents module/administrative writes from bypassing
-// read-only enforcement. Unknown commands are never automatically replayed.
-pub(super) fn read_route(cmd: &Cmd) -> (bool, Option<Vec<u8>>) {
-    let args: Vec<&[u8]> = cmd
-        .args_iter()
+fn route_slot(state: &State, slot: Option<u16>) -> Endpoint {
+    slot.and_then(|slot| {
+        state
+            .nodes
+            .iter()
+            .find(|n| n.primary && n.slots.iter().any(|(a, b)| (*a..=*b).contains(&slot)))
+            .map(Node::endpoint)
+    })
+    .unwrap_or_else(|| state.default.clone())
+}
+
+/// A server error that proves the command never ran, so even a write can be
+/// sent again: a replica refusing a write, a cluster slot mid-migration or
+/// without a primary, a server still loading its data.
+fn rejected_unrun(e: &RedisError) -> bool {
+    matches!(
+        e.kind(),
+        redis::ErrorKind::Server(
+            redis::ServerErrorKind::ReadOnly
+                | redis::ServerErrorKind::ClusterDown
+                | redis::ServerErrorKind::TryAgain
+                | redis::ServerErrorKind::MasterDown
+                | redis::ServerErrorKind::BusyLoading
+        )
+    )
+}
+
+/// A script that may write. Its reply is whatever the script returns, so an
+/// error in it proves nothing about whether its writes happened.
+fn writing_script(cmd: &Cmd) -> bool {
+    matches!(command_name(cmd).as_str(), "EVAL" | "EVALSHA" | "FCALL")
+}
+
+/// Commands whose error replies cannot be trusted to mean "never ran": writing
+/// scripts, and anything outside the key table — a module can run scripts of
+/// its own (`TFCALL`, `RG.PYEXECUTE`) that answer however they like.
+fn never_resent(cmd: &Cmd) -> bool {
+    writing_script(cmd) || command_keys(cmd) == Keys::Unknown
+}
+
+fn simple_args(cmd: &Cmd) -> Vec<&[u8]> {
+    cmd.args_iter()
         .filter_map(|a| match a {
             redis::Arg::Simple(a) => Some(a),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+fn command_name(cmd: &Cmd) -> String {
+    simple_args(cmd)
+        .first()
+        .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
+        .unwrap_or_default()
+}
+
+/// Where a command's keys are, as far as the client can tell on its own.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Keys {
+    /// The key arguments; empty for a command that takes none.
+    Known(Vec<Vec<u8>>),
+    /// Not in the table: the server is asked with `COMMAND GETKEYS`.
+    Unknown,
+}
+
+/// The key arguments of a command, for slot routing. Covers every command
+/// rediscope sends itself and the common console ones, so they need no extra
+/// round trip; anything else is `Unknown`.
+pub(super) fn command_keys(cmd: &Cmd) -> Keys {
+    let args = simple_args(cmd);
+    let (read, key) = read_route(cmd);
+    if read {
+        return Keys::Known(key.into_iter().collect());
+    }
+    let word = |i: usize| {
+        args.get(i)
+            .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
+            .unwrap_or_default()
+    };
+    let (head, sub) = (word(0), word(1));
+    let at = |positions: &[usize]| -> Keys {
+        if positions.iter().any(|&i| i >= args.len()) {
+            // Too few arguments: the server will say so, and routing by a
+            // guess must not happen first.
+            return Keys::Unknown;
+        }
+        Keys::Known(positions.iter().map(|&i| args[i].to_vec()).collect())
+    };
+    let every = |start: usize, step: usize| -> Keys {
+        Keys::Known(
+            args.iter()
+                .skip(start)
+                .step_by(step)
+                .map(|a| a.to_vec())
+                .collect(),
+        )
+    };
+    // `numkeys` at `count`, then that many keys; `extra` keys come first.
+    let counted = |extra: &[usize], count: usize| -> Keys {
+        let Some(n) = args
+            .get(count)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|a| a.parse::<usize>().ok())
+        else {
+            return Keys::Unknown;
+        };
+        let Some(end) = (count + 1).checked_add(n).filter(|&end| end <= args.len()) else {
+            return Keys::Unknown;
+        };
+        let mut keys: Vec<Vec<u8>> = extra
+            .iter()
+            .filter_map(|&i| args.get(i))
+            .map(|a| a.to_vec())
+            .collect();
+        keys.extend(args[count + 1..end].iter().map(|a| a.to_vec()));
+        Keys::Known(keys)
+    };
+    match head.as_str() {
+        "SET" | "SETNX" | "SETEX" | "PSETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
+        | "INCRBYFLOAT" | "GETSET" | "GETDEL" | "GETEX" | "SETRANGE" | "SETBIT" | "HSET"
+        | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "HEXPIRE" | "HPEXPIRE"
+        | "HEXPIREAT" | "HPEXPIREAT" | "HPERSIST" | "HGETDEL" | "HGETEX" | "HSETEX" | "LPUSH"
+        | "RPUSH" | "LPUSHX" | "RPUSHX" | "LSET" | "LREM" | "LTRIM" | "LINSERT" | "LPOP"
+        | "RPOP" | "SADD" | "SREM" | "SPOP" | "ZADD" | "ZREM" | "ZINCRBY" | "ZREMRANGEBYSCORE"
+        | "ZREMRANGEBYRANK" | "ZREMRANGEBYLEX" | "ZPOPMIN" | "ZPOPMAX" | "XADD" | "XDEL"
+        | "XTRIM" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "XSETID" | "EXPIRE" | "PEXPIRE"
+        | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "RESTORE" | "PFADD" | "GEOADD" | "VADD"
+        | "VREM" | "VSETATTR" | "HMGET" | "HEXISTS" | "HKEYS" | "HVALS" | "HSTRLEN"
+        | "HRANDFIELD" | "LINDEX" | "LPOS" | "SISMEMBER" | "SMISMEMBER" | "SRANDMEMBER"
+        | "ZSCORE" | "ZMSCORE" | "ZRANK" | "ZREVRANK" | "ZCOUNT" | "ZRANGEBYSCORE"
+        | "ZREVRANGEBYSCORE" | "ZRANDMEMBER" | "GETBIT" | "BITCOUNT" | "BITPOS" | "EXPIRETIME"
+        | "PEXPIRETIME" | "HPTTL" | "OBJECT" => {
+            // `OBJECT` subcommands name their key second.
+            if head == "OBJECT" { at(&[2]) } else { at(&[1]) }
+        }
+        "XGROUP"
+            if matches!(
+                sub.as_str(),
+                "CREATE" | "DESTROY" | "SETID" | "CREATECONSUMER" | "DELCONSUMER"
+            ) =>
+        {
+            at(&[2])
+        }
+        "DEL" | "UNLINK" | "TOUCH" | "EXISTS" | "MGET" | "SINTERSTORE" | "SUNIONSTORE"
+        | "SDIFFSTORE" | "SINTER" | "SUNION" | "SDIFF" | "PFMERGE" | "PFCOUNT" => every(1, 1),
+        "MSET" | "MSETNX" => every(1, 2),
+        "SPUBLISH" => at(&[1]),
+        "RENAME" | "RENAMENX" | "SMOVE" | "LMOVE" | "RPOPLPUSH" | "COPY" | "ZRANGESTORE"
+        | "GEOSEARCHSTORE" => at(&[1, 2]),
+        "BITOP" => every(2, 1),
+        "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" => counted(&[1], 2),
+        "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO" => counted(&[], 2),
+        "TS.CREATERULE" | "TS.DELETERULE" => at(&[1, 2]),
+        "JSON.MGET" | "JSON.MSET" | "TS.MADD" | "TS.MGET" | "TS.MRANGE" | "TS.MREVRANGE"
+        | "TS.QUERYINDEX" => Keys::Unknown,
+        h if h.starts_with("JSON.") || h.starts_with("TS.") => at(&[1]),
+        "FLUSHALL" | "FLUSHDB" | "SWAPDB" | "CONFIG" | "CLIENT" | "SLOWLOG" | "LATENCY"
+        | "PUBLISH" | "SCRIPT" | "FUNCTION" | "ACL" | "MEMORY" | "SAVE" | "BGSAVE"
+        | "BGREWRITEAOF" | "SHUTDOWN" | "DEBUG" | "MODULE" | "CLUSTER" | "FAILOVER"
+        | "REPLICAOF" | "SLAVEOF" | "RANDOMKEY" | "KEYS" | "LASTSAVE" | "ECHO" => {
+            Keys::Known(Vec::new())
+        }
+        _ => Keys::Unknown,
+    }
+}
+
+/// Keyless writes whose meaning on a cluster is one node's business, sent to
+/// the node the diagnostics tabs read from. `PUBLISH` reaches every node's
+/// subscribers from any of them, and a read-only script cannot change data.
+/// A keyless `EVAL` or `FCALL` is refused: a script can reach any key on the
+/// node it runs on, so it would change one primary of many. So would
+/// `FLUSHDB`, `SCRIPT FLUSH` or `FUNCTION LOAD`. `RANDOMKEY` and `KEYS` are
+/// refused too: one node's answer would pass for the cluster's.
+fn keyless_on_any_node(cmd: &Cmd) -> bool {
+    matches!(
+        command_name(cmd).as_str(),
+        "CONFIG"
+            | "CLIENT"
+            | "SLOWLOG"
+            | "LATENCY"
+            | "MEMORY"
+            | "PUBLISH"
+            | "EVAL_RO"
+            | "EVALSHA_RO"
+            | "FCALL_RO"
+            | "ECHO"
+            | "LASTSAVE"
+    )
+}
+
+// An explicit allowlist prevents module/administrative writes from bypassing
+// read-only enforcement. Unknown commands are never automatically replayed.
+pub(super) fn read_route(cmd: &Cmd) -> (bool, Option<Vec<u8>>) {
+    let args = simple_args(cmd);
     let head = args
         .first()
         .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
@@ -751,6 +1217,275 @@ mod tests {
             read_route(redis::cmd("MEMORY").arg("USAGE").arg("k")),
             (true, Some(b"k".to_vec()))
         );
+    }
+    fn line(parts: &[&str]) -> Cmd {
+        let mut cmd = redis::cmd(parts[0]);
+        for p in &parts[1..] {
+            cmd.arg(*p);
+        }
+        cmd
+    }
+    fn known(parts: &[&str]) -> Vec<Vec<u8>> {
+        match command_keys(&line(parts)) {
+            Keys::Known(keys) => keys,
+            Keys::Unknown => panic!("{parts:?} should have known keys"),
+        }
+    }
+    fn keys(list: &[&str]) -> Vec<Vec<u8>> {
+        list.iter().map(|k| k.as_bytes().to_vec()).collect()
+    }
+    #[test]
+    fn command_keys_single_key_writes_and_reads() {
+        assert_eq!(known(&["SET", "k", "v"]), keys(&["k"]));
+        assert_eq!(known(&["set", "k", "v", "KEEPTTL"]), keys(&["k"]));
+        assert_eq!(known(&["HSET", "h", "f", "v"]), keys(&["h"]));
+        assert_eq!(known(&["EXPIRE", "k", "10"]), keys(&["k"]));
+        assert_eq!(known(&["RESTORE", "k", "0", "payload"]), keys(&["k"]));
+        assert_eq!(known(&["GET", "r"]), keys(&["r"]));
+        assert_eq!(known(&["MEMORY", "USAGE", "m"]), keys(&["m"]));
+        assert_eq!(known(&["OBJECT", "FREQ", "o"]), keys(&["o"]));
+        assert_eq!(known(&["XGROUP", "CREATE", "s", "g", "$"]), keys(&["s"]));
+        assert_eq!(known(&["xgroup", "destroy", "s", "g"]), keys(&["s"]));
+    }
+    #[test]
+    fn command_keys_multi_key_shapes() {
+        assert_eq!(known(&["DEL", "a", "b", "c"]), keys(&["a", "b", "c"]));
+        assert_eq!(known(&["UNLINK", "a"]), keys(&["a"]));
+        assert_eq!(
+            known(&["MSET", "a", "1", "b", "2", "c", "3"]),
+            keys(&["a", "b", "c"])
+        );
+        assert_eq!(known(&["MSETNX", "a", "1"]), keys(&["a"]));
+        assert_eq!(known(&["RENAME", "old", "new"]), keys(&["old", "new"]));
+        assert_eq!(
+            known(&["COPY", "src", "dst", "REPLACE"]),
+            keys(&["src", "dst"])
+        );
+        assert_eq!(
+            known(&["BITOP", "AND", "d", "a", "b"]),
+            keys(&["d", "a", "b"])
+        );
+        assert_eq!(
+            known(&["ZUNIONSTORE", "dest", "2", "a", "b", "WEIGHTS", "1", "2"]),
+            keys(&["dest", "a", "b"])
+        );
+        assert_eq!(
+            known(&["ZINTERSTORE", "dest", "1", "a"]),
+            keys(&["dest", "a"])
+        );
+    }
+    #[test]
+    fn command_keys_scripts_count_their_keys() {
+        assert_eq!(known(&["EVAL", "return 1", "0"]), Vec::<Vec<u8>>::new());
+        assert_eq!(
+            known(&["EVAL", "return 1", "0", "arg"]),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            known(&["EVAL", "return 1", "2", "k1", "k2", "argv1"]),
+            keys(&["k1", "k2"])
+        );
+        assert_eq!(known(&["EVALSHA", "abc", "1", "k"]), keys(&["k"]));
+        assert_eq!(known(&["FCALL", "f", "1", "k", "a"]), keys(&["k"]));
+        for bad in [
+            &["EVAL", "return 1", "x", "k"][..],
+            &["EVAL", "return 1", "-1", "k"],
+            &["EVAL", "return 1", "3", "k1", "k2"],
+            &["EVAL", "return 1"],
+            &["ZUNIONSTORE", "dest", "5", "a"],
+            &["ZUNIONSTORE", "dest", "many", "a"],
+        ] {
+            assert_eq!(command_keys(&line(bad)), Keys::Unknown, "{bad:?}");
+        }
+    }
+    #[test]
+    fn command_keys_modules_admin_and_unknown() {
+        assert_eq!(known(&["JSON.SET", "j", "$", "{}"]), keys(&["j"]));
+        assert_eq!(known(&["TS.ADD", "t", "*", "1"]), keys(&["t"]));
+        assert_eq!(
+            known(&["TS.CREATERULE", "a", "b", "AGGREGATION"]),
+            keys(&["a", "b"])
+        );
+        assert_eq!(
+            command_keys(&line(&["JSON.MGET", "a", "b", "$"])),
+            Keys::Unknown
+        );
+        assert_eq!(
+            command_keys(&line(&["TS.MADD", "a", "1", "2"])),
+            Keys::Unknown
+        );
+        for admin in [
+            &["FLUSHDB"][..],
+            &["FLUSHALL", "ASYNC"],
+            &["CONFIG", "SET", "maxmemory", "1"],
+            &["CLIENT", "KILL", "ID", "1"],
+            &["SLOWLOG", "RESET"],
+            &["PUBLISH", "chan", "msg"],
+            &["SCRIPT", "FLUSH"],
+            &["FUNCTION", "LOAD", "code"],
+            &["ECHO", "x"],
+            &["LASTSAVE"],
+        ] {
+            assert_eq!(known(admin), Vec::<Vec<u8>>::new(), "{admin:?}");
+        }
+        assert_eq!(command_keys(&line(&["MYMODULE.WRITE", "k"])), Keys::Unknown);
+        assert_eq!(
+            command_keys(&line(&["XREADGROUP", "GROUP", "g"])),
+            Keys::Unknown
+        );
+        assert_eq!(command_keys(&line(&["XGROUP", "HELP"])), Keys::Unknown);
+    }
+    #[test]
+    fn command_keys_too_few_arguments_is_unknown() {
+        for short in [
+            &["SET"][..],
+            &["HSET"],
+            &["RENAME", "only"],
+            &["COPY", "only"],
+            &["XGROUP", "CREATE"],
+            &["TS.CREATERULE", "a"],
+            &["JSON.SET"],
+        ] {
+            assert_eq!(command_keys(&line(short)), Keys::Unknown, "{short:?}");
+        }
+    }
+    #[test]
+    fn keyless_writes_allowed_on_one_node_are_an_explicit_list() {
+        for ok in [
+            &["CONFIG", "SET", "a", "b"][..],
+            &["client", "kill", "id", "1"],
+            &["SLOWLOG", "RESET"],
+            &["LATENCY", "RESET"],
+            &["MEMORY", "PURGE"],
+            &["PUBLISH", "c", "m"],
+            &["EVAL_RO", "return 1", "0"],
+            &["EVALSHA_RO", "abc", "0"],
+            &["FCALL_RO", "f", "0"],
+            &["ECHO", "x"],
+            &["LASTSAVE"],
+        ] {
+            assert!(keyless_on_any_node(&line(ok)), "{ok:?}");
+        }
+        for refused in [
+            // A keyless script can still write any key on its node.
+            &["EVAL", "return 1", "0"][..],
+            &["EVALSHA", "abc", "0"],
+            &["FCALL", "f", "0"],
+            &["FLUSHDB"],
+            &["FLUSHALL"],
+            &["SCRIPT", "FLUSH"],
+            &["FUNCTION", "LOAD", "x"],
+            &["SWAPDB", "0", "1"],
+            &["RANDOMKEY"],
+            &["KEYS", "*"],
+            &["SHUTDOWN"],
+            &["CLUSTER", "FAILOVER"],
+            &["DEBUG", "SLEEP", "0"],
+            &["SAVE"],
+        ] {
+            assert!(!keyless_on_any_node(&line(refused)), "{refused:?}");
+        }
+    }
+    fn server_error(reply: &str) -> RedisError {
+        redis::parse_redis_value(reply.as_bytes())
+            .unwrap()
+            .extract_error()
+            .unwrap_err()
+    }
+    #[test]
+    fn only_the_guards_own_refusals_count_as_denied() {
+        assert!(denied(&error(DENIED)));
+        assert!(denied(&error(PIPELINE_DENIED)));
+        for spoof in [
+            format!("-ERR {DENIED}\r\n"),
+            format!("-READONLY {DENIED}\r\n"),
+            format!("-ERR {PIPELINE_DENIED}\r\n"),
+        ] {
+            assert!(!denied(&server_error(&spoof)), "{spoof}");
+        }
+        assert!(!denied(&error(format!("{DENIED}; and more"))));
+        assert!(!denied(&error(
+            "Write outcome unknown; command was not retried"
+        )));
+    }
+    #[test]
+    fn only_errors_proving_the_command_never_ran_are_resendable() {
+        for unrun in [
+            "-READONLY You can't write against a read only replica.\r\n",
+            "-CLUSTERDOWN The cluster is down\r\n",
+            "-TRYAGAIN Multiple keys request during rehashing of slot\r\n",
+            "-MASTERDOWN Link with MASTER is down\r\n",
+            "-LOADING Redis is loading the dataset in memory\r\n",
+        ] {
+            assert!(rejected_unrun(&server_error(unrun)), "{unrun}");
+        }
+        for ran_or_unknown in [
+            "-ERR something\r\n",
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+            "-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+            "-NOSCRIPT No matching script\r\n",
+            "-BUSY Redis is busy running a script\r\n",
+            "-MOVED 1 127.0.0.1:7000\r\n",
+            "-ASK 1 127.0.0.1:7000\r\n",
+            "-NOPERM no permission\r\n",
+        ] {
+            assert!(
+                !rejected_unrun(&server_error(ran_or_unknown)),
+                "{ran_or_unknown}"
+            );
+        }
+        let io = RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(!rejected_unrun(&io));
+    }
+    #[test]
+    fn only_scripts_that_may_write_are_never_resent() {
+        for script in [
+            &["EVAL", "return 1", "0"][..],
+            &["eval", "return 1", "1", "k"],
+            &["EVALSHA", "abc", "0"],
+            &["FCALL", "f", "1", "k"],
+            &["fcall", "f", "0"],
+        ] {
+            assert!(writing_script(&line(script)), "{script:?}");
+        }
+        for other in [
+            &["EVAL_RO", "return 1", "0"][..],
+            &["EVALSHA_RO", "abc", "0"],
+            &["FCALL_RO", "f", "0"],
+            &["SET", "k", "v"],
+            &["SCRIPT", "LOAD", "return 1"],
+            &["FUNCTION", "LOAD", "code"],
+        ] {
+            assert!(!writing_script(&line(other)), "{other:?}");
+        }
+    }
+    #[test]
+    fn unknown_commands_and_writing_scripts_are_never_resent() {
+        for opaque in [
+            &["EVAL", "return 1", "1", "k"][..],
+            &["FCALL", "f", "1", "k"],
+            &["MYMOD.WRITE", "k", "v"],
+            &["TFCALL", "lib.f", "1", "k"],
+        ] {
+            assert!(never_resent(&line(opaque)), "{opaque:?}");
+        }
+        for known in [
+            &["SET", "k", "v"][..],
+            &["UNLINK", "k"],
+            &["EVAL_RO", "return 1", "1", "k"],
+            &["HSET", "k", "f", "v"],
+        ] {
+            assert!(!never_resent(&line(known)), "{known:?}");
+        }
+    }
+    #[test]
+    fn sharded_publish_routes_by_its_channel() {
+        assert_eq!(known(&["SPUBLISH", "chan", "msg"]), keys(&["chan"]));
+        assert_eq!(known(&["PFCOUNT", "a", "b"]), keys(&["a", "b"]));
+        assert_eq!(command_keys(&line(&["SPUBLISH"])), Keys::Unknown);
     }
     #[test]
     fn addresses_support_ipv6() {

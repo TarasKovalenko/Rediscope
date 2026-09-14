@@ -338,8 +338,8 @@ rediscope
   bulk actions, TTL changes, imports, `CONFIG SET`, `CLIENT KILL`, Lua, copies
   and writing console commands each ask for the profile name once more before
   they run.
-- **One enforcement point.** The lease, the read-only switch and the
-  Cluster/Sentinel restriction are all checked at the moment a command is
+- **One enforcement point.** The lease and the read-only switch are both
+  checked at the moment a command is
   dispatched, so no route — form, bulk action, console, script or import — can
   get around them. Commands are classified from an allowlist: anything the
   client does not recognise counts as a write and is refused.
@@ -705,19 +705,64 @@ diagnostic endpoint; the browser's total key count sums all primaries.
 
 Topology also refreshes on redirects, recoverable connection failures, and the
 next command after 30 seconds. Sentinel discovery verifies `ROLE master` and
-repeats discovery after connection loss. Reads use bounded retries and backoff;
-writes whose replies are lost report an unknown outcome and are never replayed.
+repeats discovery after connection loss. Reads use bounded retries and backoff.
+A write is sent again only when the server proves it never ran: a `MOVED` or
+`ASK` redirect, or a refusal such as `READONLY` from a primary demoted during
+failover, `TRYAGAIN` mid-migration, `CLUSTERDOWN` or `LOADING`. A single
+write whose connection failed before it was sent is also tried again; a bulk
+batch that cannot reach one of its nodes stops instead. A write whose
+reply is lost reports an unknown outcome and is never replayed, and the
+topology is refreshed at once so the next command finds the new primary.
 The shared console refuses connection-state commands such as `AUTH` and `MULTI`;
 use profile settings for authentication and the database selector (or `SELECT`
 in the TUI) to open a fresh database connection.
 
-This first release enables **read-only browsing and diagnostics** for both
-Cluster and Sentinel. Writes, imports, transactions, and unknown raw/module
-commands are refused centrally, even if the profile's read-only switch is off.
-Cluster permits database 0 only. Cluster memory rollups and discovered-profile
-pub/sub are explicitly unavailable. Slot-aware writes and multi-key restrictions
-are deferred to the next release. Managed services exposing a single proxy
-endpoint can keep a standalone profile.
+**Writing to a Cluster or Sentinel.** Both take every write a standalone
+profile does — editing, bulk actions, imports, copies, Lua and the console —
+under the same read-only switch, production lease and audit log. A Sentinel
+profile writes to the primary it discovered. A Cluster profile sends each
+command to the primary that owns its key's slot, and a few rules keep that
+honest:
+
+- **Multi-key commands must share a slot.** `RENAME`, `SMOVE`, `LMOVE`, `COPY`,
+  `MSET`, a multi-key `DEL`, the `*STORE` commands and a Lua script's keys are
+  checked before anything is sent; keys in different slots are refused with an
+  explanation instead of Redis's `CROSSSLOT`. Give related keys a hash tag, as
+  in `{user:42}:profile` and `{user:42}:cart`, to keep them together.
+- **Bulk actions span nodes.** Deleting or changing the TTL of marked keys
+  groups them by primary and sends one pipeline per node. If a node is lost
+  partway, the error names the node and says whether commands already sent to
+  other nodes may have been applied; nothing is retried.
+- **Keyless writes that would touch one primary of many are refused.**
+  `FLUSHDB`, `FLUSHALL`, `SCRIPT FLUSH`, `FUNCTION LOAD`, `SWAPDB` and the like
+  have no key to route by, so they are refused rather than quietly run on a
+  single node; run them per node from a standalone profile. A Lua script or
+  function called with no keys is refused too, because it can still write any
+  key on the node it lands on. Node-scoped commands — `CONFIG SET`,
+  `CLIENT KILL`, `SLOWLOG RESET`, `LATENCY RESET` — go to one node: from the
+  diagnostics tabs, the node the tab was read from (shown as
+  `diagnostics_node`), even if the topology changed since; from the console,
+the current default node, which can differ from it after a failover. `PUBLISH`
+  reaches every node's subscribers from any of them.
+- **Scripts and unrecognised module commands are never sent twice.** A
+  script's reply is whatever it returns, so an error that looks like `TRYAGAIN`
+  or `MOVED` proves nothing about the writes it made; the same goes for module
+  commands rediscope does not know (RedisJSON and RedisTimeSeries commands are
+  known, and Redis refuses those before running them). A
+  failure is reported, not retried, and a redirect still refreshes the
+  topology for the next attempt.
+- **A batch that stops partway says so.** If some commands in a bulk action
+  ran and one failed, the error reports how many in that batch ran and how
+  many keys earlier batches had already changed. A lost connection or a
+  failover partway through a batch cannot be counted, and says the outcome is
+  unknown instead.
+- **Module and unfamiliar commands** have their keys looked up with
+  `COMMAND GETKEYS` before they are routed.
+- **No transactions** (`MULTI`/`EXEC`) on a cluster, and database 0 only.
+
+Cluster memory rollups and discovered-profile pub/sub and `MONITOR` are not
+available yet. Managed services exposing a single proxy endpoint can keep a
+standalone profile.
 
 Saved connections live in `connections.json` under your platform config dir, and
 the console keeps its history beside it in `history` (mode `0600`, 500 commands).
@@ -839,8 +884,8 @@ Redis ACLs remain the authorization boundary, and the lease is a guard against
 mistakes made on the wrong window. It lives in memory for one connection, so it
 is never persisted, never shared with another process, and never survives a
 reconnect or a database switch. It also never widens anything: a profile with
-the read-only switch on, or a Cluster/Sentinel profile, stays read-only and
-cannot be unlocked at all.
+the read-only switch on stays read-only and cannot be unlocked at all. Cluster
+and Sentinel profiles take the lease like any other.
 
 ### The audit log
 
@@ -888,13 +933,20 @@ numbers as the ranking they are.
 
 **Writes are refused with "this connection is read-only".** The profile has its
 read-only switch on (the title bar says `READ-ONLY`). Turn it off in the profile
-editor, or connect without `--read-only`. Cluster and Sentinel profiles always
-remain read-only in this first release, regardless of that switch.
+editor, or connect without `--read-only`.
 
 **A production profile refuses writes even though it isn't read-only.** That is
 the lease, not the switch: the title bar says `PRODUCTION LOCKED`. Press `Ctrl+W`
-and type the profile name to open a five-minute window. Cluster and Sentinel
-profiles cannot be unlocked at all in this release.
+and type the profile name to open a five-minute window.
+
+**A cluster write says the keys hash to different slots.** Redis Cluster only
+runs a multi-key command when every key lives in one slot. Rename into a name
+with the same hash tag (`{user:42}:old` → `{user:42}:new`), or copy the key with
+`C` and delete the original instead.
+
+**A cluster command says it would reach only one primary.** `FLUSHDB` and other
+keyless writes have no slot to route by. Connect to each primary with a
+standalone profile and run it there.
 
 **Saving a value says the stored value changed.** Someone wrote to that key
 between the moment you opened the editor and the moment you saved. Compare the
