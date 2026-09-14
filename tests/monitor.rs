@@ -276,16 +276,29 @@ async fn the_filter_sees_arguments_past_the_part_the_feed_keeps() {
     let mut app = App::new(Store::default(), tx);
     app.screen = Screen::Browser;
     app.client = Some(client.clone());
+    // MONITOR sees every client of the server, so the filter names this run's
+    // own key and needle: no other test, and no earlier run, can match it.
+    let run = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let key = format!("monitor:far:{run}");
+    let needle = format!("deepneedle{run}");
     app.on_key(KeyEvent::from(KeyCode::Char('W')));
     app.on_key(KeyEvent::from(KeyCode::Char('s')));
-    for c in "deepneedle".chars() {
+    // One glob: the filter splits on spaces.
+    for c in format!("*{key}*{needle}*").chars() {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
     app.on_key(KeyEvent::from(KeyCode::Enter));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let far = format!(
-        "{}deepneedle",
+        "{}{needle}",
         "x".repeat(3 * rediscope::redis_client::MONITOR_DETAIL_LIMIT)
     );
     let mut raw = redis::Client::open(format!(
@@ -297,7 +310,7 @@ async fn the_filter_sees_arguments_past_the_part_the_feed_keeps() {
     .await
     .unwrap();
     let _: () = redis::cmd("SET")
-        .arg("monitor:far")
+        .arg(&key)
         .arg(&far)
         .query_async(&mut raw)
         .await
@@ -329,7 +342,7 @@ async fn the_filter_sees_arguments_past_the_part_the_feed_keeps() {
     );
     app.on_key(KeyEvent::from(KeyCode::Esc));
     let _: () = redis::cmd("DEL")
-        .arg("monitor:far")
+        .arg(&key)
         .query_async(&mut raw)
         .await
         .unwrap();
@@ -342,7 +355,9 @@ async fn d_narrows_the_feed_to_one_database() {
     };
     let _serial = SERIAL.lock().await;
     let client = Client::connect(conn.clone()).await.unwrap();
-    let elsewhere = Client::connect(Connection { db: 6, ..conn }).await.unwrap();
+    // Database 4 holds only keys other suites clean up by prefix: 6 belongs
+    // to the memory scan, which flushes it and counts every key it finds.
+    let elsewhere = Client::connect(Connection { db: 4, ..conn }).await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let mut app = App::new(Store::default(), tx);
     app.screen = Screen::Browser;
@@ -402,7 +417,7 @@ async fn d_narrows_the_feed_to_one_database() {
     assert_eq!(six.len(), 3, "{six:?}");
     assert!(
         six.iter()
-            .all(|p| p.starts_with("db6 ") && p.contains("mondb:six"))
+            .all(|p| p.starts_with("db4 ") && p.contains("mondb:six"))
     );
 
     // A new text filter keeps the database it was showing.
@@ -411,7 +426,7 @@ async fn d_narrows_the_feed_to_one_database() {
     let Some(Modal::PubSub(state)) = &app.modal else {
         panic!("the feed closed")
     };
-    assert_eq!(state.db_filter, Some(6));
+    assert_eq!(state.db_filter, Some(4));
 
     app.on_key(KeyEvent::from(KeyCode::Esc));
     let (mut zero_keys, mut six_keys) = (String::from("DEL"), String::from("DEL"));
