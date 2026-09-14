@@ -546,6 +546,7 @@ fn line(db: Option<i64>, text: &str) -> MonitorLine {
         command: "GET".into(),
         detail: format!("db{} 1.2.3.4:5  \"{text}\"", db.unwrap_or(-1)),
         db,
+        node: None,
     }
 }
 
@@ -725,7 +726,11 @@ fn batch(app: &mut App, from: usize, count: usize, dbs: i64) {
     let lines = (from..from + count)
         .map(|i| line(Some(i as i64 % dbs), &format!("c{i}")))
         .collect();
-    app.on_msg(Msg::MonitorBatch { lines, dropped: 3 });
+    app.on_msg(Msg::MonitorBatch {
+        feed: 0,
+        lines,
+        dropped: 3,
+    });
 }
 
 #[test]
@@ -861,9 +866,10 @@ fn pubsub_and_keyspace_feeds_count_every_message() {
         check_feed(&mut app, what);
         let send = |app: &mut App, from: usize, count: usize| {
             for i in from..from + count {
-                app.on_msg(Msg::PubSub {
-                    channel: format!("news.{}", i % 5),
-                    payload: format!("m{i} ключ 🙂"),
+                app.on_msg(Msg::PubSubBatch {
+                    feed: 0,
+                    messages: vec![(None, format!("news.{}", i % 5), format!("m{i} ключ 🙂"))],
+                    dropped: vec![],
                 });
             }
         };
