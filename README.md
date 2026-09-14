@@ -795,7 +795,10 @@ that fails leaves an existing file as it was. If the path is a symlink, the file
 it points to is replaced and the link stays. On Linux and macOS a symlink that
 belongs to another user is refused (one of root's only outside a sticky
 directory such as `/tmp` that root does not own), so a link someone leaves in
-`/tmp` cannot turn an export into an overwrite of one of your files. A file of
+`/tmp` cannot turn an export into an overwrite of one of your files. This is
+stricter than the kernel: a teammate's link on a shared filesystem, or your own
+link while running under `sudo`, is refused too, with an error naming the link
+and its owner. Only the last part of the path is checked this way. A file of
 yours that is replaced keeps its permission bits and group, never setuid,
 setgid or sticky; if its group cannot be kept, the group bits are dropped. A
 new export file, or one replacing a file that is not yours, is created `0600`,
@@ -821,15 +824,17 @@ so a file with a JSON document is refused whole on a server without RedisJSON.
 Then each key is written so that a failure leaves the existing key as it was.
 With overwrite, a key that fits one pipeline (256 commands, about 1 MB) goes out
 as one `MULTI` transaction. A bigger one is written in pipelines of that size
-under a temporary name, `key:rediscope-import-tmp:<pid>-<n>`, and renamed over
+under a temporary name, `key:rediscope-import-tmp:<pid>-<n>-<random>`, and renamed over
 the key at the end, so readers see the old value until the new one is complete.
 The name starts with the key, so an ACL user limited to a key pattern such as
 `~app:*` may write it wherever it may write the key. On a cluster, which runs
 no transactions, every key takes a temporary name, and one without a hash tag
-gets itself as a tag after the marker, `key:rediscope-import-tmp:{key}<pid>-<n>`,
+gets itself as a tag after the marker, `key:rediscope-import-tmp:{key}<pid>-<n>-<random>`,
 which puts the name in the key's own slot. A key with braces of its own that
 would move that tag gets a short slot tag instead, and in the rare case that
-cannot work either, the tag goes before the key. If
+cannot work either, the tag goes before the key, and that name falls outside
+a key pattern such as `~app:*`, so an ACL user limited that way gets an error
+naming the key. If
 a transaction runs but one of its commands fails, which the checks above make
 unlikely, the error says so and what it left: a key partly written, or the new
 value in place without its TTL.

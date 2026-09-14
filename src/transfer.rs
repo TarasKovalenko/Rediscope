@@ -1623,10 +1623,18 @@ impl PendingFile {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let me = euid();
             if meta.file_type().is_file() && meta.uid() == me {
-                let group_kept = std::fs::metadata(&self.temp)?.gid() == meta.gid()
-                    || std::os::unix::fs::chown(&self.temp, None, Some(meta.gid())).is_ok();
+                // Through a handle opened without following links, so a temp
+                // file swapped for a symlink cannot pass these changes on to
+                // whatever the link points at.
+                use std::os::unix::fs::OpenOptionsExt;
+                let temp = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&self.temp)?;
+                let group_kept = temp.metadata()?.gid() == meta.gid()
+                    || std::os::unix::fs::fchown(&temp, None, Some(meta.gid())).is_ok();
                 if let Some(mode) = inherited_mode(meta.mode(), meta.uid(), true, me, group_kept) {
-                    std::fs::set_permissions(&self.temp, std::fs::Permissions::from_mode(mode))?;
+                    temp.set_permissions(std::fs::Permissions::from_mode(mode))?;
                 }
             }
         }

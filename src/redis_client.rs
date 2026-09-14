@@ -3255,8 +3255,18 @@ return 1
         let cluster = self.mgr.deployment() == Deployment::Cluster;
         let mut c = self.mgr.clone();
         for _ in 0..3 {
+            // The pid and counter alone repeat across hosts and containers
+            // (every container can be pid 1), and two imports sharing a
+            // temporary key would mix their data. Random bits make that
+            // practically impossible.
+            let random = {
+                use std::hash::{BuildHasher, Hasher};
+                std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish()
+            };
             let unique = format!(
-                "{}-{}",
+                "{}-{}-{random:016x}",
                 std::process::id(),
                 TEMP.fetch_add(1, Ordering::Relaxed)
             );
