@@ -1362,3 +1362,80 @@ async fn cluster_diagnostics_actions_carry_the_node_they_were_read_from() {
     };
     assert_eq!((param.as_str(), target), ("maxmemory", &node));
 }
+
+#[test]
+fn the_export_form_picks_a_format_and_draws_at_every_size() {
+    let mut a = app();
+    populate(&mut a);
+    press(&mut a, KeyCode::Char('w'));
+    let Some(Modal::Form { title, fields, .. }) = &a.modal else {
+        panic!("w should open the export form");
+    };
+    assert_eq!(title, "Export 4 key(s)");
+    let labels: Vec<&str> = fields.iter().map(|f| f.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "File",
+            "Format",
+            "Commands format: DEL each key before writing it"
+        ]
+    );
+    // DUMP stays the default, so Enter does what it always did.
+    assert_eq!(fields[1].choice, 0);
+    let text = render_text(&mut a, 120, 40);
+    assert!(
+        text.contains("[dump]") && text.contains(" jsonl "),
+        "{text}"
+    );
+    render_all_sizes(&mut a);
+
+    // The arrows cycle the format, both ways, wrapping at either end.
+    press(&mut a, KeyCode::Tab);
+    for expected in ["json", "jsonl", "csv", "commands", "dump", "json"] {
+        press(&mut a, KeyCode::Right);
+        let text = render_text(&mut a, 120, 40);
+        assert!(
+            text.contains(&format!("[{expected}]")),
+            "{expected}: {text}"
+        );
+    }
+    press(&mut a, KeyCode::Left);
+    press(&mut a, KeyCode::Left);
+    assert!(render_text(&mut a, 120, 40).contains("[commands]"));
+    press(&mut a, KeyCode::Tab);
+    press(&mut a, KeyCode::Char(' '));
+    let Some(Modal::Form { fields, focus, .. }) = &a.modal else {
+        panic!("the form closed");
+    };
+    assert_eq!((*focus, fields[2].flag), (2, true));
+    render_all_sizes(&mut a);
+    // Enter without a live connection closes the form and writes nothing.
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none());
+    render_all_sizes(&mut a);
+
+    // Marked keys narrow what is exported.
+    press(&mut a, KeyCode::Char('m'));
+    press(&mut a, KeyCode::Char('w'));
+    let Some(Modal::Form { title, .. }) = &a.modal else {
+        panic!("w should open the export form");
+    };
+    assert!(
+        title.starts_with("Export ") && title != "Export 4 key(s)",
+        "{title}"
+    );
+    press(&mut a, KeyCode::Esc);
+
+    // The import form says it reads every format.
+    press(&mut a, KeyCode::Char('I'));
+    let Some(Modal::Form { hint, fields, .. }) = &a.modal else {
+        panic!("I should open the import form");
+    };
+    assert!(
+        hint.contains("JSON Lines, CSV or redis-cli commands"),
+        "{hint}"
+    );
+    assert_eq!(fields.len(), 2);
+    render_all_sizes(&mut a);
+}

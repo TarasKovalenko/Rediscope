@@ -8,9 +8,12 @@
 mod common;
 
 use common::Flavor;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use redis::AsyncCommands;
-use rediscope::config::{Connection, Environment};
-use rediscope::redis_client::{Client, encode_key};
+use rediscope::app::{App, Modal, Msg, Screen};
+use rediscope::config::{Connection, Environment, Store};
+use rediscope::input::InputBuf;
+use rediscope::redis_client::{Client, KeyInfo, KeyType, encode_key};
 use rediscope::transfer::{self, Format, Parsed, Record, Value};
 
 /// Keys are read from one database and written into the other. Every test
@@ -612,4 +615,151 @@ async fn a_production_import_needs_the_write_lease() {
     assert!(client.import_parsed(&parsed, true).await.is_err());
     clear(&p.source, prefix).await;
     clear(&p.target, prefix).await;
+}
+
+#[tokio::test]
+async fn the_cli_and_the_tui_ask_for_the_production_name() {
+    let prefix = "xfer:prod:";
+    let Some(mut p) = pair(prefix).await else {
+        return;
+    };
+    let _: () = p.raw.hset(format!("{prefix}h"), "f", "v").await.unwrap();
+    let names = names(&p.source, prefix).await;
+    let prod = production("xfer-production");
+    let file = std::env::temp_dir().join(format!("rediscope-xfer-prod-{}.csv", std::process::id()));
+    let bytes = export(&p.source, &names, Format::Csv, false).await;
+    std::fs::write(&file, &bytes).unwrap();
+    let path = file.to_str().unwrap();
+
+    assert!(
+        rediscope::headless::import(prod.clone(), path, false)
+            .await
+            .is_err()
+    );
+    assert!(
+        rediscope::headless::import_confirmed(prod.clone(), path, false, Some(&prod.name), None)
+            .await
+            .is_err()
+    );
+    let exists: bool = p.raw_target.exists(format!("{prefix}h")).await.unwrap();
+    assert!(!exists);
+    rediscope::headless::import_confirmed(
+        prod.clone(),
+        path,
+        false,
+        Some(&prod.name),
+        Some(&prod.name),
+    )
+    .await
+    .unwrap();
+    assert_same(
+        &snapshot(&p.source, prefix).await,
+        &snapshot(&p.target, prefix).await,
+        "production",
+    );
+
+    // The TUI asks for the name before it imports, with the lease unlocked.
+    clear(&p.target, prefix).await;
+    let client = Client::connect(prod.clone()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.screen = Screen::Browser;
+    app.client = Some(client.clone());
+    app.on_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    assert!(
+        app.modal.is_none(),
+        "a locked production profile refuses the form"
+    );
+    client.unlock_writes(&prod.name).unwrap();
+    app.on_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    let Some(Modal::Form { fields, .. }) = &mut app.modal else {
+        panic!("I should open the import form");
+    };
+    fields[0].input = InputBuf::new(path);
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    let Some(Modal::Form { title, .. }) = &app.modal else {
+        panic!("a production import must ask for the profile name");
+    };
+    assert_eq!(title, "Confirm production change");
+    for c in prod.name.chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match msg {
+        Msg::Mutated(Ok(text)) => assert_eq!(text, "Imported 1 key(s) from CSV"),
+        _ => panic!("the import did not report a change"),
+    }
+    let exists: bool = p.raw_target.exists(format!("{prefix}h")).await.unwrap();
+    assert!(exists);
+    std::fs::remove_file(file).unwrap();
+    clear(&p.source, prefix).await;
+    clear(&p.target, prefix).await;
+}
+
+#[tokio::test]
+async fn the_tui_exports_in_the_chosen_format() {
+    let prefix = "xfer:tui:";
+    let Some(mut p) = pair(prefix).await else {
+        return;
+    };
+    let _: () = p
+        .raw
+        .sadd(format!("{prefix}set"), &["a", "b"])
+        .await
+        .unwrap();
+    let _: () = p.raw.set(format!("{prefix}s"), "v").await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.screen = Screen::Browser;
+    app.client = Some(p.source.clone());
+    app.on_msg(Msg::Keys {
+        keys: names(&p.source, prefix)
+            .await
+            .into_iter()
+            .map(|name| KeyInfo {
+                name,
+                kind: KeyType::Other,
+                ttl: -1,
+            })
+            .collect(),
+        truncated: false,
+        warnings: vec![],
+        dbsize: 2,
+        pattern: format!("{prefix}*"),
+    });
+    let file = std::env::temp_dir().join(format!("rediscope-xfer-tui-{}.out", std::process::id()));
+    app.on_key(KeyEvent::from(KeyCode::Char('w')));
+    let Some(Modal::Form { fields, .. }) = &mut app.modal else {
+        panic!("w should open the export form");
+    };
+    fields[0].input = InputBuf::new(file.to_str().unwrap());
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+    app.on_key(KeyEvent::from(KeyCode::Right));
+    app.on_key(KeyEvent::from(KeyCode::Right));
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match msg {
+        Msg::Status(text) => assert!(
+            text.starts_with("Exported 2 key(s) as JSON Lines"),
+            "{text}"
+        ),
+        _ => panic!("the export did not report a status"),
+    }
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "{{\"key\":\"{prefix}s\",\"type\":\"string\",\"ttl_ms\":null,\"value\":\"v\"}}\n\
+             {{\"key\":\"{prefix}set\",\"type\":\"set\",\"ttl_ms\":null,\"value\":[\"a\",\"b\"]}}\n"
+        )
+    );
+    std::fs::remove_file(file).unwrap();
+    clear(&p.source, prefix).await;
 }

@@ -19,15 +19,19 @@ use crate::json::{self, JsonMode};
 use crate::memory::{PrefixRow, Rollup};
 use crate::palette::{PaletteState, Target};
 use crate::redis_client::{
-    Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT,
-    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, MonitorLine, ServerInfo, Similar, SimilarTo,
-    StreamGroup, StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
+    Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, KEY_LIMIT, KEY_LIMIT_MAX,
+    KeyInfo, KeyType, KeyValue, MonitorLine, ServerInfo, Similar, SimilarTo, StreamGroup,
+    StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
 };
 use crate::theme::Theme;
+use crate::transfer::Format;
 use crate::tree::{SortMode, Tree, VisibleRow};
 
 /// The "copy to" target that means the connection already open.
 pub const THIS_CONNECTION: &str = "(this connection)";
+
+/// The file name the export and import forms offer.
+pub const EXPORT_FILE: &str = "rediscope-export.json";
 
 pub const NEW_KEY_TYPES: [KeyType; 6] = [
     KeyType::String,
@@ -281,6 +285,9 @@ pub struct Field {
     pub input: InputBuf,
     pub flag: bool,
     pub choice: usize,
+    /// Shown dimmed beside the value when the field has no effect as the
+    /// rest of the form stands.
+    pub note: Option<String>,
 }
 
 impl Field {
@@ -291,6 +298,7 @@ impl Field {
             input: InputBuf::new(initial),
             flag: false,
             choice: 0,
+            note: None,
         }
     }
     pub fn secret(label: &str, initial: &str) -> Self {
@@ -1325,6 +1333,9 @@ pub struct App {
     /// The pub/sub feed while a dialog is on top of it, so publishing does not
     /// throw away the subscription and everything it has collected.
     pub held_feed: Option<PubSubState>,
+    /// The format of the last export started, which the import form's file
+    /// name follows.
+    pub last_export_format: Format,
     /// The keys behind the tree, kept so a TTL can expire one locally.
     pub keys: Vec<KeyInfo>,
     /// What the open profile splits key names on: the tree's folders, marking
@@ -1417,6 +1428,7 @@ impl App {
             commands: CommandTable::default(),
             marked: HashSet::new(),
             held_feed: None,
+            last_export_format: Format::Dump,
             server_line: String::new(),
             keys: Vec::new(),
             separator: crate::config::DEFAULT_SEPARATOR.to_string(),
@@ -3094,14 +3106,54 @@ impl App {
             self.status = "Nothing to export".into();
             return;
         }
+        let formats: Vec<&str> = Format::ALL.iter().map(|f| f.name()).collect();
         self.modal = Some(Modal::Form {
             title: format!("Export {} key(s)", names.len()),
-            hint: "DUMP payloads and TTLs, as JSON · Enter writes the file".into(),
-            fields: vec![Field::text("File", "rediscope-export.json")],
+            hint: "dump: same server version only · json, jsonl, csv, commands: any server · ←→ format".into(),
+            fields: vec![
+                Field::text("File", EXPORT_FILE),
+                Field::choice("Format", &formats, 0),
+                Field::boolean("Commands format: DEL each key before writing it", false),
+            ],
             focus: 0,
             error: None,
             action: Action::Export(names),
         });
+        self.sync_export_form();
+    }
+
+    /// The DEL switch only means something for a commands file: say so while
+    /// another format is chosen, instead of ignoring it silently.
+    fn sync_export_form(&mut self) {
+        let Some(Modal::Form {
+            fields,
+            action: Action::Export(_),
+            ..
+        }) = &mut self.modal
+        else {
+            return;
+        };
+        let format = match fields.get(1).map(|f| &f.kind) {
+            Some(FieldKind::Choice(opts)) => opts
+                .get(fields[1].choice)
+                .and_then(|name| Format::parse(name))
+                .unwrap_or(Format::Dump),
+            _ => return,
+        };
+        if let Some(switch) = fields.get_mut(2) {
+            switch.note =
+                (format != Format::Commands).then(|| format!("unused with {}", format.name()));
+        }
+    }
+
+    /// The import form's file: the default export name, with the extension
+    /// of the format last exported in, so exporting and then importing back
+    /// needs no typing.
+    fn import_file(&self) -> String {
+        match self.last_export_format {
+            Format::Dump | Format::Json => EXPORT_FILE.to_string(),
+            other => format!("rediscope-export.{}", other.extension()),
+        }
     }
 
     fn prompt_import(&mut self) {
@@ -3110,9 +3162,10 @@ impl App {
         }
         self.modal = Some(Modal::Form {
             title: "Import keys".into(),
-            hint: "Reads a file written by the export above".into(),
+            hint: "Reads dump, JSON, JSON Lines, CSV or redis-cli commands; the format is detected"
+                .into(),
             fields: vec![
-                Field::text("File", "rediscope-export.json"),
+                Field::text("File", &self.import_file()),
                 Field::boolean("Overwrite keys that already exist", false),
             ],
             focus: 0,
@@ -4663,6 +4716,7 @@ impl App {
                             *error = None;
                         }
                     }
+                    self.sync_export_form();
                 }
             },
             Modal::Info(state) => {
@@ -5666,7 +5720,15 @@ impl App {
                 });
             }
             Action::Export(names) => {
-                let path = crate::config::expand_home(v(0).trim());
+                let format = Format::parse(&v(1)).unwrap_or(Format::Dump);
+                // The switch writes DEL lines, which only a commands file has.
+                let replace = v(2) == "true" && format == Format::Commands;
+                let mut file = v(0).trim().to_string();
+                // The default name follows the format; a typed one is kept.
+                if file == EXPORT_FILE {
+                    file = format!("rediscope-export.{}", format.extension());
+                }
+                let path = crate::config::expand_home(&file);
                 let Some(client) = self.client.clone() else {
                     return;
                 };
@@ -5674,21 +5736,35 @@ impl App {
                     self.status = "Nothing to export".into();
                     return;
                 }
-                self.status = format!("Exporting {} key(s) ...", names.len());
+                self.status = format!("Exporting {} key(s) as {} ...", names.len(), format.label());
+                self.last_export_format = format;
                 self.spawn(async move {
-                    let entries = match client.export_keys(&names).await {
-                        Ok(entries) => entries,
-                        Err(e) => return Msg::Error(format!("export failed: {e}")),
+                    // Written beside the file and renamed over it once
+                    // complete, so a failed export leaves an old file alone.
+                    let (pending, out) = match crate::transfer::PendingFile::create(&path) {
+                        Ok((pending, f)) => (pending, std::io::BufWriter::new(f)),
+                        Err(e) => return Msg::Error(format!("cannot write the export: {e}")),
                     };
-                    let count = entries.len();
-                    let text = match serde_json::to_string_pretty(&entries) {
-                        Ok(text) => text,
-                        Err(e) => return Msg::Error(format!("export failed: {e}")),
-                    };
-                    match tokio::task::spawn_blocking(move || std::fs::write(&path, text)).await {
-                        Ok(Ok(())) => Msg::Status(format!("Exported {count} key(s)")),
-                        Ok(Err(e)) => Msg::Error(format!("cannot write the export: {e}")),
-                        Err(e) => Msg::Error(e.to_string()),
+                    match client.export_to(&names, format, replace, out).await {
+                        Ok((report, out)) => {
+                            drop(out);
+                            if let Err(e) = pending.commit() {
+                                return Msg::Error(format!("cannot write the export: {e}"));
+                            }
+                            let mut text = format!(
+                                "Exported {} key(s) as {} to {file}",
+                                report.written,
+                                format.label()
+                            );
+                            if let Some(first) = report.skipped.first() {
+                                text.push_str(&format!(
+                                    " · skipped {} ({first})",
+                                    report.skipped.len()
+                                ));
+                            }
+                            Msg::Status(text)
+                        }
+                        Err(e) => Msg::Error(format!("export failed: {e:#}")),
                     }
                 });
             }
@@ -5703,20 +5779,24 @@ impl App {
                 };
                 self.status = "Importing ...".into();
                 self.spawn(async move {
-                    let text =
-                        match tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
-                            .await
-                        {
-                            Ok(Ok(text)) => text,
-                            Ok(Err(e)) => return Msg::Error(format!("cannot read the file: {e}")),
-                            Err(e) => return Msg::Error(e.to_string()),
-                        };
-                    let entries: Vec<ExportEntry> = match serde_json::from_str(&text) {
-                        Ok(entries) => entries,
-                        Err(e) => return Msg::Error(format!("not a rediscope export: {e}")),
+                    // Reading and parsing a big file is real work: off the workers.
+                    let parsed = tokio::task::spawn_blocking(move || {
+                        let bytes = std::fs::read(&path)
+                            .map_err(|e| format!("cannot read the file: {e}"))?;
+                        crate::transfer::parse(&bytes)
+                            .map_err(|e| format!("not a rediscope export: {e:#}"))
+                    })
+                    .await;
+                    let parsed = match parsed {
+                        Ok(Ok(parsed)) => parsed,
+                        Ok(Err(e)) => return Msg::Error(e),
+                        Err(e) => return Msg::Error(e.to_string()),
                     };
-                    match client.import_entries(&entries, replace).await {
-                        Ok(n) => Msg::Mutated(Ok(format!("Imported {n} key(s)"))),
+                    match client.import_parsed(&parsed, replace).await {
+                        Ok(report) => Msg::Mutated(Ok(crate::transfer::import_summary(
+                            parsed.format(),
+                            &report,
+                        ))),
                         Err(e) => Msg::Mutated(Err(e.to_string())),
                     }
                 });

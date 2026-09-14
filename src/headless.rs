@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 
 use crate::config::{Connection, Store};
 use crate::memory::{Rollup, human_bytes};
-use crate::redis_client::{Client, ExportEntry, KEY_LIMIT, MemoryScan};
+use crate::redis_client::{Client, KEY_LIMIT, MemoryScan};
+use crate::transfer::{self, Format};
 
 /// Resolve which server to talk to: an explicit `--profile`, otherwise the
 /// profile the connection flags describe.
@@ -52,8 +53,18 @@ pub async fn keys(conn: Connection, pattern: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `rediscope export` — DUMP payloads and TTLs, as the JSON the import reads.
-pub async fn export(conn: Connection, pattern: &str, out: &str) -> Result<()> {
+/// `rediscope export` — the keys matching a pattern, in any export format.
+pub async fn export(
+    conn: Connection,
+    pattern: &str,
+    out: &str,
+    format: Format,
+    replace: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !replace || format == Format::Commands,
+        "--replace only applies to --format commands, where it writes DEL before each key"
+    );
     let client = Client::connect(conn).await?;
     let report = client.scan_report(pattern, KEY_LIMIT).await?;
     for warning in &report.warnings {
@@ -61,13 +72,30 @@ pub async fn export(conn: Connection, pattern: &str, out: &str) -> Result<()> {
     }
     let (keys, truncated) = (report.keys, report.truncated);
     let names: Vec<String> = keys.into_iter().map(|k| k.name).collect();
-    let entries = client.export_keys(&names).await?;
-    let text = serde_json::to_string_pretty(&entries)?;
-    if out == "-" {
-        println!("{text}");
+    let exported = if out == "-" {
+        let stdout = std::io::BufWriter::new(std::io::stdout());
+        client.export_to(&names, format, replace, stdout).await?.0
     } else {
-        std::fs::write(out, text).with_context(|| format!("cannot write {out}"))?;
-        eprintln!("exported {} key(s) to {out}", entries.len());
+        // Written beside the file and renamed over it once complete, so a
+        // failed export leaves an existing file untouched.
+        let (pending, file) =
+            transfer::PendingFile::create(out).with_context(|| format!("cannot write {out}"))?;
+        let (report, writer) = client
+            .export_to(&names, format, replace, std::io::BufWriter::new(file))
+            .await?;
+        drop(writer);
+        pending
+            .commit()
+            .with_context(|| format!("cannot write {out}"))?;
+        eprintln!(
+            "exported {} key(s) to {out} as {}",
+            report.written,
+            format.label()
+        );
+        report
+    };
+    for skipped in &exported.skipped {
+        eprintln!("warning: skipped {skipped}");
     }
     if truncated {
         eprintln!("warning: stopped at {KEY_LIMIT} keys — narrow the pattern");
@@ -80,6 +108,8 @@ pub async fn import(conn: Connection, file: &str, replace: bool) -> Result<()> {
     import_confirmed(conn, file, replace, None, None).await
 }
 
+/// `rediscope import` with the production flags. The file's format is read
+/// from its content: DUMP payloads, JSON, JSON Lines, CSV or commands.
 pub async fn import_confirmed(
     conn: Connection,
     file: &str,
@@ -103,11 +133,13 @@ pub async fn import_confirmed(
     if client.read_only() {
         anyhow::bail!("'{}' is a read-only profile", client.conn.name);
     }
-    let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?;
-    let entries: Vec<ExportEntry> =
-        serde_json::from_str(&text).context("not a rediscope export")?;
-    let written = client.import_entries(&entries, replace).await?;
-    eprintln!("imported {written} key(s)");
+    let bytes = std::fs::read(file).with_context(|| format!("cannot read {file}"))?;
+    let parsed = transfer::parse(&bytes).context("not a rediscope export")?;
+    if replace && parsed.format() == Format::Commands {
+        eprintln!("warning: --replace does not apply to a commands file; it runs as written");
+    }
+    let report = client.import_parsed(&parsed, replace).await?;
+    eprintln!("{}", transfer::import_summary(parsed.format(), &report));
     Ok(())
 }
 
