@@ -280,7 +280,7 @@ fn connection_line(c: &Connection, app: &App, palette: Palette) -> Vec<Span<'sta
             Style::new().fg(palette.info),
         ));
     }
-    if c.read_only || c.deployment != crate::config::Deployment::Standalone {
+    if c.read_only {
         spans.push(Span::styled(
             "  read-only",
             Style::new().fg(palette.warning),
@@ -507,7 +507,9 @@ fn value_panel(f: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
                         }) {
                             format!(
                                 "   slot: {}",
-                                crate::redis_client::key_slot(k.name.as_bytes())
+                                crate::redis_client::key_slot(&crate::redis_client::decode_key(
+                                    &k.name
+                                ))
                             )
                         } else {
                             String::new()

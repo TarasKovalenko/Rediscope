@@ -93,9 +93,11 @@ impl Server {
     }
 }
 
-#[tokio::test]
-#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
-async fn real_cluster_browsing_partial_coverage_and_sentinel_discovery() {
+/// Live tests share port ranges and scratch directories, so they run one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Three primaries joined with `redis-cli --cluster create`, once converged.
+async fn start_cluster() -> Vec<Server> {
     let mut servers = Vec::new();
     for _ in 0..3 {
         servers.push(Server::start(true, None).await);
@@ -131,6 +133,14 @@ async fn real_cluster_browsing_partial_coverage_and_sentinel_discovery() {
         }
         assert!(ready, "cluster did not converge");
     }
+    servers
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_cluster_browsing_partial_coverage_and_sentinel_discovery() {
+    let _serial = SERIAL.lock().await;
+    let mut servers = start_cluster().await;
     let client = Client::connect(servers[0].profile(Deployment::Cluster))
         .await
         .unwrap();
@@ -162,7 +172,34 @@ async fn real_cluster_browsing_partial_coverage_and_sentinel_discovery() {
     for name in &names {
         assert!(client.read_value(name, KeyType::String).await.is_ok());
     }
-    assert!(client.set_string(&names[0], "forbidden").await.is_err());
+    client.set_string(&names[0], "written").await.unwrap();
+    assert!(matches!(
+        client.read_value(&names[0], KeyType::String).await.unwrap(),
+        rediscope::redis_client::KeyValue::Str(s) if s == "written"
+    ));
+    assert_eq!(client.delete_keys(&names).await.unwrap(), 3);
+    for name in &names {
+        redis::cmd("SET")
+            .arg(name)
+            .arg("value")
+            .query_async::<()>(
+                &mut servers
+                    .iter()
+                    .find(|s| {
+                        nodes.iter().any(|n| {
+                            n.port == s.port
+                                && n.slots
+                                    .iter()
+                                    .any(|(a, b)| (*a..=*b).contains(&key_slot(name.as_bytes())))
+                        })
+                    })
+                    .unwrap()
+                    .raw()
+                    .await,
+            )
+            .await
+            .unwrap();
+    }
     assert!(client.info().await.unwrap().raw.contains("slots=["));
     servers[2].child.kill().unwrap();
     servers[2].child.wait().unwrap();
@@ -186,4 +223,213 @@ async fn real_cluster_browsing_partial_coverage_and_sentinel_discovery() {
         client.refresh_topology().await.unwrap()[0].port,
         primary.port
     );
+}
+
+/// The server owning `key`'s slot.
+fn owner<'a>(
+    servers: &'a [Server],
+    nodes: &[rediscope::redis_client::Node],
+    key: &str,
+) -> &'a Server {
+    let slot = key_slot(key.as_bytes());
+    let node = nodes
+        .iter()
+        .find(|n| n.primary && n.slots.iter().any(|(a, b)| (*a..=*b).contains(&slot)))
+        .unwrap();
+    servers.iter().find(|s| s.port == node.port).unwrap()
+}
+async fn raw_get(server: &Server, key: &str) -> Option<String> {
+    redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut server.raw().await)
+        .await
+        .unwrap()
+}
+async fn raw_exists(server: &Server, key: &str) -> bool {
+    redis::cmd("EXISTS")
+        .arg(key)
+        .query_async::<i64>(&mut server.raw().await)
+        .await
+        .unwrap()
+        == 1
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_cluster_and_sentinel_accept_routed_writes() {
+    use rediscope::redis_client::{EditOutcome, EditTarget, KeyValue};
+    let _serial = SERIAL.lock().await;
+    let servers = start_cluster().await;
+    let client = Client::connect(servers[0].profile(Deployment::Cluster))
+        .await
+        .unwrap();
+    assert!(!client.read_only());
+    let nodes = client.refresh_topology().await.unwrap();
+    let primaries: Vec<_> = nodes.iter().filter(|n| n.primary).collect();
+    assert_eq!(primaries.len(), 3);
+
+    // One key per primary, written through the client, read back raw from its owner.
+    let names: Vec<String> = primaries
+        .iter()
+        .map(|node| {
+            (0..10000)
+                .map(|i| format!("write:key:{i}"))
+                .find(|k| {
+                    let slot = key_slot(k.as_bytes());
+                    node.slots.iter().any(|(a, b)| (*a..=*b).contains(&slot))
+                })
+                .unwrap()
+        })
+        .collect();
+    for name in &names {
+        client.set_string(name, "routed").await.unwrap();
+        assert_eq!(
+            raw_get(owner(&servers, &nodes, name), name)
+                .await
+                .as_deref(),
+            Some("routed")
+        );
+    }
+    let owners: std::collections::HashSet<u16> = names
+        .iter()
+        .map(|n| owner(&servers, &nodes, n).port)
+        .collect();
+    assert_eq!(owners.len(), 3, "the keys cover every primary");
+
+    // Rename within a hash tag works; across slots it is refused and nothing changes.
+    let (old, new) = ("{write}:old".to_string(), "{write}:new".to_string());
+    client.set_string(&old, "tagged").await.unwrap();
+    client.rename_key(&old, &new).await.unwrap();
+    let tagged = owner(&servers, &nodes, &new);
+    assert!(!raw_exists(tagged, &old).await);
+    assert_eq!(raw_get(tagged, &new).await.as_deref(), Some("tagged"));
+    let e = client
+        .rename_key(&names[0], &names[1])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("different cluster slots"), "{e}");
+    assert!(raw_exists(owner(&servers, &nodes, &names[0]), &names[0]).await);
+
+    // A script over two same-slot keys runs on their owner.
+    let reply = client
+        .eval(
+            "redis.call('SET', KEYS[1], ARGV[1]); redis.call('SET', KEYS[2], ARGV[1]); return redis.call('GET', KEYS[2])",
+            &["{write}:s1".into(), "{write}:s2".into()],
+            &["scripted".into()],
+        )
+        .await
+        .unwrap();
+    assert!(reply.contains("scripted"), "{reply}");
+    assert_eq!(
+        raw_get(owner(&servers, &nodes, "{write}:s1"), "{write}:s1")
+            .await
+            .as_deref(),
+        Some("scripted")
+    );
+
+    // Keyless writes that would touch one primary of three are refused.
+    let before = client.dbsize().await.unwrap();
+    let e = client.execute_raw("FLUSHDB").await.unwrap_err().to_string();
+    assert!(e.contains("only one primary"), "{e}");
+    assert_eq!(client.dbsize().await.unwrap(), before);
+    assert!(
+        client
+            .execute_raw("CONFIG SET slowlog-max-len 128")
+            .await
+            .is_ok()
+    );
+
+    // Bulk expiry and persistence across nodes.
+    assert_eq!(client.expire_keys(&names, Some(1000)).await.unwrap(), 3);
+    for name in &names {
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(name)
+            .query_async(&mut owner(&servers, &nodes, name).raw().await)
+            .await
+            .unwrap();
+        assert!(ttl > 0 && ttl <= 1000, "{name}: {ttl}");
+    }
+    assert_eq!(client.expire_keys(&names, None).await.unwrap(), 3);
+
+    // Export, delete across nodes, import back.
+    // One of the three becomes a hash, so the round trip carries more than strings.
+    client
+        .delete_keys(std::slice::from_ref(&names[2]))
+        .await
+        .unwrap();
+    client.hash_set(&names[2], "field", "value").await.unwrap();
+    let entries = client.export_keys(&names).await.unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(client.delete_keys(&names).await.unwrap(), 3);
+    for name in &names {
+        assert!(!raw_exists(owner(&servers, &nodes, name), name).await);
+    }
+    assert_eq!(client.delete_keys(&names).await.unwrap(), 0);
+    assert_eq!(client.import_entries(&entries, false).await.unwrap(), 3);
+    assert!(client.import_entries(&entries, false).await.is_err());
+    assert_eq!(client.import_entries(&entries, true).await.unwrap(), 3);
+    assert_eq!(
+        raw_get(owner(&servers, &nodes, &names[0]), &names[0])
+            .await
+            .as_deref(),
+        Some("routed")
+    );
+    assert!(matches!(
+        client.read_value(&names[2], KeyType::Hash).await.unwrap(),
+        KeyValue::Rows { .. }
+    ));
+
+    // An in-place edit is one EVAL on the key's owner, with its conflict check.
+    let edit = |original: &str| EditTarget {
+        key: names[0].clone(),
+        kind: KeyType::String,
+        selector: String::new(),
+        original: original.into(),
+        decoded: None,
+    };
+    assert_eq!(
+        client
+            .save_edit(&edit("routed"), &["edited".into()], false)
+            .await
+            .unwrap(),
+        EditOutcome::Saved
+    );
+    assert_eq!(
+        raw_get(owner(&servers, &nodes, &names[0]), &names[0])
+            .await
+            .as_deref(),
+        Some("edited")
+    );
+    assert_eq!(
+        client
+            .save_edit(&edit("stale"), &["lost".into()], false)
+            .await
+            .unwrap(),
+        EditOutcome::Conflict {
+            current: Some("edited".into())
+        }
+    );
+
+    // Sentinel: writes land on the primary it names.
+    let primary = Server::start(false, None).await;
+    let sentinel = Server::start(false, Some(primary.port)).await;
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "test-primary".into();
+    let client = Client::connect(profile).await.unwrap();
+    assert!(!client.read_only());
+    client.set_string("sentinel:write", "landed").await.unwrap();
+    assert_eq!(
+        raw_get(&primary, "sentinel:write").await.as_deref(),
+        Some("landed")
+    );
+    assert_eq!(
+        client
+            .delete_keys(&["sentinel:write".into(), "sentinel:missing".into()])
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!raw_exists(&primary, "sentinel:write").await);
+    drop(servers);
 }

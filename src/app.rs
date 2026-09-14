@@ -239,10 +239,11 @@ pub enum Action {
     /// Run a RediSearch query.
     Search,
     /// `CONFIG SET` the parameter the info modal has selected.
-    SetConfig(String),
+    /// A config parameter, and the cluster node the Config tab was read from.
+    SetConfig(String, Option<(String, u16)>),
     /// Disconnect a client by id.
-    KillClient(String),
-    ResetSlowlog,
+    KillClient(String, Option<(String, u16)>),
+    ResetSlowlog(Option<(String, u16)>),
     CreateGroup(String),
     DestroyGroup {
         key: String,
@@ -2487,7 +2488,7 @@ impl App {
                 Field::text("SSH user (optional)", &c.ssh_user),
                 Field::text("SSH port", &c.ssh_port.to_string()),
                 Field::text("SSH private key file (optional)", &c.ssh_key_file),
-                Field::section("Topology (Cluster/Sentinel browsing is read-only)"),
+                Field::section("Topology"),
                 Field::choice(
                     "Deployment",
                     &["standalone", "cluster", "sentinel"],
@@ -4531,7 +4532,7 @@ impl App {
                                 fields: vec![Field::text(&param, &value)],
                                 focus: 0,
                                 error: None,
-                                action: Action::SetConfig(param),
+                                action: Action::SetConfig(param, state.diag.node.clone()),
                             });
                         }
                     }
@@ -4541,14 +4542,14 @@ impl App {
                             if let Some((id, addr)) = state.selected_client() {
                                 self.modal = Some(Modal::Confirm {
                                     message: format!("Disconnect client {id} ({addr})?"),
-                                    action: Action::KillClient(id),
+                                    action: Action::KillClient(id, state.diag.node.clone()),
                                 });
                             }
                         }
                         Some(&"Slowlog") => {
                             self.modal = Some(Modal::Confirm {
                                 message: "Reset the slow log?".into(),
-                                action: Action::ResetSlowlog,
+                                action: Action::ResetSlowlog(state.diag.node.clone()),
                             });
                         }
                         _ => {}
@@ -4980,9 +4981,9 @@ impl App {
             | Action::VsetDel { .. }
             | Action::TsDel { .. }
             | Action::Import
-            | Action::SetConfig(_)
-            | Action::KillClient(_)
-            | Action::ResetSlowlog
+            | Action::SetConfig(..)
+            | Action::KillClient(..)
+            | Action::ResetSlowlog(_)
             | Action::DestroyGroup { .. }
             | Action::RunLua
             | Action::CopyKey(_) => true,
@@ -5530,7 +5531,7 @@ impl App {
                     }
                 });
             }
-            Action::SetConfig(param) => {
+            Action::SetConfig(param, node) => {
                 if self.refuse_write() {
                     return;
                 }
@@ -5539,31 +5540,31 @@ impl App {
                     return;
                 };
                 self.spawn(async move {
-                    match client.config_set(&param, &value).await {
+                    match client.config_set_on(&node, &param, &value).await {
                         Ok(()) => Msg::Status(format!("{param} set to '{value}'")),
                         Err(e) => Msg::Error(format!("CONFIG SET failed: {e}")),
                     }
                 });
                 self.load_info();
             }
-            Action::KillClient(id) => {
+            Action::KillClient(id, node) => {
                 let Some(client) = self.client.clone() else {
                     return;
                 };
                 self.spawn(async move {
-                    match client.client_kill(&id).await {
+                    match client.client_kill_on(&node, &id).await {
                         Ok(()) => Msg::Status(format!("Client {id} disconnected")),
                         Err(e) => Msg::Error(format!("CLIENT KILL failed: {e}")),
                     }
                 });
                 self.load_info();
             }
-            Action::ResetSlowlog => {
+            Action::ResetSlowlog(node) => {
                 let Some(client) = self.client.clone() else {
                     return;
                 };
                 self.spawn(async move {
-                    match client.slowlog_reset().await {
+                    match client.slowlog_reset_on(&node).await {
                         Ok(()) => Msg::Status("Slow log reset".into()),
                         Err(e) => Msg::Error(format!("SLOWLOG RESET failed: {e}")),
                     }

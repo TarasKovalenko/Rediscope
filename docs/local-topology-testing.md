@@ -4,8 +4,8 @@ Local Cluster and Sentinel testing
 These steps target macOS with zsh/bash, matching this workspace. Commands run
 from the repository root. Keep the same terminal for setup so its variables
 remain available. All servers bind to loopback and use temporary directories.
-Cluster/Sentinel profiles are read-only in this first release; seed data with
-`redis-cli`.
+Cluster/Sentinel profiles can write; seed data with `redis-cli` or from
+rediscope itself.
 
 1. Check prerequisites and build
 
@@ -174,9 +174,14 @@ In the TUI:
 - Press `i`, then navigate to the Cluster tab: expect three primaries and
   slot ranges covering 0–16383. The All view includes per-primary INFO.
 - Close the modal with Escape. Press `r` to refresh keys and topology.
-- Try editing/deleting a key: Rediscope should refuse because the deployment
-  is read-only. A standalone profile aimed at a cluster seed does not enable
-  discovery; use the Cluster profile above.
+- Edit a key with `e` and save; it is written to the primary that owns its
+  slot. Mark keys from different folders with `m` and delete them with `D`:
+  the batch spans primaries.
+- Press `:` and run `RENAME demo:a demo:b`: unless both names happen to
+  share a slot, expect a refusal explaining the keys hash to different slots. `RENAME {demo}:a {demo}:b` works once `{demo}:a` exists.
+- `FLUSHDB` in the console is refused, because it would reach one primary only.
+- A standalone profile aimed at a cluster seed does not enable discovery; use
+  the Cluster profile above.
 
 6. Test cluster partial results and recovery
 
@@ -300,7 +305,8 @@ normal. Keep the temporary directory if you want to inspect logs. Unsetting
 
 Current limits to expect
 
-- Cluster/Sentinel writes and imports are disabled, even with `read_only: false`.
+- Cluster multi-key writes need every key in one slot (use hash tags); keyless
+  cluster-wide writes such as `FLUSHDB` are refused; no `MULTI`/`EXEC`.
 - Cluster accepts database 0 only.
 - Cluster namespace-memory rollups and discovered-profile pub/sub are unavailable.
 - Browser discovery spans primaries; raw node-local commands such as SCAN

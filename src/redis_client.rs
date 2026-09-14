@@ -510,6 +510,10 @@ pub struct Diagnostics {
     pub latency: Vec<(String, String)>,
     pub cluster: Vec<(String, String)>,
     pub modules: Vec<String>,
+    /// On a Cluster or Sentinel, the node every tab was read from. Changes made from
+    /// the tabs go back to it: a client id or a config value only means
+    /// something on the node that reported it.
+    pub node: Option<(String, u16)>,
 }
 
 /// The server's command list: every name, plus the ones it flags as writes.
@@ -2216,36 +2220,38 @@ return 1
     /// Every part is optional: a managed provider that blocks `CONFIG` or
     /// `CLIENT LIST` still gets the tabs it is allowed to see.
     pub async fn diagnostics(&self) -> Result<Diagnostics> {
-        let mut c = self.mgr.clone();
-        let slowlog = match redis::cmd("SLOWLOG")
-            .arg("GET")
-            .arg(128)
-            .query_async::<redis::Value>(&mut c)
+        // Sentinel too: after a failover, a client id still belongs to the
+        // node that listed it.
+        let node = if self.conn.deployment != Deployment::Standalone {
+            Some(self.mgr.default_endpoint().await)
+        } else {
+            None
+        };
+        let slowlog = match self
+            .node_query(&node, redis::cmd("SLOWLOG").arg("GET").arg(128))
             .await
         {
             Ok(v) => parse_slowlog(&v),
             Err(_) => Vec::new(),
         };
-        let clients = redis::cmd("CLIENT")
-            .arg("LIST")
-            .query_async::<String>(&mut c)
+        let clients = self
+            .node_query(&node, redis::cmd("CLIENT").arg("LIST"))
             .await
+            .and_then(|v| Ok(redis::from_redis_value::<String>(v)?))
             .map(|raw| parse_client_list(&raw))
             .unwrap_or_default();
         // Read loosely: KeyDB answers one parameter (`tls-allowlist`) with a
         // list, which a strict read of strings would reject in full.
-        let config: Vec<(String, String)> = redis::cmd("CONFIG")
-            .arg("GET")
-            .arg("*")
-            .query_async::<redis::Value>(&mut c)
+        let config: Vec<(String, String)> = self
+            .node_query(&node, redis::cmd("CONFIG").arg("GET").arg("*"))
             .await
             .map(|reply| config_pairs(&reply))
             .unwrap_or_default();
-        let latency = self.latency_rows(&mut c).await;
-        let mut cluster: Vec<(String, String)> = redis::cmd("CLUSTER")
-            .arg("INFO")
-            .query_async::<String>(&mut c)
+        let latency = self.latency_rows(&node).await;
+        let mut cluster: Vec<(String, String)> = self
+            .node_query(&node, redis::cmd("CLUSTER").arg("INFO"))
             .await
+            .and_then(|v| Ok(redis::from_redis_value::<String>(v)?))
             .map(|raw| {
                 raw.lines()
                     .filter_map(|l| l.split_once(':'))
@@ -2253,12 +2259,14 @@ return 1
                     .collect()
             })
             .unwrap_or_default();
+        if let Some((host, port)) = &node {
+            cluster.insert(0, ("diagnostics_node".into(), format!("{host}:{port}")));
+        }
         if self.conn.deployment != Deployment::Standalone {
             cluster.extend(self.topology_rows().await);
         }
-        let modules = redis::cmd("MODULE")
-            .arg("LIST")
-            .query_async::<redis::Value>(&mut c)
+        let modules = self
+            .node_query(&node, redis::cmd("MODULE").arg("LIST"))
             .await
             .map(|v| {
                 as_maps(&v)
@@ -2280,12 +2288,29 @@ return 1
             latency,
             cluster,
             modules,
+            node,
         })
+    }
+
+    /// One command to `node` when there is one, otherwise through the normal
+    /// route. Used for everything the diagnostics tabs read and change.
+    async fn node_query(
+        &self,
+        node: &Option<(String, u16)>,
+        cmd: &redis::Cmd,
+    ) -> redis::RedisResult<redis::Value> {
+        match node {
+            Some(ep) => self.mgr.direct(ep, cmd).await,
+            None => {
+                let mut c = self.mgr.clone();
+                cmd.query_async(&mut c).await
+            }
+        }
     }
 
     /// `LATENCY LATEST` plus a fresh ping sample, so the tab says something
     /// useful even on a server with latency monitoring switched off.
-    async fn latency_rows(&self, c: &mut Transport) -> Vec<(String, String)> {
+    async fn latency_rows(&self, node: &Option<(String, u16)>) -> Vec<(String, String)> {
         let mut rows = Vec::new();
         let mut best = f64::MAX;
         let mut worst: f64 = 0.0;
@@ -2293,7 +2318,7 @@ return 1
         const SAMPLES: usize = 5;
         for _ in 0..SAMPLES {
             let start = std::time::Instant::now();
-            if redis::cmd("PING").query_async::<()>(c).await.is_err() {
+            if self.node_query(node, &redis::cmd("PING")).await.is_err() {
                 break;
             }
             let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -2310,10 +2335,10 @@ return 1
                 ),
             ));
         }
-        if let Ok(events) = redis::cmd("LATENCY")
-            .arg("LATEST")
-            .query_async::<Vec<(String, i64, i64, i64)>>(c)
+        if let Ok(events) = self
+            .node_query(node, redis::cmd("LATENCY").arg("LATEST"))
             .await
+            .and_then(|v| Ok(redis::from_redis_value::<Vec<(String, i64, i64, i64)>>(v)?))
         {
             for (event, at, last_ms, max_ms) in events {
                 rows.push((
@@ -2334,33 +2359,40 @@ return 1
     /// Change one running config parameter. Not persisted to the config file;
     /// that is `CONFIG REWRITE`, which stays a console command on purpose.
     pub async fn config_set(&self, param: &str, value: &str) -> Result<()> {
-        let mut c = self.mgr.clone();
-        redis::cmd("CONFIG")
-            .arg("SET")
-            .arg(param)
-            .arg(value)
-            .query_async::<()>(&mut c)
+        self.config_set_on(&None, param, value).await
+    }
+
+    /// `config_set` on the node a diagnostics read came from (`Diagnostics::node`).
+    pub async fn config_set_on(
+        &self,
+        node: &Option<(String, u16)>,
+        param: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.node_query(node, redis::cmd("CONFIG").arg("SET").arg(param).arg(value))
             .await?;
         Ok(())
     }
 
     /// Disconnect a client by id.
     pub async fn client_kill(&self, id: &str) -> Result<()> {
-        let mut c = self.mgr.clone();
-        redis::cmd("CLIENT")
-            .arg("KILL")
-            .arg("ID")
-            .arg(id)
-            .query_async::<redis::Value>(&mut c)
+        self.client_kill_on(&None, id).await
+    }
+
+    /// `client_kill` on the node that listed the client. Ids are counted per
+    /// node, so the same id on another node is a different client.
+    pub async fn client_kill_on(&self, node: &Option<(String, u16)>, id: &str) -> Result<()> {
+        self.node_query(node, redis::cmd("CLIENT").arg("KILL").arg("ID").arg(id))
             .await?;
         Ok(())
     }
 
     pub async fn slowlog_reset(&self) -> Result<()> {
-        let mut c = self.mgr.clone();
-        redis::cmd("SLOWLOG")
-            .arg("RESET")
-            .query_async::<()>(&mut c)
+        self.slowlog_reset_on(&None).await
+    }
+
+    pub async fn slowlog_reset_on(&self, node: &Option<(String, u16)>) -> Result<()> {
+        self.node_query(node, redis::cmd("SLOWLOG").arg("RESET"))
             .await?;
         Ok(())
     }
@@ -2377,7 +2409,13 @@ return 1
             for name in chunk {
                 pipe.cmd("UNLINK").arg(decode_key(name));
             }
-            let counts: Vec<i64> = pipe.query_async(&mut c).await?;
+            let counts: Vec<i64> = match pipe.query_async(&mut c).await {
+                Ok(counts) => counts,
+                Err(e) if removed > 0 => {
+                    anyhow::bail!("{e}. Earlier batches had already removed {removed} key(s).")
+                }
+                Err(e) => return Err(e.into()),
+            };
             removed += counts.iter().map(|n| (*n).max(0) as u64).sum::<u64>();
         }
         Ok(removed)
@@ -2395,7 +2433,13 @@ return 1
                     _ => pipe.cmd("PERSIST").arg(decode_key(name)),
                 };
             }
-            let counts: Vec<i64> = pipe.query_async(&mut c).await?;
+            let counts: Vec<i64> = match pipe.query_async(&mut c).await {
+                Ok(counts) => counts,
+                Err(e) if changed > 0 => {
+                    anyhow::bail!("{e}. Earlier batches had already changed {changed} key(s).")
+                }
+                Err(e) => return Err(e.into()),
+            };
             changed += counts.iter().map(|n| (*n).max(0) as u64).sum::<u64>();
         }
         Ok(changed)

@@ -1074,3 +1074,84 @@ async fn the_footer_keeps_help_and_quit_at_any_width() {
     // Narrower than the pinned pair itself: no panic.
     render_all_sizes(&mut a);
 }
+
+#[tokio::test]
+async fn cluster_diagnostics_actions_carry_the_node_they_were_read_from() {
+    use rediscope::app::Action;
+    let node = Some(("10.0.0.2".to_string(), 7001));
+    let mut a = app();
+    populate(&mut a);
+    let diag = rediscope::redis_client::Diagnostics {
+        clients: vec![rediscope::redis_client::ClientEntry {
+            id: "17".into(),
+            addr: "10.0.0.9:5000".into(),
+            db: "0".into(),
+            command: "get".into(),
+            ..Default::default()
+        }],
+        config: vec![("maxmemory".into(), "0".into())],
+        cluster: vec![
+            ("diagnostics_node".into(), "10.0.0.2:7001".into()),
+            ("cluster_state".into(), "ok".into()),
+        ],
+        node: node.clone(),
+        ..Default::default()
+    };
+    let open = |a: &mut App, tab: char| {
+        a.modal = None;
+        a.on_msg(Msg::Info(Box::new(Ok((
+            ServerInfo::parse("# Server\nredis_version:7.2.4\n"),
+            diag.clone(),
+        )))));
+        press(a, KeyCode::Char(tab));
+    };
+
+    // Cluster tab (9) shows which node the tabs describe.
+    open(&mut a, '9');
+    let text = render_text(&mut a, 120, 30);
+    assert!(
+        text.contains("diagnostics_node") && text.contains("10.0.0.2:7001"),
+        "{text}"
+    );
+
+    // Clients tab (6): x on the selected client targets that node.
+    open(&mut a, '6');
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Char('x'));
+    let Some(Modal::Confirm {
+        action: Action::KillClient(id, target),
+        ..
+    }) = &a.modal
+    else {
+        panic!("x on the clients tab should confirm a kill");
+    };
+    assert_eq!((id.as_str(), target), ("17", &node));
+    // Confirming without a live client must not panic.
+    press(&mut a, KeyCode::Char('y'));
+    press(&mut a, KeyCode::Enter);
+
+    // Slowlog tab (5): x resets the slow log on that node.
+    open(&mut a, '5');
+    press(&mut a, KeyCode::Char('x'));
+    let Some(Modal::Confirm {
+        action: Action::ResetSlowlog(target),
+        ..
+    }) = &a.modal
+    else {
+        panic!("x on the slowlog tab should confirm a reset");
+    };
+    assert_eq!(target, &node);
+
+    // Config tab (7): e edits the parameter on that node.
+    open(&mut a, '7');
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Char('e'));
+    let Some(Modal::Form {
+        action: Action::SetConfig(param, target),
+        ..
+    }) = &a.modal
+    else {
+        panic!("e on the config tab should edit the parameter");
+    };
+    assert_eq!((param.as_str(), target), ("maxmemory", &node));
+}

@@ -2,7 +2,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::config::{Connection, Deployment, Environment};
+use crate::config::{Connection, Environment};
 use anyhow::{Result, ensure};
 
 pub const WRITE_LEASE: Duration = Duration::from_secs(300);
@@ -21,9 +21,7 @@ impl Safety {
             .unwrap_or(0)
     }
     pub fn read_only(&self, p: &Connection) -> bool {
-        p.read_only
-            || p.deployment != Deployment::Standalone
-            || (p.environment == Environment::Production && self.remaining() == 0)
+        p.read_only || (p.environment == Environment::Production && self.remaining() == 0)
     }
     pub fn unlock(&self, p: &Connection, confirmation: &str) -> Result<()> {
         ensure!(
@@ -31,8 +29,8 @@ impl Safety {
             "Only production profiles need an unlock"
         );
         ensure!(
-            !p.read_only && p.deployment == Deployment::Standalone,
-            "Explicit read-only and discovered deployments cannot be unlocked"
+            !p.read_only,
+            "Explicit read-only profiles cannot be unlocked"
         );
         ensure!(
             confirmation == p.name && !confirmation.is_empty(),
@@ -49,6 +47,7 @@ impl Safety {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Deployment;
     #[test]
     fn lease_is_shared_expires_and_never_overrides_hard_restrictions() {
         let s = Safety::default();
@@ -65,8 +64,11 @@ mod tests {
         assert!(s.read_only(&p));
         assert!(s.unlock(&p, "prod").is_err());
         p.read_only = false;
-        p.deployment = Deployment::Cluster;
-        assert!(s.read_only(&p));
+        // Cluster and Sentinel profiles take the same lease as standalone ones.
+        for deployment in [Deployment::Cluster, Deployment::Sentinel] {
+            p.deployment = deployment;
+            assert!(!s.read_only(&p));
+        }
         p.deployment = Deployment::Standalone;
         *s.until.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
         assert!(s.read_only(&p));

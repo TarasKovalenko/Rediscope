@@ -410,6 +410,7 @@ fn demo_diagnostics() -> Diagnostics {
         latency: vec![("expire-cycle".into(), "14".into())],
         cluster: vec![("cluster_enabled".into(), "0".into())],
         modules: Vec::new(),
+        node: None,
     }
 }
 
