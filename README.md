@@ -299,8 +299,9 @@ rediscope
   which channels the traffic is on, each in its own colour; selecting a JSON or
   XML message pretty-prints it below the feed. `w` publishes one, `f` follows
   the tail, `y` copies the feed. A busy channel is handled like the monitor:
-  the feed keeps at most 500 messages every 100 ms and counts the rest, per
-  channel, as "too fast to show". On a Sentinel profile the subscription is on
+  the feed keeps at most 500 messages every 100 ms. The rest are shown as one
+  total, "too fast to show", and still counted in each channel's number in the
+  channel breakdown. On a Sentinel profile the subscription is on
   the primary. The feed asks Sentinel every 5 seconds which node it names, so
   after a failover it moves to the new primary even if the old one keeps the
   connection open, and says so in a warning line. A cluster delivers every
@@ -762,7 +763,8 @@ Both passwords accept environment placeholders. Data-node credentials also
 support the existing OS keychain setting. TLS trust/client certificates apply
 to both discovery endpoints and data nodes; all advertised addresses must be
 reachable and valid for those certificates. A single SSH forward is rejected
-for discovered deployments.
+for discovered deployments. Discovery trusts the first Sentinel that answers
+and does not ask the others whether they agree.
 
 Cluster browsing scans each discovered primary, deduplicates keys, and applies
 the view limit to the combined results. The tree displays **PARTIAL RESULTS**
@@ -779,7 +781,9 @@ Topology also refreshes on redirects, recoverable connection failures, and the
 next command after 30 seconds. Sentinel discovery verifies `ROLE master` and
 repeats discovery after connection loss. If a Sentinel discovery fails, the
 next command discovers again before it is sent and is refused if that fails
-too, so a stale address is never used. Reads use bounded retries and backoff.
+too, so a stale address is never used. That includes changes made from the
+diagnostics tabs, and the tabs show the discovery error instead of reading
+the old primary. Reads use bounded retries and backoff.
 A node that stops answering only holds up the commands sent to it; reads and
 writes for other nodes carry on, and callers that need a fresh topology at
 the same moment share a single discovery. A command that just failed never
@@ -791,6 +795,7 @@ write whose connection failed before it was sent is also tried again; a bulk
 batch that cannot reach one of its nodes stops instead. A write whose
 reply is lost reports an unknown outcome and is never replayed, and the
 topology is refreshed at once so the next command finds the new primary.
+Writes that arrive while that refresh runs wait for it.
 A load balancer or firewall can drop a quiet connection without telling
 either side, so a write about to go out on a connection that has not answered
 anything for 30 seconds sends a `PING` first; if that fails, the write has not

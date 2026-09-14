@@ -96,24 +96,24 @@ pub enum Msg {
         truncated: bool,
         needle: String,
     },
-    /// One message from the pub/sub feed. `node` names the cluster node it
-    /// came from when the feed merges several.
-    PubSub {
-        channel: String,
-        payload: String,
-        node: Option<String>,
-    },
     /// Pub/sub messages since the last batch, as (node, channel, payload),
-    /// and per channel how many more arrived than a batch keeps.
+    /// and per channel how many more arrived than a batch keeps. `node`
+    /// names the cluster node a message came from when the feed merges
+    /// several. `feed` is the [`PubSubState::feed`] of the task that sent it.
     PubSubBatch {
+        feed: u64,
         messages: Vec<(Option<String>, String, String)>,
         dropped: Vec<(String, u64)>,
     },
-    /// A note about the feed itself: a node lost, a reconnection.
-    FeedNotice(String),
-    /// Commands seen by `MONITOR` since the last batch, as (command, detail),
-    /// and how many more arrived than a batch keeps.
+    /// A note about the feed `feed` itself: a node lost, a reconnection.
+    FeedNotice {
+        feed: u64,
+        text: String,
+    },
+    /// Commands seen by the `MONITOR` feed `feed` since the last batch, and
+    /// how many more arrived than a batch keeps.
     MonitorBatch {
+        feed: u64,
         lines: Vec<MonitorLine>,
         dropped: u64,
     },
@@ -879,6 +879,10 @@ pub struct PubSubState {
     pub messages: Vec<FeedMessage>,
     /// Stopped when the modal closes, so no task outlives the view.
     pub task: Option<tokio::task::JoinHandle<()>>,
+    /// Which started feed this is. A task tags what it sends with it, so a
+    /// batch an aborted task had already queued never lands in the feed
+    /// that replaced it.
+    pub feed: u64,
     pub scroll: usize,
     /// Set by `f`: keep the view pinned to the newest message.
     pub follow: bool,
@@ -929,6 +933,7 @@ impl PubSubState {
             dropped: 0,
             messages: Vec::new(),
             task: None,
+            feed: 0,
             scroll: 0,
             follow: true,
             started: std::time::Instant::now(),
@@ -1384,6 +1389,8 @@ pub struct App {
     /// The pub/sub feed while a dialog is on top of it, so publishing does not
     /// throw away the subscription and everything it has collected.
     pub held_feed: Option<PubSubState>,
+    /// Feeds started so far; the latest one's number is its `feed`.
+    feeds_started: u64,
     /// The keys behind the tree, kept so a TTL can expire one locally.
     pub keys: Vec<KeyInfo>,
     /// What the open profile splits key names on: the tree's folders, marking
@@ -1476,6 +1483,7 @@ impl App {
             commands: CommandTable::default(),
             marked: HashSet::new(),
             held_feed: None,
+            feeds_started: 0,
             server_line: String::new(),
             keys: Vec::new(),
             separator: crate::config::DEFAULT_SEPARATOR.to_string(),
@@ -1995,63 +2003,43 @@ impl App {
                 });
                 self.status = status;
             }
-            Msg::MonitorBatch { lines, dropped } => {
-                let feed = match &mut self.modal {
-                    Some(Modal::PubSub(state)) if state.monitor => Some(state),
-                    _ => self.held_feed.as_mut().filter(|f| f.monitor),
-                };
-                match feed {
-                    Some(state) => {
-                        for line in lines {
-                            state.push_command(line);
-                        }
-                        state.push_dropped(dropped);
+            // A batch from any other feed is dropped: its task was stopped
+            // when that feed closed or was replaced, and what it had already
+            // queued belongs to no open view.
+            Msg::MonitorBatch {
+                feed,
+                lines,
+                dropped,
+            } => {
+                if let Some((state, _)) = self.feed_mut(feed).filter(|(f, _)| f.monitor) {
+                    for line in lines {
+                        state.push_command(line);
                     }
-                    None => self.stop_feeds(),
+                    state.push_dropped(dropped);
                 }
             }
-            Msg::PubSub {
-                channel,
-                payload,
-                node,
-            } => match &mut self.modal {
-                Some(Modal::PubSub(state)) => state.push_from(node, channel, payload),
-                // The feed is behind a dialog: keep collecting for it.
-                _ => match &mut self.held_feed {
-                    Some(feed) => feed.push_from(node, channel, payload),
-                    // Nothing is listening any more, so neither is the task.
-                    None => self.stop_feeds(),
-                },
-            },
-            Msg::PubSubBatch { messages, dropped } => {
-                let feed = match &mut self.modal {
-                    Some(Modal::PubSub(state)) => Some(state),
-                    // The feed is behind a dialog: keep collecting for it.
-                    _ => self.held_feed.as_mut(),
-                };
-                match feed {
-                    Some(state) => {
-                        for (node, channel, payload) in messages {
-                            state.push_from(node, channel, payload);
-                        }
-                        for (channel, count) in dropped {
-                            state.push_dropped_from(channel, count);
-                        }
+            Msg::PubSubBatch {
+                feed,
+                messages,
+                dropped,
+            } => {
+                if let Some((state, _)) = self.feed_mut(feed).filter(|(f, _)| !f.monitor) {
+                    for (node, channel, payload) in messages {
+                        state.push_from(node, channel, payload);
                     }
-                    // Nothing is listening any more, so neither is the task.
-                    None => self.stop_feeds(),
+                    for (channel, count) in dropped {
+                        state.push_dropped_from(channel, count);
+                    }
                 }
             }
-            Msg::FeedNotice(text) => match &mut self.modal {
-                Some(Modal::PubSub(state)) => {
+            Msg::FeedNotice { feed, text } => {
+                if let Some((state, shown)) = self.feed_mut(feed) {
                     state.push_notice(text.clone());
-                    self.status = text;
+                    if shown {
+                        self.status = text;
+                    }
                 }
-                _ => match &mut self.held_feed {
-                    Some(feed) => feed.push_notice(text),
-                    None => self.stop_feeds(),
-                },
-            },
+            }
             Msg::Groups(result) => match *result {
                 Ok(groups) => {
                     if let Some(Modal::Groups(state)) = &mut self.modal {
@@ -3833,6 +3821,9 @@ impl App {
             old.stop();
         }
         let mut state = PubSubState::new(patterns.clone(), keyspace);
+        self.feeds_started += 1;
+        state.feed = self.feeds_started;
+        let id = state.feed;
         let tx = self.tx.clone();
         state.task = Some(tokio::spawn(async move {
             let mut feed = match client.subscribe(patterns, keyspace).await {
@@ -3851,6 +3842,7 @@ impl App {
             let mut dropped: std::collections::HashMap<String, u64> = Default::default();
             let flush = |batch: &mut Vec<_>, dropped: &mut std::collections::HashMap<_, _>| {
                 Msg::PubSubBatch {
+                    feed: id,
                     messages: std::mem::take(batch),
                     dropped: dropped.drain().collect(),
                 }
@@ -3872,7 +3864,7 @@ impl App {
                             {
                                 return;
                             }
-                            if tx.send(Msg::FeedNotice(text)).is_err() {
+                            if tx.send(Msg::FeedNotice { feed: id, text }).is_err() {
                                 return;
                             }
                         }
@@ -3944,6 +3936,9 @@ impl App {
         state.current_db = client.conn.db;
         state.db_filter = db_filter;
         state.dbs.extend(db_filter);
+        self.feeds_started += 1;
+        state.feed = self.feeds_started;
+        let id = state.feed;
         // Lowercased once here, and each line once below, rather than both
         // for every pattern on every command.
         let patterns: Vec<Vec<u8>> = filters
@@ -3970,10 +3965,11 @@ impl App {
                             Some(FeedEvent::Notice(text)) => {
                                 // What arrived before the notice is listed first.
                                 let _ = tx.send(Msg::MonitorBatch {
+                                    feed: id,
                                     lines: std::mem::take(&mut batch),
                                     dropped: std::mem::take(&mut dropped),
                                 });
-                                if tx.send(Msg::FeedNotice(text)).is_err() {
+                                if tx.send(Msg::FeedNotice { feed: id, text }).is_err() {
                                     return;
                                 }
                                 continue;
@@ -3981,6 +3977,7 @@ impl App {
                             Some(FeedEvent::Message { .. }) => continue,
                             None => {
                                 let _ = tx.send(Msg::MonitorBatch {
+                                    feed: id,
                                     lines: std::mem::take(&mut batch),
                                     dropped,
                                 });
@@ -4016,6 +4013,7 @@ impl App {
                         let lines = std::mem::take(&mut batch);
                         if tx
                             .send(Msg::MonitorBatch {
+                                feed: id,
                                 lines,
                                 dropped: std::mem::take(&mut dropped),
                             })
@@ -4028,6 +4026,19 @@ impl App {
             }
         }));
         self.modal = Some(Modal::PubSub(state));
+    }
+
+    /// The open or held feed numbered `feed`, and whether it is on screen.
+    fn feed_mut(&mut self, feed: u64) -> Option<(&mut PubSubState, bool)> {
+        match &mut self.modal {
+            Some(Modal::PubSub(state)) if state.feed == feed => Some((state, true)),
+            // The feed is behind a dialog: keep collecting for it.
+            _ => self
+                .held_feed
+                .as_mut()
+                .filter(|f| f.feed == feed)
+                .map(|f| (f, false)),
+        }
     }
 
     /// Abort any subscription still running with nothing to show it in.
@@ -7548,10 +7559,14 @@ mod tests {
         let mut on_b = command("SET", 0, "\"k\" \"v\"");
         on_b.node = Some("10.0.0.2:7001".into());
         app.on_msg(Msg::MonitorBatch {
+            feed: 0,
             lines: vec![command("GET", 0, "\"k\""), on_b],
             dropped: 0,
         });
-        app.on_msg(Msg::FeedNotice("Lost node 10.0.0.3:7002".into()));
+        app.on_msg(Msg::FeedNotice {
+            feed: 0,
+            text: "Lost node 10.0.0.3:7002".into(),
+        });
         let Some(Modal::PubSub(state)) = &app.modal else {
             panic!("the feed stays open");
         };
@@ -7567,6 +7582,7 @@ mod tests {
         let mut app = tick_app(vec![]);
         app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
         app.on_msg(Msg::MonitorBatch {
+            feed: 0,
             lines: vec![
                 command("SET", 0, "\"k\" \"v\""),
                 command("GET", 0, "\"k\""),
@@ -7586,6 +7602,7 @@ mod tests {
         // A monitor batch never lands in a pub/sub feed.
         app.modal = Some(Modal::PubSub(PubSubState::new(vec!["*".into()], false)));
         app.on_msg(Msg::MonitorBatch {
+            feed: 0,
             lines: vec![command("SET", 0, "x")],
             dropped: 0,
         });

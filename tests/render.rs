@@ -770,16 +770,21 @@ async fn the_new_panes_render_at_any_size() {
         rediscope::app::PubSubState::new(vec!["news.*".into()], false),
     ));
     for i in 0..30 {
-        a.on_msg(Msg::PubSub {
-            channel: format!("news.{i}"),
-            payload: format!("message {i} with a body long enough to need truncating"),
-            // A merged cluster feed labels every message with its node.
-            node: (i % 2 == 0).then(|| format!("10.0.0.{}:6379", i % 3)),
+        a.on_msg(Msg::PubSubBatch {
+            feed: 0,
+            messages: vec![(
+                // A merged cluster feed labels every message with its node.
+                (i % 2 == 0).then(|| format!("10.0.0.{}:6379", i % 3)),
+                format!("news.{i}"),
+                format!("message {i} with a body long enough to need truncating"),
+            )],
+            dropped: vec![],
         });
     }
-    a.on_msg(Msg::FeedNotice(
-        "Lost node 10.0.0.2:6379; the other 2 node(s) keep streaming".into(),
-    ));
+    a.on_msg(Msg::FeedNotice {
+        feed: 0,
+        text: "Lost node 10.0.0.2:6379; the other 2 node(s) keep streaming".into(),
+    });
     render_all_sizes(&mut a);
     press(&mut a, KeyCode::Char('f')); // stop following
     press(&mut a, KeyCode::Char('G'));
@@ -1367,4 +1372,67 @@ async fn cluster_diagnostics_actions_carry_the_node_they_were_read_from() {
         panic!("e on the config tab should edit the parameter");
     };
     assert_eq!((param.as_str(), target), ("maxmemory", &node));
+}
+
+#[tokio::test]
+async fn batches_from_a_replaced_feed_never_reach_or_stop_the_feed_that_replaced_it() {
+    use rediscope::app::PubSubState;
+    let mut a = app();
+    // Feed 1 closed and feed 2 opened in its place while feed 1 still had
+    // messages queued.
+    let mut open = PubSubState::new(vec!["news.*".into()], false);
+    open.feed = 2;
+    open.task = Some(tokio::spawn(std::future::pending::<()>()));
+    a.modal = Some(Modal::PubSub(open));
+    let batch = |feed: u64, payload: &str| Msg::PubSubBatch {
+        feed,
+        messages: vec![(None, "news.a".into(), payload.into())],
+        dropped: vec![("news.a".into(), 4)],
+    };
+    let stale = |a: &mut App| {
+        a.on_msg(batch(1, "stale"));
+        a.on_msg(Msg::FeedNotice {
+            feed: 1,
+            text: "Lost node 10.0.0.9:6379".into(),
+        });
+        // Feed 1 was a monitor: its last batch must not end feed 2.
+        a.on_msg(Msg::MonitorBatch {
+            feed: 1,
+            lines: vec![],
+            dropped: 3,
+        });
+    };
+    let status = a.status.clone();
+    stale(&mut a);
+    let Some(Modal::PubSub(state)) = &a.modal else {
+        panic!("the feed closed");
+    };
+    assert!(state.messages.is_empty());
+    assert_eq!((state.total, state.dropped), (0, 0));
+    assert!(state.task.is_some(), "a stale batch stopped the open feed");
+    assert_eq!(a.status, status);
+    render_all_sizes(&mut a);
+
+    // The same while the feed is held behind a dialog.
+    a.held_feed = match a.modal.take() {
+        Some(Modal::PubSub(state)) => Some(state),
+        _ => unreachable!(),
+    };
+    stale(&mut a);
+    let held = a.held_feed.as_ref().expect("the held feed was dropped");
+    assert!(held.messages.is_empty());
+    assert!(held.task.is_some(), "a stale batch stopped the held feed");
+    a.on_msg(batch(2, "held"));
+    assert_eq!(a.held_feed.as_ref().unwrap().total, 5);
+
+    // Its own batches still land once it is back on screen.
+    a.modal = a.held_feed.take().map(Modal::PubSub);
+    a.on_msg(batch(2, "fresh"));
+    let Some(Modal::PubSub(state)) = &a.modal else {
+        panic!("the feed closed");
+    };
+    let payloads: Vec<&str> = state.messages.iter().map(|m| m.payload.as_str()).collect();
+    assert_eq!(payloads, ["held", "fresh"]);
+    assert_eq!(state.total, 10);
+    render_all_sizes(&mut a);
 }

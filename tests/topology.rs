@@ -4135,12 +4135,12 @@ impl Tally {
                 .expect("the monitor stopped delivering")
                 .unwrap();
             match &msg {
-                Msg::MonitorBatch { lines, dropped } => {
+                Msg::MonitorBatch { lines, dropped, .. } => {
                     self.biggest = self.biggest.max(lines.len());
                     self.kept += lines.len();
                     self.dropped += dropped;
                 }
-                Msg::FeedNotice(_) => self.notices += 1,
+                Msg::FeedNotice { .. } => self.notices += 1,
                 Msg::Error(e) => panic!("{e}"),
                 _ => {}
             }
@@ -5212,6 +5212,7 @@ async fn a_pubsub_flood_is_capped_per_batch_and_every_message_is_counted() {
             Msg::PubSubBatch {
                 messages,
                 dropped: lost,
+                ..
             } => {
                 biggest = biggest.max(messages.len());
                 kept += messages.len();
@@ -5231,6 +5232,7 @@ async fn a_pubsub_flood_is_capped_per_batch_and_every_message_is_counted() {
         panic!("the feed closed: {}", app.status);
     };
     assert_eq!(state.total, (3 * PER_NODE) as u64);
+    assert_ne!(state.feed, 0, "the feed was not numbered");
     assert_eq!(state.dropped, dropped);
     assert!(state.messages.len() <= PUBSUB_LIMIT);
     let per_channel: std::collections::HashMap<&str, u64> = state
@@ -5256,4 +5258,270 @@ async fn a_pubsub_flood_is_capped_per_batch_and_every_message_is_counted() {
             .collect::<String>()
     };
     assert!(text.contains("too fast to show"), "{text}");
+}
+
+// ---- node-addressed changes and lost writes during a failover ------------
+
+/// A node that logs every command and answers like a primary.
+fn primary_peer() -> (Peer, Log) {
+    let log: Log = Arc::default();
+    let seen = log.clone();
+    let peer = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        Some(match args[0].as_str() {
+            "ROLE" => "*1\r\n$6\r\nmaster\r\n".into(),
+            "SLOWLOG" | "CONFIG" if args.get(1).is_some_and(|a| a == "GET") => "*0\r\n".into(),
+            "CLIENT" if args.get(1).is_some_and(|a| a == "LIST") => bulk(""),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    (peer, log)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sentinel_node_changes_after_a_failed_discovery_ask_again_and_never_reach_the_old_address()
+{
+    let (first, first_log) = primary_peer();
+    let (second, second_log) = primary_peer();
+    let target = Arc::new(AtomicUsize::new(first.port as usize));
+    let broken = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let (named, failing, asks) = (target.clone(), broken.clone(), asked.clone());
+    let sentinel = Peer::start(move |_, args| match args[0].as_str() {
+        "SENTINEL" => {
+            asks.fetch_add(1, Ordering::SeqCst);
+            if failing.load(Ordering::SeqCst) {
+                return None;
+            }
+            Some(format!(
+                "*2\r\n{}{}",
+                bulk("127.0.0.1"),
+                bulk(&named.load(Ordering::SeqCst).to_string())
+            ))
+        }
+        _ => Some("+OK\r\n".into()),
+    });
+    let client = sentinel_client(&sentinel).await;
+    let old = Some(("127.0.0.1".to_string(), first.port));
+    assert_eq!(client.diagnostics().await.unwrap().node, old);
+
+    // Sentinel stops answering, and meanwhile the primary moves.
+    broken.store(true, Ordering::SeqCst);
+    target.store(second.port as usize, Ordering::SeqCst);
+    assert!(client.refresh_topology().await.is_err());
+    let changes = |log: &Log| {
+        count(log, "CLIENT", Some("KILL"))
+            + count(log, "CONFIG", Some("SET"))
+            + count(log, "SLOWLOG", Some("RESET"))
+    };
+    let at = asked.load(Ordering::SeqCst);
+    assert!(client.client_kill_on(&old, "5").await.is_err());
+    assert!(
+        asked.load(Ordering::SeqCst) > at,
+        "no rediscovery was tried"
+    );
+    assert!(client.config_set_on(&old, "maxmemory", "1").await.is_err());
+    assert!(client.slowlog_reset_on(&old).await.is_err());
+    assert_eq!(changes(&first_log), 0, "a change reached the stale address");
+    assert_eq!(changes(&second_log), 0);
+
+    // Diagnostics say why instead of reading the stale address.
+    let reads = first_log.lock().unwrap().len();
+    let d = client.diagnostics().await.unwrap();
+    assert_eq!(d.node, None);
+    let error = d
+        .cluster
+        .iter()
+        .find(|(k, _)| k == "diagnostics_error")
+        .map(|(_, v)| v.clone())
+        .expect("the discovery failure is shown");
+    assert!(error.contains("Discovery failed"), "{error}");
+    assert_eq!(first_log.lock().unwrap().len(), reads);
+
+    // Sentinel answers again: a change addressed to a node goes to that node.
+    broken.store(false, Ordering::SeqCst);
+    client.client_kill_on(&old, "5").await.unwrap();
+    assert_eq!(count(&first_log, "CLIENT", Some("KILL")), 1);
+    assert_eq!(
+        client.diagnostics().await.unwrap().node,
+        Some(("127.0.0.1".to_string(), second.port))
+    );
+}
+
+/// A Sentinel whose answer waits while `gate` is set, counting every ask.
+fn held_sentinel(target: Arc<AtomicUsize>, gate: Arc<AtomicBool>, asked: Arc<AtomicUsize>) -> Peer {
+    Peer::start(move |_, args| match args[0].as_str() {
+        "SENTINEL" => {
+            asked.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while gate.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Some(format!(
+                "*2\r\n{}{}",
+                bulk("127.0.0.1"),
+                bulk(&target.load(Ordering::SeqCst).to_string())
+            ))
+        }
+        _ => Some("+OK\r\n".into()),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writers_arriving_while_a_lost_write_rediscovers_never_reach_the_old_primary() {
+    let (second, second_log) = primary_peer();
+    let target = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    // The old primary loses the first write sent to it, names the new
+    // primary, and holds Sentinel's next answer. It stays up and would take
+    // any later write.
+    let first_log: Log = Arc::default();
+    let (seen, switch, hold) = (first_log.clone(), target.clone(), gate.clone());
+    let next = second.port as usize;
+    let first = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        match args[0].as_str() {
+            "ROLE" => Some("*1\r\n$6\r\nmaster\r\n".into()),
+            "SET" if args[1].starts_with("lost") => {
+                hold.store(true, Ordering::SeqCst);
+                switch.store(next, Ordering::SeqCst);
+                None
+            }
+            _ => Some("+OK\r\n".into()),
+        }
+    });
+    target.store(first.port as usize, Ordering::SeqCst);
+    let sentinel = held_sentinel(target.clone(), gate.clone(), asked.clone());
+    let client = sentinel_client(&sentinel).await;
+    client.set_string("before", "v").await.unwrap();
+    assert_eq!(count(&first_log, "SET", Some("before")), 1);
+
+    // Writer A loses its write and starts rediscovering; B arrives meanwhile.
+    let before = asked.load(Ordering::SeqCst);
+    let a = client.clone();
+    let lost = tokio::spawn(async move { a.set_string("lost-a", "v").await });
+    eventually("A's rediscovery to ask Sentinel", 10, || {
+        asked.load(Ordering::SeqCst) > before
+    })
+    .await;
+    let b = client.clone();
+    let arriving = tokio::spawn(async move { b.set_string("b", "v").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        count(&first_log, "SET", Some("b")),
+        0,
+        "B was sent to the old primary while A rediscovered"
+    );
+    gate.store(false, Ordering::SeqCst);
+    let e = lost.await.unwrap().unwrap_err().to_string();
+    assert!(e.contains("outcome unknown"), "{e}");
+    arriving.await.unwrap().unwrap();
+    assert_eq!(count(&first_log, "SET", Some("b")), 0);
+    assert_eq!(count(&second_log, "SET", Some("b")), 1);
+    assert_eq!(count(&first_log, "SET", Some("lost-a")), 1);
+    assert_eq!(count(&second_log, "SET", Some("lost-a")), 0, "resent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_write_whose_task_is_cancelled_mid_rediscovery_still_moves_the_next_write() {
+    let (second, second_log) = primary_peer();
+    let target = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let first_log: Log = Arc::default();
+    let (seen, switch, hold) = (first_log.clone(), target.clone(), gate.clone());
+    let next = second.port as usize;
+    let first = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        match args[0].as_str() {
+            "ROLE" => Some("*1\r\n$6\r\nmaster\r\n".into()),
+            "SET" if args[1] == "lost" => {
+                hold.store(true, Ordering::SeqCst);
+                switch.store(next, Ordering::SeqCst);
+                None
+            }
+            _ => Some("+OK\r\n".into()),
+        }
+    });
+    target.store(first.port as usize, Ordering::SeqCst);
+    let sentinel = held_sentinel(target.clone(), gate.clone(), asked.clone());
+    let client = sentinel_client(&sentinel).await;
+
+    let before = asked.load(Ordering::SeqCst);
+    let a = client.clone();
+    let lost = tokio::spawn(async move { a.set_string("lost", "v").await });
+    eventually("the rediscovery to ask Sentinel", 10, || {
+        asked.load(Ordering::SeqCst) > before
+    })
+    .await;
+    lost.abort();
+    assert!(lost.await.unwrap_err().is_cancelled());
+    gate.store(false, Ordering::SeqCst);
+
+    client.set_string("next", "v").await.unwrap();
+    assert_eq!(
+        count(&first_log, "SET", Some("next")),
+        0,
+        "went to the old primary"
+    );
+    assert_eq!(count(&second_log, "SET", Some("next")), 1);
+    assert_eq!(count(&first_log, "SET", Some("lost")), 1);
+    assert_eq!(count(&second_log, "SET", Some("lost")), 0, "resent");
+}
+
+#[tokio::test]
+async fn a_batch_answered_with_a_server_error_keeps_the_shared_socket() {
+    let log: Log = Arc::default();
+    let seen = log.clone();
+    let server = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        Some(match (args[0].as_str(), args.get(1).map(String::as_str)) {
+            ("UNLINK", Some("refused")) => "-NOPERM no\r\n".into(),
+            ("UNLINK", _) => ":1\r\n".into(),
+            ("PING", _) => "+PONG\r\n".into(),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    let client = Client::connect(server.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+    client.set_string("before", "v").await.unwrap();
+    assert!(client.delete_keys(&["refused".into()]).await.is_err());
+    client.set_string("after", "v").await.unwrap();
+    let socket = sockets_for(&log, "SET")[0];
+    assert_eq!(sockets_for(&log, "UNLINK"), vec![socket]);
+    assert_eq!(
+        sockets_for(&log, "SET"),
+        vec![socket, socket],
+        "reconnected after a server error"
+    );
+}
+
+#[tokio::test]
+async fn a_standalone_discovery_whose_ping_fails_drops_that_socket() {
+    let log: Log = Arc::default();
+    let seen = log.clone();
+    let failing = Arc::new(AtomicBool::new(false));
+    let fails = failing.clone();
+    let server = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        Some(match args[0].as_str() {
+            "PING" if fails.load(Ordering::SeqCst) => "-ERR not now\r\n".into(),
+            "PING" => "+PONG\r\n".into(),
+            "GET" => bulk("value"),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    let client = Client::connect(server.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+    client.execute_raw("GET before").await.unwrap();
+    failing.store(true, Ordering::SeqCst);
+    assert!(client.refresh_topology().await.is_err());
+    failing.store(false, Ordering::SeqCst);
+    client.execute_raw("GET after").await.unwrap();
+    let gets = sockets_for(&log, "GET");
+    assert_eq!(gets.len(), 2);
+    assert_ne!(gets[0], gets[1], "kept the socket whose PING failed");
 }

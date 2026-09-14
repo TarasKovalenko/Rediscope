@@ -84,6 +84,12 @@ struct State {
     /// The last discovery failed. A Sentinel profile then discovers again
     /// before its next request instead of trusting the address it had.
     must_rediscover: bool,
+    /// A write was lost after it was sent, when `started` stood at this
+    /// number. Set before the writer rediscovers, so writers that arrive
+    /// meanwhile, or come after a writer that was cancelled, wait for a
+    /// discovery that started after the loss instead of routing by the
+    /// address the write was lost on.
+    lost_at: Option<u64>,
 }
 /// A cached multiplexed connection. The id lets a caller whose request failed
 /// on it drop exactly that socket, not a newer one another caller opened.
@@ -175,6 +181,7 @@ impl Transport {
                 last_generation: 0,
                 last_discovery: Ok(()),
                 must_rediscover: false,
+                lost_at: None,
             })),
             discovery: Arc::default(),
             primary_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
@@ -377,23 +384,18 @@ impl Transport {
     /// take its result. Discoveries run one at a time, so a result can only
     /// ever be replaced by one that started after it.
     ///
-    /// With `after_failure`, the caller has just seen a request fail, and a
-    /// discovery that was already under way may have asked before the
-    /// failure. Only a result from a discovery that started after the caller
-    /// arrived will do then. Otherwise any discovery that finished after the
-    /// caller arrived will.
-    async fn discover(&self, after_failure: bool) -> RedisResult<()> {
-        let (started, finished) = {
-            let state = self.state();
-            (state.started, state.discovered)
-        };
+    /// With `since`, a discovery that was already under way may have asked
+    /// before something failed. Only a result from a discovery numbered
+    /// above `since` (one that started later) will do then. Otherwise any
+    /// discovery that finished after the caller arrived will.
+    async fn discover(&self, since: Option<u64>) -> RedisResult<()> {
+        let finished = self.state().discovered;
         let _running = self.discovery.lock().await;
         let generation = {
             let mut state = self.state();
-            let fresh = if after_failure {
-                state.last_generation > started
-            } else {
-                state.discovered != finished
+            let fresh = match since {
+                Some(since) => state.last_generation > since,
+                None => state.discovered != finished,
             };
             if fresh {
                 return state.last_discovery.clone();
@@ -419,6 +421,11 @@ impl Transport {
         state.discovered += 1;
         state.last_generation = generation;
         state.must_rediscover = result.is_err();
+        // A discovery that started after the loss settles it. If it failed,
+        // `must_rediscover` keeps a Sentinel profile asking again.
+        if state.lost_at.is_some_and(|lost| generation > lost) {
+            state.lost_at = None;
+        }
         state.last_discovery = result.clone();
         result
     }
@@ -426,11 +433,37 @@ impl Transport {
     /// Discover after a request failed, and keep a failure as the topology
     /// warning.
     async fn rediscover(&self) -> RedisResult<()> {
-        self.discover_noting(true).await
+        let started = self.state().started;
+        self.discover_noting(Some(started)).await
     }
 
-    async fn discover_noting(&self, after_failure: bool) -> RedisResult<()> {
-        let result = self.discover(after_failure).await;
+    /// Record that a write was lost after it was sent, then rediscover. The
+    /// mark is set before anything is awaited, so it holds even if the
+    /// caller is cancelled while discovery runs.
+    async fn rediscover_after_lost_write(&self) {
+        if self.profile.deployment == Deployment::Standalone {
+            return;
+        }
+        let started = {
+            let mut state = self.state();
+            let started = state.started;
+            state.lost_at = Some(state.lost_at.map_or(started, |l| l.max(started)));
+            started
+        };
+        let _ = self.discover_noting(Some(started)).await;
+    }
+
+    /// A write was lost and no discovery that started after it has finished
+    /// yet, or, on a Sentinel profile, the last discovery failed. A write
+    /// must not go by the current address then.
+    fn unsettled(&self) -> bool {
+        let state = self.state();
+        state.lost_at.is_some()
+            || (state.must_rediscover && self.profile.deployment == Deployment::Sentinel)
+    }
+
+    async fn discover_noting(&self, since: Option<u64>) -> RedisResult<()> {
+        let result = self.discover(since).await;
         if let Err(e) = &result {
             self.state().warning = Some(e.to_string());
         }
@@ -446,6 +479,9 @@ impl Transport {
             let mut c = socket.conn.clone();
             let result = redis::cmd("PING").query_async::<()>(&mut c).await;
             self.answered(&socket, &result);
+            if result.is_err() {
+                self.forget(&ep, socket.id);
+            }
             result?;
             return Ok(None);
         }
@@ -595,22 +631,26 @@ impl Transport {
     }
 
     /// Rediscover when the topology is older than 30 seconds, or, on a
-    /// Sentinel profile, when the last discovery failed. Only a Sentinel
+    /// Sentinel profile, when the last discovery failed. After a lost write,
+    /// wait for a discovery that started after the loss. Only a Sentinel
     /// failure is an error: its primary may have moved, and a stale address
     /// must never be written to. A cluster keeps routing on what it knows.
     async fn refresh_if_stale(&self) -> RedisResult<()> {
         if self.profile.deployment == Deployment::Standalone {
             return Ok(());
         }
-        let due = {
+        let (due, lost) = {
             let state = self.state();
-            state.refreshed.elapsed() >= Duration::from_secs(30)
-                || (state.must_rediscover && self.profile.deployment == Deployment::Sentinel)
+            (
+                state.refreshed.elapsed() >= Duration::from_secs(30)
+                    || (state.must_rediscover && self.profile.deployment == Deployment::Sentinel),
+                state.lost_at,
+            )
         };
-        if !due {
+        if !due && lost.is_none() {
             return Ok(());
         }
-        if let Err(e) = self.discover_noting(false).await
+        if let Err(e) = self.discover_noting(lost).await
             && self.profile.deployment == Deployment::Sentinel
         {
             return Err(e);
@@ -725,7 +765,7 @@ impl Transport {
     }
 
     pub async fn refresh(&self) -> RedisResult<()> {
-        self.discover_noting(false).await
+        self.discover_noting(None).await
     }
     /// Refresh after something was lost, such as a feed's connection: a
     /// discovery already under way when that happened does not count.
@@ -733,10 +773,11 @@ impl Transport {
         self.rediscover().await
     }
     /// Where keyless commands go: the node diagnostics describe. Refreshed
-    /// first when stale; if that refresh fails, the last known node is used.
-    pub async fn default_endpoint(&self) -> Endpoint {
-        let _ = self.refresh_if_stale().await;
-        self.state().default.clone()
+    /// first when stale. If that refresh fails, a cluster uses the last known
+    /// node, and a Sentinel profile gets the error: its primary may have moved.
+    pub async fn default_endpoint(&self) -> RedisResult<Endpoint> {
+        self.refresh_if_stale().await?;
+        Ok(self.state().default.clone())
     }
     /// The default node as last discovered, without refreshing first.
     pub async fn known_default(&self) -> Endpoint {
@@ -808,9 +849,21 @@ impl Transport {
     async fn direct_inner(&self, ep: &Endpoint, cmd: &Cmd) -> RedisResult<Value> {
         let read = read_route(cmd).0;
         self.guard(read)?;
+        // On a Sentinel profile, `ep` came from a discovery. If a later one
+        // failed, or a write was lost since, it may name a demoted primary:
+        // a change is only sent once discovery has succeeded again.
+        let checked = !read && self.profile.deployment == Deployment::Sentinel;
+        if checked {
+            self.refresh_if_stale().await?;
+        }
         let mut socket = self.connection(ep).await?;
         if !read {
             socket = self.for_write(ep, socket).await?;
+        }
+        if checked && self.unsettled() {
+            return Err(error(
+                "The Sentinel primary is being rediscovered after a failure; nothing was sent, so try again",
+            ));
         }
         // Again at the moment of sending: connecting can take a while.
         self.guard(read)?;
@@ -821,6 +874,9 @@ impl Transport {
         // A server error (NOPERM from a managed service) leaves the socket good.
         if result.as_ref().is_err_and(RedisError::is_io_error) {
             self.forget(ep, socket.id);
+            if !read {
+                self.rediscover_after_lost_write().await;
+            }
         }
         result
     }
@@ -906,6 +962,24 @@ impl Transport {
                     let mut socket = self.connection(&ep).await?;
                     if !read {
                         socket = self.for_write(&ep, socket).await?;
+                        // A write lost while this one waited for its socket
+                        // leaves the route in doubt: nothing is sent until a
+                        // discovery after that loss has finished.
+                        let mut waits = 0;
+                        while self.profile.deployment != Deployment::Standalone
+                            && self.unsettled()
+                        {
+                            if waits == 3 {
+                                return Err(error(
+                                    "The topology kept changing while this write waited; nothing was sent, so try again",
+                                ));
+                            }
+                            waits += 1;
+                            self.refresh_if_stale().await?;
+                            ep = self.route(slot);
+                            socket = self.connection(&ep).await?;
+                            socket = self.for_write(&ep, socket).await?;
+                        }
                     }
                     used = Some(socket.id);
                     let mut c = socket.conn.clone();
@@ -976,9 +1050,7 @@ impl Transport {
                     if !read && sent && !refused {
                         // Never resent, but the next command should not be
                         // aimed at a primary that is gone.
-                        if self.profile.deployment != Deployment::Standalone {
-                            let _ = self.rediscover().await;
-                        }
+                        self.rediscover_after_lost_write().await;
                         return Err(error(format!(
                             "Write outcome unknown; command was not retried: {e}"
                         )));
@@ -1036,10 +1108,23 @@ impl Transport {
             return Ok(values.into_iter().skip(offset).take(count).collect());
         }
         self.refresh_if_stale().await?;
-        let ep = self.state().default.clone();
+        let mut ep = self.state().default.clone();
         let mut socket = self.connection(&ep).await?;
         if writes {
             socket = self.for_write(&ep, socket).await?;
+            let mut waits = 0;
+            while self.profile.deployment != Deployment::Standalone && self.unsettled() {
+                if waits == 3 {
+                    return Err(error(
+                        "The topology kept changing while this batch waited; nothing was sent, so try again",
+                    ));
+                }
+                waits += 1;
+                self.refresh_if_stale().await?;
+                ep = self.state().default.clone();
+                socket = self.connection(&ep).await?;
+                socket = self.for_write(&ep, socket).await?;
+            }
         }
         self.guard(!writes)?;
         let mut c = socket.conn.clone();
@@ -1048,7 +1133,10 @@ impl Transport {
         let result =
             result.and_then(|values| values.into_iter().map(Value::extract_error).collect());
         if let Err(e) = &result {
-            self.forget(&ep, socket.id);
+            // A server error leaves the shared socket working.
+            if e.is_io_error() {
+                self.forget(&ep, socket.id);
+            }
             // A Sentinel primary demoted during failover refuses writes as a
             // replica. Find the new primary now, so a retry reaches it.
             if self.profile.deployment == Deployment::Sentinel && writes && rejected_unrun(e) {
@@ -1058,7 +1146,9 @@ impl Transport {
                 )));
             }
             if e.is_io_error() {
-                if self.profile.deployment == Deployment::Sentinel {
+                if writes {
+                    self.rediscover_after_lost_write().await;
+                } else if self.profile.deployment == Deployment::Sentinel {
                     let _ = self.rediscover().await;
                 }
                 if !pipeline.is_transaction() && pipeline.cmd_iter().all(|cmd| read_route(cmd).0) {
@@ -1167,7 +1257,7 @@ impl Transport {
                 }
                 Err(e) => {
                     self.forget(ep, socket.id);
-                    let _ = self.rediscover().await;
+                    self.rediscover_after_lost_write().await;
                     return Err(earlier("outcome unknown for its commands", &e));
                 }
             }

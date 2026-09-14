@@ -191,7 +191,7 @@ pub(super) async fn monitor(transport: Transport) -> Result<Feed> {
 async fn start(transport: Transport, spec: Spec, every_primary: bool) -> Result<Feed> {
     let (tx, rx) = mpsc::channel(BUFFER);
     if !every_primary {
-        let ep = transport.default_endpoint().await;
+        let ep = transport.default_endpoint().await?;
         let link = open(&transport, &ep, &spec).await?;
         let task = tokio::spawn(follow(transport, spec, ep, link, tx));
         return Ok(Feed {

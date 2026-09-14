@@ -756,7 +756,7 @@ impl Client {
         if self.conn.deployment == Deployment::Standalone {
             return Ok(self.raw.get_async_pubsub().await?);
         }
-        let ep = self.mgr.default_endpoint().await;
+        let ep = self.mgr.default_endpoint().await?;
         Ok(self.mgr.node_client(&ep).await?.get_async_pubsub().await?)
     }
 
@@ -775,7 +775,7 @@ impl Client {
         match self.conn.deployment {
             Deployment::Standalone => Ok(self.raw.get_async_monitor().await?),
             Deployment::Sentinel => {
-                let ep = self.mgr.default_endpoint().await;
+                let ep = self.mgr.default_endpoint().await?;
                 Ok(self.mgr.node_client(&ep).await?.get_async_monitor().await?)
             }
             Deployment::Cluster => anyhow::bail!(
@@ -2283,10 +2283,26 @@ return 1
     pub async fn diagnostics(&self) -> Result<Diagnostics> {
         // Sentinel too: after a failover, a client id still belongs to the
         // node that listed it.
-        let node = if self.conn.deployment != Deployment::Standalone {
-            Some(self.mgr.default_endpoint().await)
-        } else {
-            None
+        let node = match self.conn.deployment {
+            Deployment::Standalone => None,
+            deployment => match self.mgr.default_endpoint().await {
+                Ok(ep) => Some(ep),
+                // A Sentinel primary that cannot be confirmed may have been
+                // demoted. Nothing is read from it, and the tabs say why
+                // instead of showing an old node as if it were current.
+                Err(e) => {
+                    return Ok(Diagnostics {
+                        cluster: vec![
+                            ("deployment".into(), deployment.name().into()),
+                            (
+                                "diagnostics_error".into(),
+                                format!("Cannot confirm the primary, so nothing was read: {e}"),
+                            ),
+                        ],
+                        ..Default::default()
+                    });
+                }
+            },
         };
         let slowlog = match self
             .node_query(&node, redis::cmd("SLOWLOG").arg("GET").arg(128))
