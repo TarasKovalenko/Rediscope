@@ -10,7 +10,15 @@ repository = "https://github.com/TarasKovalenko/Rediscope"
 homepage = "https://github.com/TarasKovalenko/Rediscope"
 keywords = ["redis", "tui", "terminal", "cli", "database"]
 categories = ["command-line-utilities", "database"]
-exclude = [".github/*"]
+exclude = [
+    ".github/*",
+    "docs/*",
+    "site/*",
+    "packaging/*",
+    "scripts/*",
+    "install.sh",
+    "install.ps1",
+]
 
 [[bin]]
 name = "rediscope"

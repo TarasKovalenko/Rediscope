@@ -1,0 +1,29 @@
+# Maintainer: Taras Kovalenko <bad dot kto at gmail dot com>
+#
+# Rendered from packaging/aur/rediscope-bin/PKGBUILD in TarasKovalenko/Rediscope
+# by scripts/render-packaging.sh on each release. Change it there.
+
+pkgname=rediscope-bin
+_pkgname=rediscope
+pkgver=@PKGVER@
+_tag=@TAG@
+pkgrel=1
+pkgdesc='Terminal UI client for Redis, Valkey, KeyDB and Dragonfly (prebuilt binary)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/TarasKovalenko/Rediscope'
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+options=('!strip' '!debug')
+source=("LICENSE-$_tag::https://raw.githubusercontent.com/TarasKovalenko/Rediscope/$_tag/LICENSE")
+source_x86_64=("$_pkgname-$_tag-x86_64.tar.gz::$url/releases/download/$_tag/$_pkgname-$_tag-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$_pkgname-$_tag-aarch64.tar.gz::$url/releases/download/$_tag/$_pkgname-$_tag-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums=('@LICENSE_SHA256@')
+sha256sums_x86_64=('@SHA256_LINUX_X64_GNU@')
+sha256sums_aarch64=('@SHA256_LINUX_ARM64_GNU@')
+
+package() {
+  install -Dm755 "$srcdir/$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+  install -Dm644 "$srcdir/LICENSE-$_tag" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
