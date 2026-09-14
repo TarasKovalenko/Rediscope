@@ -805,6 +805,14 @@ impl Client {
         self.mgr.idle_ping_after(after);
     }
 
+    /// How often a keyspace or `MONITOR` feed on a cluster checks for
+    /// primaries that were added or demoted (20 seconds unless changed). Only
+    /// tests change it.
+    #[doc(hidden)]
+    pub fn feed_check_every(&self, every: std::time::Duration) {
+        self.mgr.feed_check_every(every);
+    }
+
     /// Command names for console completion, and the subset flagged `write`.
     /// `COMMAND` works on every server version, unlike `COMMAND LIST`, and one
     /// reply per connection is cheap. The write set is what a read-only

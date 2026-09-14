@@ -103,6 +103,12 @@ pub enum Msg {
         payload: String,
         node: Option<String>,
     },
+    /// Pub/sub messages since the last batch, as (node, channel, payload),
+    /// and per channel how many more arrived than a batch keeps.
+    PubSubBatch {
+        messages: Vec<(Option<String>, String, String)>,
+        dropped: Vec<(String, u64)>,
+    },
     /// A note about the feed itself: a node lost, a reconnection.
     FeedNotice(String),
     /// Commands seen by `MONITOR` since the last batch, as (command, detail),
@@ -905,10 +911,10 @@ pub struct PubSubState {
 /// How many messages the feed keeps.
 pub const PUBSUB_LIMIT: usize = 2_000;
 
-/// How often the `MONITOR` reader hands its batch to the UI.
+/// How often the `MONITOR` and pub/sub readers hand their batch to the UI.
 pub const MONITOR_FLUSH: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Most commands one `MONITOR` batch keeps; the rest are only counted.
+/// Most commands or messages one batch keeps; the rest are only counted.
 pub const MONITOR_BATCH: usize = 500;
 
 /// How many seconds of traffic the rate sparkline covers.
@@ -988,6 +994,19 @@ impl PubSubState {
         self.peak = self.peak.max(self.rate[slot]);
         self.total += count;
         self.dropped += count;
+    }
+
+    /// Count `count` messages on `channel` that were not kept, in the rate,
+    /// the total and the channel's own count.
+    pub fn push_dropped_from(&mut self, channel: String, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.push_dropped(count);
+        match self.channels.iter_mut().find(|(name, _)| *name == channel) {
+            Some((_, n)) => *n += count,
+            None => self.channels.push((channel, count)),
+        }
     }
 
     pub fn push_at(&mut self, channel: String, payload: String, at: std::time::Instant) {
@@ -2004,6 +2023,25 @@ impl App {
                     None => self.stop_feeds(),
                 },
             },
+            Msg::PubSubBatch { messages, dropped } => {
+                let feed = match &mut self.modal {
+                    Some(Modal::PubSub(state)) => Some(state),
+                    // The feed is behind a dialog: keep collecting for it.
+                    _ => self.held_feed.as_mut(),
+                };
+                match feed {
+                    Some(state) => {
+                        for (node, channel, payload) in messages {
+                            state.push_from(node, channel, payload);
+                        }
+                        for (channel, count) in dropped {
+                            state.push_dropped_from(channel, count);
+                        }
+                    }
+                    // Nothing is listening any more, so neither is the task.
+                    None => self.stop_feeds(),
+                }
+            }
             Msg::FeedNotice(text) => match &mut self.modal {
                 Some(Modal::PubSub(state)) => {
                     state.push_notice(text.clone());
@@ -3804,23 +3842,55 @@ impl App {
                     return;
                 }
             };
-            while let Some(event) = feed.next().await {
-                let msg = match event {
-                    FeedEvent::Message {
-                        node,
-                        channel,
-                        payload,
-                    } => Msg::PubSub {
-                        channel,
-                        payload,
-                        node,
+            // A busy channel can outrun any terminal, and the redis crate
+            // queues what the socket receives without limit, so the feed is
+            // drained as fast as it arrives. Each batch keeps at most
+            // `MONITOR_BATCH` messages; the rest are counted per channel.
+            let mut tick = tokio::time::interval(MONITOR_FLUSH);
+            let mut batch: Vec<(Option<String>, String, String)> = Vec::new();
+            let mut dropped: std::collections::HashMap<String, u64> = Default::default();
+            let flush = |batch: &mut Vec<_>, dropped: &mut std::collections::HashMap<_, _>| {
+                Msg::PubSubBatch {
+                    messages: std::mem::take(batch),
+                    dropped: dropped.drain().collect(),
+                }
+            };
+            loop {
+                tokio::select! {
+                    event = feed.next() => match event {
+                        Some(FeedEvent::Message { node, channel, payload }) => {
+                            if batch.len() < MONITOR_BATCH {
+                                batch.push((node, channel, payload));
+                            } else {
+                                *dropped.entry(channel).or_default() += 1;
+                            }
+                        }
+                        Some(FeedEvent::Notice(text)) => {
+                            // What arrived before the notice is listed first.
+                            if (!batch.is_empty() || !dropped.is_empty())
+                                && tx.send(flush(&mut batch, &mut dropped)).is_err()
+                            {
+                                return;
+                            }
+                            if tx.send(Msg::FeedNotice(text)).is_err() {
+                                return;
+                            }
+                        }
+                        // A subscription never carries `MONITOR` lines.
+                        Some(FeedEvent::Command { .. }) => {}
+                        None => {
+                            let _ = tx.send(flush(&mut batch, &mut dropped));
+                            return;
+                        }
                     },
-                    FeedEvent::Notice(text) => Msg::FeedNotice(text),
-                    // A subscription never carries `MONITOR` lines.
-                    FeedEvent::Command { .. } => continue,
-                };
-                if tx.send(msg).is_err() {
-                    return;
+                    _ = tick.tick() => {
+                        if batch.is_empty() && dropped.is_empty() {
+                            continue;
+                        }
+                        if tx.send(flush(&mut batch, &mut dropped)).is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         }));

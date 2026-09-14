@@ -298,11 +298,16 @@ rediscope
   minute carries the message rate, peak and total; a channel breakdown shows
   which channels the traffic is on, each in its own colour; selecting a JSON or
   XML message pretty-prints it below the feed. `w` publishes one, `f` follows
-  the tail, `y` copies the feed. On a Sentinel profile the subscription is on
-  the primary, and after a failover the feed reconnects to the new primary and
-  says so in a warning line. A cluster delivers every `PUBLISH` to every node,
-  so one subscription on the default node sees them all; if that node goes,
-  the feed reconnects through another.
+  the tail, `y` copies the feed. A busy channel is handled like the monitor:
+  the feed keeps at most 500 messages every 100 ms and counts the rest, per
+  channel, as "too fast to show". On a Sentinel profile the subscription is on
+  the primary. The feed asks Sentinel every 5 seconds which node it names, so
+  after a failover it moves to the new primary even if the old one keeps the
+  connection open, and says so in a warning line. A cluster delivers every
+  `PUBLISH` to every node, so one subscription on the default node sees them
+  all; if that node goes, the feed reconnects through another. A node that
+  keeps dropping the subscription is retried less and less often, up to every
+  5 seconds.
 - **Command monitor** (`W`). `MONITOR` in the same feed: every command the
   server runs, grouped by command name, with the rate and a filter (`s`) that
   keeps commands whose name or arguments match. A busy server runs more
@@ -324,7 +329,10 @@ rediscope
   covers the merged feed, not each node, and `d` still works, though a
   cluster only has database 0. On a production cluster the prompt says how
   many primaries will be slowed. A node that drops out is reported in the feed
-  and the others keep streaming.
+  and the others keep streaming. Every 20 seconds the feed checks the
+  topology: a primary added by a reshard or promoted by a failover is
+  monitored too, and a node that is no longer a primary is dropped, each with
+  a line in the feed.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
   evicted live. Needs `notify-keyspace-events` set on the server. A cluster
@@ -332,8 +340,9 @@ rediscope
   profile the feed subscribes on every primary, one connection each, and
   merges them, naming each event's node when the terminal is wide enough. A
   node that drops out is reported in a warning line while the others keep
-  streaming, and it rejoins the feed when it answers again. Set
-  `notify-keyspace-events` on every node.
+  streaming, and it rejoins the feed when it answers again. Every 20 seconds
+  the feed also checks for primaries that were added or demoted, and follows
+  or drops them. Set `notify-keyspace-events` on every node.
 - **Consumer groups** (`S`, on a stream). Every group with its pending count
   and lag, the consumers behind it, and the entries none of them have acked.
   `n` creates a group, `d` destroys one, `a` acks an entry and `c` claims one

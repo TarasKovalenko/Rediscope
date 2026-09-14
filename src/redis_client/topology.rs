@@ -54,12 +54,17 @@ pub(super) struct Transport {
     /// How long, in milliseconds, a cached socket may go without proving it
     /// is alive before a write on it is preceded by a `PING`.
     idle_ping_ms: Arc<AtomicU64>,
+    /// How often, in milliseconds, a feed that follows every primary checks
+    /// the topology for primaries that came or went.
+    feed_check_ms: Arc<AtomicU64>,
 }
 /// Load balancers and firewalls drop connections that sit quiet for a few
 /// minutes without telling either end. A write sent into such a socket is
 /// lost with an unknown outcome, so a socket unused for this long is checked
 /// with a `PING` first.
 const IDLE_PING: Duration = Duration::from_secs(30);
+/// How often a merged feed looks for primaries that were added or demoted.
+const FEED_CHECK: Duration = Duration::from_secs(20);
 struct State {
     clients: HashMap<Endpoint, redis::Client>,
     sockets: HashMap<Endpoint, Socket>,
@@ -175,6 +180,7 @@ impl Transport {
             primary_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             epoch: Instant::now(),
             idle_ping_ms: Arc::new(AtomicU64::new(IDLE_PING.as_millis() as u64)),
+            feed_check_ms: Arc::new(AtomicU64::new(FEED_CHECK.as_millis() as u64)),
         };
         let result = this.refresh().await;
         this.audit.record(
@@ -348,6 +354,15 @@ impl Transport {
             .store(after.as_millis() as u64, Ordering::Relaxed);
     }
 
+    /// How often a feed on every primary checks for primaries that came or went.
+    pub fn feed_check_every(&self, every: Duration) {
+        self.feed_check_ms
+            .store(every.as_millis() as u64, Ordering::Relaxed);
+    }
+    pub(super) fn feed_check(&self) -> Duration {
+        Duration::from_millis(self.feed_check_ms.load(Ordering::Relaxed))
+    }
+
     /// Drop the cached socket for `ep` after a failure on it, if it is still
     /// the socket `used` names. A request that failed before it had a socket
     /// drops nothing: whatever is cached belongs to someone else.
@@ -517,6 +532,28 @@ impl Transport {
             .query_async(&mut c)
             .await?;
         address.ok_or_else(|| error("Sentinel does not know this service"))
+    }
+
+    /// The primary Sentinel names right now, from the first seed that
+    /// answers. Nothing is verified or recorded: this only tells a caller
+    /// whether a discovery is worth running.
+    pub(super) async fn sentinel_primary(&self) -> RedisResult<Endpoint> {
+        let ask = async {
+            let mut failures = Vec::new();
+            for ep in self.seeds() {
+                match self.sentinel_names(&ep).await {
+                    Ok(address) => return Ok(address),
+                    Err(e) => failures.push(format!("{}:{}: {e}", ep.0, ep.1)),
+                }
+            }
+            Err(error(format!(
+                "No Sentinel answered: {}",
+                failures.join("; ")
+            )))
+        };
+        tokio::time::timeout(Duration::from_secs(10), ask)
+            .await
+            .unwrap_or_else(|_| Err(error("Sentinel did not answer in time")))
     }
 
     /// Check with `ROLE` that the node Sentinel named is a primary. The
@@ -689,6 +726,11 @@ impl Transport {
 
     pub async fn refresh(&self) -> RedisResult<()> {
         self.discover_noting(false).await
+    }
+    /// Refresh after something was lost, such as a feed's connection: a
+    /// discovery already under way when that happened does not count.
+    pub(super) async fn refresh_after_loss(&self) -> RedisResult<()> {
+        self.rediscover().await
     }
     /// Where keyless commands go: the node diagnostics describe. Refreshed
     /// first when stale; if that refresh fails, the last known node is used.
