@@ -186,3 +186,209 @@ jobs:
             dist/SHA256SUMS
             dist/*.spdx.json
           generate_release_notes: true
+
+  # Everything below runs after the GitHub release exists. Each channel needs a
+  # secret the maintainer adds once (see packaging/README.md). Without it the
+  # job is skipped and the run stays green. Pre-release tags such as
+  # v1.0.0-rc.1 never go to package managers.
+  packaging:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.channels.outputs.version }}
+      homebrew: ${{ steps.channels.outputs.homebrew }}
+      scoop: ${{ steps.channels.outputs.scoop }}
+      winget: ${{ steps.channels.outputs.winget }}
+      aur: ${{ steps.channels.outputs.aur }}
+      crates: ${{ steps.channels.outputs.crates }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      # Render from the SHA256SUMS that was actually published, so a manifest
+      # can only point at archives people can download.
+      - name: Download SHA256SUMS from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir dist
+
+      - name: Render manifests
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: sh scripts/render-packaging.sh "$RELEASE_TAG" dist/SHA256SUMS dist/packaging
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packaging-manifests
+          path: dist/packaging
+          if-no-files-found: error
+
+      # Job-level `if` cannot read secrets, so this step turns "is the secret
+      # set" into outputs the publishing jobs can check.
+      - name: Decide which channels to publish
+        id: channels
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          stable=false
+          if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then stable=true; fi
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          decide() {
+            local channel="$1" secret="$2" value="$3" on=false
+            if [ "$stable" != true ]; then
+              echo "::notice::$channel skipped: $RELEASE_TAG is a pre-release"
+            elif [ -z "$value" ]; then
+              echo "::notice::$channel skipped: secret $secret is not set"
+            else
+              on=true
+            fi
+            echo "$channel=$on" >> "$GITHUB_OUTPUT"
+          }
+          decide homebrew HOMEBREW_TAP_TOKEN "$HOMEBREW_TAP_TOKEN"
+          decide scoop SCOOP_BUCKET_TOKEN "$SCOOP_BUCKET_TOKEN"
+          decide winget WINGET_TOKEN "$WINGET_TOKEN"
+          decide aur AUR_SSH_PRIVATE_KEY "$AUR_SSH_PRIVATE_KEY"
+          decide crates CARGO_REGISTRY_TOKEN "$CARGO_REGISTRY_TOKEN"
+
+  homebrew:
+    needs: packaging
+    if: needs.packaging.outputs.homebrew == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: packaging-manifests
+          path: manifests
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: TarasKovalenko/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Commit the formula to the tap
+        env:
+          VERSION: ${{ needs.packaging.outputs.version }}
+        run: |
+          mkdir -p tap/Formula
+          cp manifests/homebrew/rediscope.rb tap/Formula/rediscope.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/rediscope.rb
+          if git diff --cached --quiet; then
+            echo "Formula is already at $VERSION"
+            exit 0
+          fi
+          git commit -m "rediscope $VERSION"
+          git push
+
+  scoop:
+    needs: packaging
+    if: needs.packaging.outputs.scoop == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: packaging-manifests
+          path: manifests
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: TarasKovalenko/scoop-bucket
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: bucket
+      - name: Commit the manifest to the bucket
+        env:
+          VERSION: ${{ needs.packaging.outputs.version }}
+        run: |
+          mkdir -p bucket/bucket
+          cp manifests/scoop/rediscope.json bucket/bucket/rediscope.json
+          cd bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/rediscope.json
+          if git diff --cached --quiet; then
+            echo "Manifest is already at $VERSION"
+            exit 0
+          fi
+          git commit -m "rediscope: Update to version $VERSION"
+          git push
+
+  # winget-releaser only updates a package that is already in winget-pkgs, so
+  # add WINGET_TOKEN after the first manual submission has been merged.
+  winget:
+    needs: packaging
+    if: needs.packaging.outputs.winget == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: TarasKovalenko.Rediscope
+          version: ${{ needs.packaging.outputs.version }}
+          release-tag: ${{ inputs.tag || github.ref_name }}
+          installers-regex: '-pc-windows-msvc\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}
+
+  aur:
+    needs: packaging
+    if: needs.packaging.outputs.aur == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: packaging-manifests
+          path: manifests
+      # With test: true the action builds the package in an Arch container
+      # first, which downloads the archive and checks it against sha256sums.
+      # It then writes .SRCINFO and pushes both files.
+      - uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: rediscope-bin
+          pkgbuild: manifests/aur/rediscope-bin/PKGBUILD
+          commit_username: ${{ vars.AUR_COMMIT_USERNAME || 'github-actions[bot]' }}
+          commit_email: ${{ vars.AUR_COMMIT_EMAIL || '41898282+github-actions[bot]@users.noreply.github.com' }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update to ${{ needs.packaging.outputs.version }}
+          test: true
+
+  crates:
+    needs: packaging
+    if: needs.packaging.outputs.crates == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Check the tag matches Cargo.toml
+        env:
+          VERSION: ${{ needs.packaging.outputs.version }}
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rediscope") | .version')"
+          if [ "$crate_version" != "$VERSION" ]; then
+            echo "::error::Cargo.toml is at $crate_version but the tag is $VERSION"
+            exit 1
+          fi
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
