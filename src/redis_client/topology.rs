@@ -389,6 +389,31 @@ impl Transport {
         let _ = self.refresh_if_stale(&mut state).await;
         state.default.clone()
     }
+    /// The default node as last discovered, without refreshing first.
+    pub async fn known_default(&self) -> Endpoint {
+        self.state.lock().await.default.clone()
+    }
+    pub fn deployment(&self) -> Deployment {
+        self.profile.deployment
+    }
+    /// A client for one node, with the profile's data credentials and TLS,
+    /// for a connection that cannot be shared: pub/sub or `MONITOR`. On a
+    /// standalone profile this is the client the profile connected with, so a
+    /// tunnel or a Unix socket still applies.
+    pub async fn node_client(&self, ep: &Endpoint) -> RedisResult<redis::Client> {
+        let mut state = self.state.lock().await;
+        if let Some(client) = state.clients.get(ep) {
+            return Ok(client.clone());
+        }
+        let mut profile = self.profile.clone();
+        profile.host = ep.0.clone();
+        profile.port = ep.1;
+        let raw = build_client(&profile, None)
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        state.clients.insert(ep.clone(), raw.clone());
+        Ok(raw)
+    }
     pub async fn nodes(&self) -> Vec<Node> {
         self.state.lock().await.nodes.clone()
     }

@@ -773,8 +773,13 @@ async fn the_new_panes_render_at_any_size() {
         a.on_msg(Msg::PubSub {
             channel: format!("news.{i}"),
             payload: format!("message {i} with a body long enough to need truncating"),
+            // A merged cluster feed labels every message with its node.
+            node: (i % 2 == 0).then(|| format!("10.0.0.{}:6379", i % 3)),
         });
     }
+    a.on_msg(Msg::FeedNotice(
+        "Lost node 10.0.0.2:6379; the other 2 node(s) keep streaming".into(),
+    ));
     render_all_sizes(&mut a);
     press(&mut a, KeyCode::Char('f')); // stop following
     press(&mut a, KeyCode::Char('G'));

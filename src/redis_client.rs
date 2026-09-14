@@ -11,8 +11,10 @@ use redis::{
 use crate::codec::{Decoding, Shown, View};
 use crate::config::{Connection, Deployment};
 mod edit;
+mod feed;
 mod topology;
 pub use edit::{EditOutcome, EditTarget};
+pub use feed::{Feed, FeedEvent};
 use topology::Transport;
 pub use topology::{Node, key_slot};
 
@@ -747,13 +749,22 @@ impl Client {
     }
 
     /// A connection of its own, for pub/sub. The multiplexed connection cannot
-    /// be put into subscriber mode without breaking every other caller.
+    /// be put into subscriber mode without breaking every other caller. On a
+    /// Sentinel profile it goes to the primary, on a cluster to the default
+    /// node, which receives every node's `PUBLISH`.
     pub async fn pubsub(&self) -> Result<redis::aio::PubSub> {
-        anyhow::ensure!(
-            self.conn.deployment == Deployment::Standalone,
-            "Pub/sub is not supported for discovered deployments yet"
-        );
-        Ok(self.raw.get_async_pubsub().await?)
+        if self.conn.deployment == Deployment::Standalone {
+            return Ok(self.raw.get_async_pubsub().await?);
+        }
+        let ep = self.mgr.default_endpoint().await;
+        Ok(self.mgr.node_client(&ep).await?.get_async_pubsub().await?)
+    }
+
+    /// Follow `patterns` with `PSUBSCRIBE` until the feed is dropped.
+    /// `keyspace` marks keyspace notifications: a cluster raises those only on
+    /// the node that owns the key, so the feed subscribes on every primary.
+    pub async fn subscribe(&self, patterns: Vec<String>, keyspace: bool) -> Result<Feed> {
+        feed::subscribe(self.mgr.clone(), patterns, keyspace).await
     }
 
     /// A `MONITOR` connection of its own: every command the server runs, as

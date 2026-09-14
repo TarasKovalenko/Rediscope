@@ -298,7 +298,11 @@ rediscope
   minute carries the message rate, peak and total; a channel breakdown shows
   which channels the traffic is on, each in its own colour; selecting a JSON or
   XML message pretty-prints it below the feed. `w` publishes one, `f` follows
-  the tail, `y` copies the feed.
+  the tail, `y` copies the feed. On a Sentinel profile the subscription is on
+  the primary, and after a failover the feed reconnects to the new primary and
+  says so in a warning line. A cluster delivers every `PUBLISH` to every node,
+  so one subscription on the default node sees them all; if that node goes,
+  the feed reconnects through another.
 - **Command monitor** (`W`). `MONITOR` in the same feed: every command the
   server runs, grouped by command name, with the rate and a filter (`s`) that
   keeps commands whose name or arguments match. A busy server runs more
@@ -313,10 +317,16 @@ rediscope
   `MONITOR` connection closes with the feed, however the feed goes away.
   A production profile asks before starting it, because `MONITOR` costs the
   server real throughput while it runs; `Esc` stops it. Standalone profiles
-  only for now, like pub/sub.
+  only for now.
 - **Keyspace events** (`N`). The same feed pointed at
   `__keyevent@<db>__:*`, so you can watch keys being written, expired and
-  evicted live. Needs `notify-keyspace-events` set on the server.
+  evicted live. Needs `notify-keyspace-events` set on the server. A cluster
+  raises these events only on the node that owns the key, so on a Cluster
+  profile the feed subscribes on every primary, one connection each, and
+  merges them, naming each event's node when the terminal is wide enough. A
+  node that drops out is reported in a warning line while the others keep
+  streaming, and it rejoins the feed when it answers again. Set
+  `notify-keyspace-events` on every node.
 - **Consumer groups** (`S`, on a stream). Every group with its pending count
   and lag, the consumers behind it, and the entries none of them have acked.
   `n` creates a group, `d` destroys one, `a` acks an entry and `c` claims one
@@ -806,8 +816,8 @@ the current default node, which can differ from it after a failover. `PUBLISH`
   `COMMAND GETKEYS` before they are routed.
 - **No transactions** (`MULTI`/`EXEC`) on a cluster, and database 0 only.
 
-Cluster memory rollups and discovered-profile pub/sub and `MONITOR` are not
-available yet. Managed services exposing a single proxy endpoint can keep a
+Cluster memory rollups and discovered-profile `MONITOR` are not available
+yet. Managed services exposing a single proxy endpoint can keep a
 standalone profile.
 
 Saved connections live in `connections.json` under your platform config dir, and

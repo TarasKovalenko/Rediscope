@@ -433,3 +433,203 @@ async fn real_cluster_and_sentinel_accept_routed_writes() {
     assert!(!raw_exists(&primary, "sentinel:write").await);
     drop(servers);
 }
+
+// ---- feeds ------------------------------------------------------------------
+
+use rediscope::redis_client::{Feed, FeedEvent};
+
+/// Read `feed` until `done` holds, for at most `secs` seconds.
+async fn read_until(
+    feed: &mut Feed,
+    secs: u64,
+    mut done: impl FnMut(&[FeedEvent]) -> bool,
+) -> Vec<FeedEvent> {
+    let mut seen = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(secs), async {
+        while let Some(event) = feed.next().await {
+            seen.push(event);
+            if done(&seen) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(finished, Ok(true), "feed stalled or ended after {seen:?}");
+    seen
+}
+fn has_message(events: &[FeedEvent], wanted: &str) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, FeedEvent::Message { payload, .. } if payload == wanted))
+}
+
+/// A key whose slot `node` owns.
+fn key_owned_by(node: &rediscope::redis_client::Node, prefix: &str) -> String {
+    (0..10000)
+        .map(|i| format!("{prefix}{i}"))
+        .find(|k| {
+            let slot = key_slot(k.as_bytes());
+            node.slots.iter().any(|(a, b)| (*a..=*b).contains(&slot))
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_cluster_pubsub_and_keyspace_events_cover_every_node() {
+    let _serial = SERIAL.lock().await;
+    let servers = start_cluster().await;
+    let client = Client::connect(servers[0].profile(Deployment::Cluster))
+        .await
+        .unwrap();
+    let nodes = client.refresh_topology().await.unwrap();
+    let primaries: Vec<_> = nodes.iter().filter(|n| n.primary).cloned().collect();
+    assert_eq!(primaries.len(), 3);
+
+    // A message published on any node reaches the one subscription.
+    let mut feed = client
+        .subscribe(vec!["live.*".into()], false)
+        .await
+        .unwrap();
+    assert_eq!(feed.nodes(), 1);
+    for server in &servers {
+        redis::cmd("PUBLISH")
+            .arg("live.news")
+            .arg(format!("from-{}", server.port))
+            .query_async::<i64>(&mut server.raw().await)
+            .await
+            .unwrap();
+    }
+    let events = read_until(&mut feed, 10, |seen| {
+        servers
+            .iter()
+            .all(|s| has_message(seen, &format!("from-{}", s.port)))
+    })
+    .await;
+    assert!(
+        events
+            .iter()
+            .all(|e| matches!(e, FeedEvent::Message { node: None, .. })),
+        "{events:?}"
+    );
+    // Publishing through the client reaches it too.
+    client
+        .execute_raw("PUBLISH live.news through-rediscope")
+        .await
+        .unwrap();
+    read_until(&mut feed, 10, |seen| has_message(seen, "through-rediscope")).await;
+    drop(feed);
+
+    // Keyspace events stay on the node that owns the key, so the feed has to
+    // be on all three.
+    for server in &servers {
+        redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("notify-keyspace-events")
+            .arg("KEA")
+            .query_async::<()>(&mut server.raw().await)
+            .await
+            .unwrap();
+    }
+    let mut feed = client
+        .subscribe(vec!["__keyevent@0__:*".into()], true)
+        .await
+        .unwrap();
+    assert_eq!(feed.nodes(), 3);
+    let keys: Vec<(String, u16)> = primaries
+        .iter()
+        .map(|n| (key_owned_by(n, "events:key:"), n.port))
+        .collect();
+    for (key, _) in &keys {
+        client.set_string(key, "v").await.unwrap();
+    }
+    let events = read_until(&mut feed, 10, |seen| {
+        keys.iter().all(|(k, _)| has_message(seen, k))
+    })
+    .await;
+    for (key, port) in &keys {
+        let node = events.iter().find_map(|e| match e {
+            FeedEvent::Message {
+                node,
+                channel,
+                payload,
+            } if payload == key && channel == "__keyevent@0__:set" => node.clone(),
+            _ => None,
+        });
+        assert_eq!(node, Some(format!("127.0.0.1:{port}")), "{key}");
+    }
+    drop(servers);
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_sentinel_pubsub_reconnects_to_the_new_primary_after_failover() {
+    let _serial = SERIAL.lock().await;
+    let primary = Server::start(false, None).await;
+    let replica = Server::start(false, None).await;
+    redis::cmd("REPLICAOF")
+        .arg("127.0.0.1")
+        .arg(primary.port)
+        .query_async::<()>(&mut replica.raw().await)
+        .await
+        .unwrap();
+    let sentinel = Server::start(false, Some(primary.port)).await;
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "test-primary".into();
+    let client = Client::connect(profile).await.unwrap();
+
+    let mut feed = client
+        .subscribe(vec!["alerts".into()], false)
+        .await
+        .unwrap();
+    redis::cmd("PUBLISH")
+        .arg("alerts")
+        .arg("before")
+        .query_async::<i64>(&mut primary.raw().await)
+        .await
+        .unwrap();
+    read_until(&mut feed, 10, |seen| has_message(seen, "before")).await;
+
+    failover(&sentinel, &replica).await;
+    let wanted = format!("Reconnected to the new primary 127.0.0.1:{}", replica.port);
+    read_until(&mut feed, 30, |seen| {
+        seen.iter()
+            .any(|e| matches!(e, FeedEvent::Notice(n) if n.contains(&wanted)))
+    })
+    .await;
+    redis::cmd("PUBLISH")
+        .arg("alerts")
+        .arg("after")
+        .query_async::<i64>(&mut replica.raw().await)
+        .await
+        .unwrap();
+    read_until(&mut feed, 10, |seen| has_message(seen, "after")).await;
+}
+
+/// Ask Sentinel to promote `replica`, once it has found it, and wait until
+/// the replica says it is the primary.
+async fn failover(sentinel: &Server, replica: &Server) {
+    let mut started = false;
+    for _ in 0..300 {
+        if !started {
+            started = redis::cmd("SENTINEL")
+                .arg("FAILOVER")
+                .arg("test-primary")
+                .query_async::<()>(&mut sentinel.raw().await)
+                .await
+                .is_ok();
+        }
+        if started {
+            let role: Vec<redis::Value> = redis::cmd("ROLE")
+                .query_async(&mut replica.raw().await)
+                .await
+                .unwrap();
+            if matches!(role.first(), Some(redis::Value::BulkString(b)) if b == b"master") {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("Sentinel never failed over to {}", replica.port);
+}

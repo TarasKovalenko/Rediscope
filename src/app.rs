@@ -19,9 +19,10 @@ use crate::json::{self, JsonMode};
 use crate::memory::{PrefixRow, Rollup};
 use crate::palette::{PaletteState, Target};
 use crate::redis_client::{
-    Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT,
-    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, MonitorLine, ServerInfo, Similar, SimilarTo,
-    StreamGroup, StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
+    Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, ExportEntry, FeedEvent,
+    KEY_LIMIT, KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, MonitorLine, ServerInfo, Similar,
+    SimilarTo, StreamGroup, StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window,
+    is_destructive,
 };
 use crate::theme::Theme;
 use crate::tree::{SortMode, Tree, VisibleRow};
@@ -95,11 +96,15 @@ pub enum Msg {
         truncated: bool,
         needle: String,
     },
-    /// One message from the pub/sub feed.
+    /// One message from the pub/sub feed. `node` names the cluster node it
+    /// came from when the feed merges several.
     PubSub {
         channel: String,
         payload: String,
+        node: Option<String>,
     },
+    /// A note about the feed itself: a node lost, a reconnection.
+    FeedNotice(String),
     /// Commands seen by `MONITOR` since the last batch, as (command, detail),
     /// and how many more arrived than a batch keeps.
     MonitorBatch {
@@ -845,6 +850,11 @@ pub struct FeedMessage {
     pub payload: String,
     /// The database a monitored command ran against. `None` for pub/sub.
     pub db: Option<i64>,
+    /// The cluster node it came from, when the feed merges several.
+    pub node: Option<String>,
+    /// A note about the feed itself rather than something the server sent.
+    /// Listed whatever the filter, and never counted as traffic.
+    pub notice: bool,
 }
 
 pub struct PubSubState {
@@ -941,6 +951,27 @@ impl PubSubState {
         self.push_at(channel, payload, std::time::Instant::now());
     }
 
+    /// A message from one node of a merged feed.
+    pub fn push_from(&mut self, node: Option<String>, channel: String, payload: String) {
+        self.push_entry(channel, payload, None, node, std::time::Instant::now());
+    }
+
+    /// A line about the feed itself, such as a node that dropped. It is
+    /// listed like a message but counts as no traffic.
+    pub fn push_notice(&mut self, text: String) {
+        self.sync_listed();
+        self.messages.push(FeedMessage {
+            at: std::time::Instant::now(),
+            channel: "rediscope".into(),
+            payload: text,
+            db: None,
+            node: None,
+            notice: true,
+        });
+        self.listed += 1;
+        self.trim();
+    }
+
     /// Count `count` commands that were not kept, so the rate and total stay
     /// true on a server faster than the feed.
     pub fn push_dropped(&mut self, count: u64) {
@@ -960,7 +991,7 @@ impl PubSubState {
     }
 
     pub fn push_at(&mut self, channel: String, payload: String, at: std::time::Instant) {
-        self.push_entry(channel, payload, None, at);
+        self.push_entry(channel, payload, None, None, at);
     }
 
     /// One command from `MONITOR`, grouped under its name and tagged with its
@@ -975,12 +1006,12 @@ impl PubSubState {
         {
             self.dbs.insert(slot, db);
         }
-        self.push_entry(line.command, line.detail, line.db, at);
+        self.push_entry(line.command, line.detail, line.db, None, at);
     }
 
     /// Whether `message` passes the database filter.
     fn shows(&self, message: &FeedMessage) -> bool {
-        self.db_filter.is_none() || message.db == self.db_filter
+        self.db_filter.is_none() || message.notice || message.db == self.db_filter
     }
 
     /// The messages the feed lists, oldest first. `scroll` indexes into this.
@@ -1046,6 +1077,7 @@ impl PubSubState {
         channel: String,
         payload: String,
         db: Option<i64>,
+        node: Option<String>,
         at: std::time::Instant,
     ) {
         self.sync_listed();
@@ -1063,11 +1095,19 @@ impl PubSubState {
             channel,
             payload,
             db,
+            node,
+            notice: false,
         };
         if self.shows(&message) {
             self.listed += 1;
         }
         self.messages.push(message);
+        self.trim();
+    }
+
+    /// Keep the newest [`PUBSUB_LIMIT`] messages, and the count and cursor
+    /// in step with what was dropped.
+    fn trim(&mut self) {
         if self.messages.len() > PUBSUB_LIMIT {
             let overflow = self.messages.len() - PUBSUB_LIMIT;
             // The cursor counts listed messages, so only those move it.
@@ -1951,12 +1991,26 @@ impl App {
                     None => self.stop_feeds(),
                 }
             }
-            Msg::PubSub { channel, payload } => match &mut self.modal {
-                Some(Modal::PubSub(state)) => state.push(channel, payload),
+            Msg::PubSub {
+                channel,
+                payload,
+                node,
+            } => match &mut self.modal {
+                Some(Modal::PubSub(state)) => state.push_from(node, channel, payload),
                 // The feed is behind a dialog: keep collecting for it.
                 _ => match &mut self.held_feed {
-                    Some(feed) => feed.push(channel, payload),
+                    Some(feed) => feed.push_from(node, channel, payload),
                     // Nothing is listening any more, so neither is the task.
+                    None => self.stop_feeds(),
+                },
+            },
+            Msg::FeedNotice(text) => match &mut self.modal {
+                Some(Modal::PubSub(state)) => {
+                    state.push_notice(text.clone());
+                    self.status = text;
+                }
+                _ => match &mut self.held_feed {
+                    Some(feed) => feed.push_notice(text),
                     None => self.stop_feeds(),
                 },
             },
@@ -3743,24 +3797,27 @@ impl App {
         let mut state = PubSubState::new(patterns.clone(), keyspace);
         let tx = self.tx.clone();
         state.task = Some(tokio::spawn(async move {
-            let mut pubsub = match client.pubsub().await {
-                Ok(p) => p,
+            let mut feed = match client.subscribe(patterns, keyspace).await {
+                Ok(feed) => feed,
                 Err(e) => {
-                    let _ = tx.send(Msg::Error(format!("cannot subscribe: {e}")));
+                    let _ = tx.send(Msg::Error(format!("cannot subscribe: {e:#}")));
                     return;
                 }
             };
-            for pattern in &patterns {
-                if let Err(e) = pubsub.psubscribe(pattern).await {
-                    let _ = tx.send(Msg::Error(format!("cannot subscribe to {pattern}: {e}")));
-                    return;
-                }
-            }
-            let mut stream = pubsub.on_message();
-            while let Some(msg) = futures_util::StreamExt::next(&mut stream).await {
-                let channel = msg.get_channel_name().to_string();
-                let payload: String = msg.get_payload().unwrap_or_default();
-                if tx.send(Msg::PubSub { channel, payload }).is_err() {
+            while let Some(event) = feed.next().await {
+                let msg = match event {
+                    FeedEvent::Message {
+                        node,
+                        channel,
+                        payload,
+                    } => Msg::PubSub {
+                        channel,
+                        payload,
+                        node,
+                    },
+                    FeedEvent::Notice(text) => Msg::FeedNotice(text),
+                };
+                if tx.send(msg).is_err() {
                     return;
                 }
             }
@@ -4964,7 +5021,10 @@ impl App {
                     let text = state
                         .shown()
                         .iter()
-                        .map(|m| format!("{}  {}", m.channel, m.payload))
+                        .map(|m| match &m.node {
+                            Some(node) => format!("{node}  {}  {}", m.channel, m.payload),
+                            None => format!("{}  {}", m.channel, m.payload),
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
                     crate::osc52::copy(&text);

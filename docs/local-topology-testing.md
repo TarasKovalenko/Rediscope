@@ -308,7 +308,8 @@ Current limits to expect
 - Cluster multi-key writes need every key in one slot (use hash tags); keyless
   cluster-wide writes such as `FLUSHDB` are refused; no `MULTI`/`EXEC`.
 - Cluster accepts database 0 only.
-- Cluster namespace-memory rollups and discovered-profile pub/sub are unavailable.
+- Cluster namespace-memory rollups are unavailable. Keyspace events on a
+  cluster need `notify-keyspace-events` set on every node.
 - Browser discovery spans primaries; raw node-local commands such as SCAN
   still describe one diagnostic endpoint.
 - The automated real smoke test and protocol tests passed during implementation.

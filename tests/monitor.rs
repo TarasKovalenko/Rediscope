@@ -849,6 +849,7 @@ fn pubsub_and_keyspace_feeds_count_every_message() {
                 app.on_msg(Msg::PubSub {
                     channel: format!("news.{}", i % 5),
                     payload: format!("m{i} ключ 🙂"),
+                    node: None,
                 });
             }
         };

@@ -111,11 +111,19 @@ fn serve(socket: TcpStream, id: usize, handler: Arc<Handler>) {
         let Some(response) = response else {
             return;
         };
-        if reader.get_mut().write_all(response.as_bytes()).is_err() {
+        // A reply ending in `CLOSE` is written, then the connection dropped:
+        // a subscriber or monitor socket that the server lets go of.
+        let (response, close) = match response.strip_suffix(CLOSE) {
+            Some(rest) => (rest.to_string(), true),
+            None => (response, false),
+        };
+        if reader.get_mut().write_all(response.as_bytes()).is_err() || close {
             return;
         }
     }
 }
+/// Appended to a scripted reply, closes the connection once it is written.
+const CLOSE: &str = "\0CLOSE";
 fn bulk(s: &str) -> String {
     format!("${}\r\n{s}\r\n", s.len())
 }
@@ -2764,4 +2772,205 @@ async fn expire_keys_later_chunk_lost_reports_what_earlier_chunks_changed() {
         "{e}"
     );
     assert_eq!(count(&log, "EXPIRE", None), 257);
+}
+
+// ---- feeds: pub/sub on Sentinel and Cluster -------------------------------
+
+use rediscope::redis_client::{Feed, FeedEvent};
+
+fn psubscribed(pattern: &str) -> String {
+    format!("*3\r\n{}{}:1\r\n", bulk("psubscribe"), bulk(pattern))
+}
+fn pmessage(pattern: &str, channel: &str, payload: &str) -> String {
+    format!(
+        "*4\r\n{}{}{}{}",
+        bulk("pmessage"),
+        bulk(pattern),
+        bulk(channel),
+        bulk(payload)
+    )
+}
+
+/// Read `feed` until `done` says so, bounded, and return what arrived.
+async fn events_until(feed: &mut Feed, done: impl Fn(&[FeedEvent]) -> bool) -> Vec<FeedEvent> {
+    let mut seen = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = feed.next().await {
+            seen.push(event);
+            if done(&seen) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(finished, Ok(true), "feed stalled or ended after {seen:?}");
+    seen
+}
+fn payload_of(event: &FeedEvent) -> Option<(&Option<String>, &str)> {
+    match event {
+        FeedEvent::Message { node, payload, .. } => Some((node, payload.as_str())),
+        _ => None,
+    }
+}
+fn position(events: &[FeedEvent], what: impl Fn(&FeedEvent) -> bool) -> usize {
+    events
+        .iter()
+        .position(what)
+        .unwrap_or_else(|| panic!("not found in {events:?}"))
+}
+fn notice_with(text: String) -> impl Fn(&FeedEvent) -> bool {
+    move |e| matches!(e, FeedEvent::Notice(n) if n.contains(&text))
+}
+fn message_with(payload: &'static str) -> impl Fn(&FeedEvent) -> bool {
+    move |e| payload_of(e).is_some_and(|(_, p)| p == payload)
+}
+
+#[tokio::test]
+async fn sentinel_pubsub_follows_the_primary_after_a_failover() {
+    let second_log: Log = Arc::default();
+    let seen = second_log.clone();
+    let second = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        Some(match args[0].as_str() {
+            "ROLE" => "*1\r\n$6\r\nmaster\r\n".into(),
+            "PSUBSCRIBE" => psubscribed(&args[1]) + &pmessage(&args[1], "news", "from second"),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    let active = Arc::new(AtomicUsize::new(0));
+    let (switch, next) = (active.clone(), second.port as usize);
+    // The first primary delivers one message, then Sentinel fails it over
+    // and it drops its subscribers.
+    let first = Peer::start(move |_, args| {
+        Some(match args[0].as_str() {
+            "ROLE" if switch.load(Ordering::SeqCst) == next => "*1\r\n$5\r\nslave\r\n".into(),
+            "ROLE" => "*1\r\n$6\r\nmaster\r\n".into(),
+            "PSUBSCRIBE" => {
+                switch.store(next, Ordering::SeqCst);
+                psubscribed(&args[1]) + &pmessage(&args[1], "news", "from first") + CLOSE
+            }
+            _ => "+OK\r\n".into(),
+        })
+    });
+    active.store(first.port as usize, Ordering::SeqCst);
+    let master = active.clone();
+    let sentinel = Peer::start(move |_, args| match args[0].as_str() {
+        "SENTINEL" => Some(format!(
+            "*2\r\n{}{}",
+            bulk("127.0.0.1"),
+            bulk(&master.load(Ordering::SeqCst).to_string())
+        )),
+        _ => Some("+OK\r\n".into()),
+    });
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "service".into();
+    let client = Client::connect(profile).await.unwrap();
+    let mut feed = client.subscribe(vec!["*".into()], false).await.unwrap();
+    assert_eq!(feed.nodes(), 1);
+    let events = events_until(&mut feed, |seen| {
+        seen.iter().any(message_with("from second"))
+    })
+    .await;
+    let from_first = position(&events, message_with("from first"));
+    let lost = position(
+        &events,
+        notice_with(format!("Lost the connection to 127.0.0.1:{}", first.port)),
+    );
+    let back = position(
+        &events,
+        notice_with(format!(
+            "Reconnected to the new primary 127.0.0.1:{}",
+            second.port
+        )),
+    );
+    let from_second = position(&events, message_with("from second"));
+    assert!(
+        from_first < lost && lost < back && back < from_second,
+        "{events:?}"
+    );
+    // One stream at a time: nothing here is labelled by node.
+    assert!(
+        events
+            .iter()
+            .filter_map(payload_of)
+            .all(|(node, _)| node.is_none())
+    );
+    assert_eq!(count(&second_log, "PSUBSCRIBE", Some("*")), 1);
+}
+
+#[tokio::test]
+async fn cluster_channel_messages_need_one_subscription_on_the_default_node() {
+    let nodes = TwoNodes::start(|_, _, args| {
+        (args[0] == "PSUBSCRIBE")
+            .then(|| Some(psubscribed(&args[1]) + &pmessage(&args[1], "news.eu", "hello")))
+    });
+    let client = nodes.client().await;
+    let mut feed = client
+        .subscribe(vec!["news.*".into()], false)
+        .await
+        .unwrap();
+    let events = events_until(&mut feed, |seen| seen.iter().any(message_with("hello"))).await;
+    assert_eq!(payload_of(&events[0]), Some((&None, "hello")));
+    assert_eq!(count(&nodes.a_log, "PSUBSCRIBE", None), 1);
+    assert_eq!(count(&nodes.b_log, "PSUBSCRIBE", None), 0);
+}
+
+#[tokio::test]
+async fn cluster_keyspace_events_merge_every_primary_and_survive_a_lost_node() {
+    let b_subscriptions = Arc::new(AtomicUsize::new(0));
+    let b_count = b_subscriptions.clone();
+    let nodes = TwoNodes::start(move |node, _, args| {
+        if args[0] != "PSUBSCRIBE" {
+            return None;
+        }
+        let pattern = &args[1];
+        let event = |key: &str| pmessage(pattern, "__keyevent@0__:set", key);
+        Some(Some(match node {
+            'a' => psubscribed(pattern) + &event("on-a"),
+            // `b` drops its first subscriber, then keeps the next one.
+            _ if b_count.fetch_add(1, Ordering::SeqCst) == 0 => {
+                psubscribed(pattern) + &event("on-b") + CLOSE
+            }
+            _ => psubscribed(pattern) + &event("on-b-again"),
+        }))
+    });
+    let client = nodes.client().await;
+    let mut feed = client
+        .subscribe(vec!["__keyevent@0__:*".into()], true)
+        .await
+        .unwrap();
+    assert_eq!(feed.nodes(), 2);
+    let events = events_until(&mut feed, |seen| {
+        seen.iter().any(message_with("on-b-again")) && seen.iter().any(message_with("on-a"))
+    })
+    .await;
+    let label = |port: u16| Some(format!("127.0.0.1:{port}"));
+    let on = |payload: &str| {
+        events
+            .iter()
+            .filter_map(payload_of)
+            .find(|(_, p)| *p == payload)
+            .map(|(node, _)| node.clone())
+            .unwrap()
+    };
+    assert_eq!(on("on-a"), label(nodes.a.port));
+    assert_eq!(on("on-b"), label(nodes.b.port));
+    assert_eq!(on("on-b-again"), label(nodes.b.port));
+    let lost = position(
+        &events,
+        notice_with(format!(
+            "Lost node 127.0.0.1:{}; the other 1 node(s) keep streaming",
+            nodes.b.port
+        )),
+    );
+    let back = position(
+        &events,
+        notice_with(format!("Following node 127.0.0.1:{}", nodes.b.port)),
+    );
+    assert!(lost < back, "{events:?}");
+    assert!(back < position(&events, message_with("on-b-again")));
+    // The node that stayed up was never subscribed again.
+    assert_eq!(count(&nodes.a_log, "PSUBSCRIBE", None), 1);
+    assert_eq!(b_subscriptions.load(Ordering::SeqCst), 2);
 }

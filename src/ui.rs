@@ -1974,7 +1974,23 @@ fn feed_messages(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palett
     let channel_width = 24
         .min(area.width.saturating_sub(age_width as u16 + 4) as usize)
         .max(1);
-    let payload_width = (area.width as usize).saturating_sub(channel_width + age_width + 2);
+    // A merged cluster feed names each message's node, when there is room
+    // for that and still a useful stretch of payload.
+    let node_width = if area.width >= 72 {
+        state
+            .shown_iter()
+            .skip(start)
+            .take(height)
+            .filter_map(|m| m.node.as_ref())
+            .map(|n| n.chars().count() + 1)
+            .max()
+            .unwrap_or(0)
+            .min(22)
+    } else {
+        0
+    };
+    let payload_width =
+        (area.width as usize).saturating_sub(channel_width + age_width + node_width + 2);
     let lines: Vec<Line> = state
         .shown_iter()
         .enumerate()
@@ -1982,7 +1998,16 @@ fn feed_messages(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palett
         .take(height)
         .map(|(index, message)| {
             let age = feed_age(message.at.saturating_duration_since(state.started));
-            let line = Line::from(vec![
+            let (channel_style, payload_style) = if message.notice {
+                let warn = Style::new().fg(palette.warning);
+                (warn, warn)
+            } else {
+                (
+                    Style::new().fg(channel_color(&message.channel, palette)),
+                    Style::new().fg(palette.foreground),
+                )
+            };
+            let mut spans = vec![
                 Span::styled(
                     format!("{:>age_width$} ", truncate(&age, age_width)),
                     Style::new().fg(palette.dim),
@@ -1992,13 +2017,25 @@ fn feed_messages(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palett
                         "{:<channel_width$} ",
                         truncate(&message.channel, channel_width.saturating_sub(1))
                     ),
-                    Style::new().fg(channel_color(&message.channel, palette)),
+                    channel_style,
                 ),
-                Span::styled(
-                    truncate(&one_line(&message.payload), payload_width),
-                    Style::new().fg(palette.foreground),
-                ),
-            ]);
+            ];
+            if node_width > 0 {
+                let node = message.node.as_deref().unwrap_or("");
+                spans.push(Span::styled(
+                    format!(
+                        "{:<width$}",
+                        truncate(node, node_width.saturating_sub(1)),
+                        width = node_width
+                    ),
+                    Style::new().fg(palette.dim),
+                ));
+            }
+            spans.push(Span::styled(
+                truncate(&one_line(&message.payload), payload_width),
+                payload_style,
+            ));
+            let line = Line::from(spans);
             if index == anchor && !state.follow {
                 line.style(Style::new().bg(palette.panel))
             } else {
@@ -2569,6 +2606,51 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn merged_feed_text(width: u16) -> String {
+        let mut state = crate::app::PubSubState::new(vec!["__keyevent@0__:*".into()], true);
+        state.push_from(
+            Some("10.0.0.7:7001".into()),
+            "__keyevent@0__:set".into(),
+            "user:1".into(),
+        );
+        state.push_notice("Lost node 10.0.0.8:7002; the other 1 node(s) keep streaming".into());
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20)).unwrap();
+        term.draw(|f| pubsub_feed(f, f.area(), &state, Theme::Redis.palette()))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..20)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_merged_feed_names_the_node_when_there_is_room() {
+        let wide = merged_feed_text(140);
+        assert!(wide.contains("10.0.0.7:7001"), "{wide}");
+        assert!(wide.contains("user:1"), "{wide}");
+        assert!(wide.contains("Lost node"), "{wide}");
+        let narrow = merged_feed_text(60);
+        assert!(!narrow.contains("10.0.0.7:7001"), "{narrow}");
+        assert!(narrow.contains("user:1"), "{narrow}");
+    }
+
+    #[test]
+    fn a_feed_notice_is_listed_but_not_counted() {
+        let mut state = crate::app::PubSubState::monitor(vec![]);
+        state.push_notice("Reconnected to the new primary 10.0.0.9:6379".into());
+        assert_eq!(state.total, 0);
+        assert!(state.channels.is_empty());
+        assert_eq!(state.shown_len(), 1);
+        state.db_filter = Some(3);
+        assert_eq!(state.shown_len(), 1, "a notice passes the database filter");
     }
 
     #[test]
