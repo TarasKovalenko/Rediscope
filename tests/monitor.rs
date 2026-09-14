@@ -422,3 +422,244 @@ async fn d_narrows_the_feed_to_one_database() {
     client.execute_raw(&zero_keys).await.unwrap();
     elsewhere.execute_raw(&six_keys).await.unwrap();
 }
+
+// ---- parsing and the database filter, without a server ------------------------
+
+use rediscope::app::PubSubState;
+use rediscope::redis_client::MonitorLine;
+
+#[test]
+fn monitor_lines_from_every_kind_of_client_name_their_database() {
+    for (line, command, db, detail) in [
+        (
+            r#"1700000000.123456 [0 127.0.0.1:1234] "SET" "k" "v""#,
+            "SET",
+            Some(0),
+            r#"db0 127.0.0.1:1234  "k" "v""#,
+        ),
+        (
+            r#"1700000000.123456 [0 lua] "set" "k""#,
+            "SET",
+            Some(0),
+            r#"db0 lua  "k""#,
+        ),
+        (
+            r#"1700000000.123456 [0 unix:/tmp/r.sock] "GET" "k""#,
+            "GET",
+            Some(0),
+            r#"db0 unix:/tmp/r.sock  "k""#,
+        ),
+        (
+            r#"1700000000.123456 [7 unix:/tmp/my dir/r.sock] "GET" "k""#,
+            "GET",
+            Some(7),
+            r#"db7 unix:/tmp/my dir/r.sock  "k""#,
+        ),
+        (
+            r#"1700000000.123456 [3 [::1]:52100] "HGET" "h" "f""#,
+            "HGET",
+            Some(3),
+            r#"db3 [::1]:52100  "h" "f""#,
+        ),
+        (
+            r#"1700000000.123456 [15 10.0.0.1:6000] "PING""#,
+            "PING",
+            Some(15),
+            "db15 10.0.0.1:6000",
+        ),
+        (
+            r#"1700000000.123456 [1000 10.0.0.1:6000] "get" "k""#,
+            "GET",
+            Some(1000),
+            r#"db1000 10.0.0.1:6000  "k""#,
+        ),
+        // An argument holding the characters that end the source part.
+        (
+            r#"1.0 [2 10.0.0.1:6000] "SET" "a] [b" "\"q\"""#,
+            "SET",
+            Some(2),
+            r#"db2 10.0.0.1:6000  "a] [b" "\"q\"""#,
+        ),
+        (
+            r#"1.0 [x 10.0.0.1:6000] "GET" "k""#,
+            "GET",
+            None,
+            r#"dbx 10.0.0.1:6000  "k""#,
+        ),
+    ] {
+        let parsed = parse_monitor_line(line).unwrap_or_else(|| panic!("{line}"));
+        assert_eq!(parsed.command, command, "{line}");
+        assert_eq!(parsed.db, db, "{line}");
+        assert_eq!(parsed.detail, detail, "{line}");
+    }
+}
+
+#[test]
+fn malformed_monitor_lines_are_skipped_without_panicking() {
+    for line in [
+        "",
+        "OK",
+        "1700000000.1",
+        "1700000000.1 ",
+        "1700000000.1 [0 127.0.0.1:1]",
+        "1700000000.1 [0 127.0.0.1:1] ",
+        r#"1700000000.1 [0127.0.0.1:1] "GET""#,
+        "1700000000.1 [0 127.0.0.1:1] GET k",
+        r#"1700000000.1 [0 127.0.0.1:1] "GET"#,
+        r#"[0 127.0.0.1:1] "GET" "k""#,
+        r#"1700000000.1 0 127.0.0.1:1] "GET""#,
+    ] {
+        assert!(parse_monitor_line(line).is_none(), "{line:?}");
+    }
+    // Odd but readable: never a panic on multibyte text.
+    for line in [
+        r#"1.0 [0 127.0.0.1:1] "ГЕТ" "ключ""#,
+        "1.0 [0 127.0.0.1:1] \"\u{1F600}\"",
+        r#"1.0 [٣ 127.0.0.1:1] "GET""#,
+    ] {
+        let parsed = parse_monitor_line(line).unwrap();
+        assert!(parsed.db.is_none() || parsed.db == Some(0), "{line}");
+    }
+    let long = format!(r#"1.0 [4 127.0.0.1:1] "SET" "k" "{}""#, "ж".repeat(10_000));
+    let short = parse_monitor_line(&long).unwrap().shortened();
+    assert_eq!(short.db, Some(4));
+    assert!(short.detail.len() < long.len());
+}
+
+fn line(db: Option<i64>, text: &str) -> MonitorLine {
+    MonitorLine {
+        command: "GET".into(),
+        detail: format!("db{} 1.2.3.4:5  \"{text}\"", db.unwrap_or(-1)),
+        db,
+    }
+}
+
+#[test]
+fn d_with_no_other_database_seen_toggles_between_all_and_this_one() {
+    let mut state = PubSubState::monitor(vec![]);
+    state.current_db = 4;
+    // Nothing seen at all yet.
+    let mut filters = Vec::new();
+    for _ in 0..4 {
+        state.cycle_db();
+        filters.push(state.db_filter);
+    }
+    assert_eq!(filters, [Some(4), None, Some(4), None]);
+
+    // Only this database seen.
+    state.push_command(line(Some(4), "a"));
+    state.push_command(line(Some(4), "b"));
+    assert_eq!(state.dbs, [4]);
+    state.cycle_db();
+    assert_eq!(state.db_filter, Some(4));
+    assert_eq!(state.shown().len(), 2);
+    state.cycle_db();
+    assert_eq!(state.db_filter, None);
+}
+
+#[test]
+fn commands_with_no_database_only_show_unfiltered() {
+    let mut state = PubSubState::monitor(vec![]);
+    state.push_command(line(None, "mystery"));
+    state.push_command(line(Some(0), "zero"));
+    assert_eq!(state.dbs, [0], "an unknown database is not offered");
+    assert_eq!(state.shown().len(), 2);
+    state.cycle_db();
+    let shown: Vec<&str> = state.shown().iter().map(|m| m.payload.as_str()).collect();
+    assert_eq!(shown.len(), 1);
+    assert!(shown[0].contains("zero"));
+}
+
+#[test]
+fn a_filter_on_a_database_that_went_quiet_lists_nothing_and_still_draws() {
+    common::isolate_config();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.screen = Screen::Browser;
+    let mut state = PubSubState::monitor(vec![]);
+    state.current_db = 9;
+    for i in 0..30 {
+        state.push_command(line(Some(i % 3), &format!("cmd{i}")));
+    }
+    app.modal = Some(Modal::PubSub(state));
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    let Some(Modal::PubSub(state)) = &app.modal else {
+        panic!("feed closed")
+    };
+    assert_eq!(state.db_filter, Some(9));
+    assert!(state.shown().is_empty());
+    assert_eq!(state.scroll, 0);
+    for (w, h) in [(140, 40), (80, 24), (40, 12), (20, 8), (10, 5)] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| rediscope::ui::draw(f, &mut app)).unwrap();
+    }
+    // Moving about an empty list is harmless.
+    for code in [
+        KeyCode::Down,
+        KeyCode::Up,
+        KeyCode::PageDown,
+        KeyCode::PageUp,
+        KeyCode::End,
+        KeyCode::Home,
+        KeyCode::Char('f'),
+        KeyCode::Char('f'),
+    ] {
+        app.on_key(KeyEvent::from(code));
+    }
+    let Some(Modal::PubSub(state)) = &app.modal else {
+        panic!("feed closed")
+    };
+    assert_eq!(state.scroll, 0);
+}
+
+#[test]
+fn moving_through_a_filtered_feed_stays_within_what_is_listed() {
+    common::isolate_config();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.screen = Screen::Browser;
+    let mut state = PubSubState::monitor(vec![]);
+    for i in 0..40 {
+        state.push_command(line(Some(if i % 4 == 0 { 1 } else { 0 }), &format!("c{i}")));
+    }
+    state.cycle_db(); // db0: 30 listed
+    state.cycle_db(); // db1: 10 listed
+    assert_eq!(state.db_filter, Some(1));
+    app.modal = Some(Modal::PubSub(state));
+    let scroll = |app: &App| match &app.modal {
+        Some(Modal::PubSub(state)) => (state.scroll, state.shown().len()),
+        _ => panic!("feed closed"),
+    };
+    assert_eq!(scroll(&app), (9, 10), "following the newest listed");
+    app.on_key(KeyEvent::from(KeyCode::PageDown));
+    assert_eq!(scroll(&app).0, 9);
+    app.on_key(KeyEvent::from(KeyCode::Home));
+    app.on_key(KeyEvent::from(KeyCode::PageDown));
+    assert_eq!(scroll(&app).0, 9, "clamped to the ten listed");
+    app.on_key(KeyEvent::from(KeyCode::Up));
+    app.on_key(KeyEvent::from(KeyCode::Up));
+    assert_eq!(scroll(&app).0, 7);
+    // More commands for another database do not move a cursor that stopped.
+    if let Some(Modal::PubSub(state)) = &mut app.modal {
+        for _ in 0..50 {
+            state.push_command(line(Some(0), "noise"));
+        }
+    }
+    assert_eq!(scroll(&app), (7, 10));
+    app.on_key(KeyEvent::from(KeyCode::End));
+    assert_eq!(scroll(&app).0, 9);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    terminal.draw(|f| rediscope::ui::draw(f, &mut app)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("db1 only"), "{text}");
+    assert!(text.contains("10 shown"), "{text}");
+    assert!(text.contains("90 total"), "{text}");
+    assert!(!text.contains("noise"), "{text}");
+}
