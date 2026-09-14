@@ -2765,3 +2765,234 @@ async fn expire_keys_later_chunk_lost_reports_what_earlier_chunks_changed() {
     );
     assert_eq!(count(&log, "EXPIRE", None), 257);
 }
+
+// ---- import over scripted servers ---------------------------------------------
+
+/// A standalone server that runs `MULTI` the way Redis does: queued commands
+/// are answered `QUEUED`, and `EXEC` answers with each queued command's reply
+/// from `reply`, which also answers every command outside a transaction.
+fn transactional(log: Log, reply: impl Fn(&[String]) -> String + Send + Sync + 'static) -> Peer {
+    let queued: Arc<Mutex<std::collections::HashMap<usize, Vec<Vec<String>>>>> = Arc::default();
+    Peer::start(move |id, args| {
+        log.lock().unwrap().push((id, args.to_vec()));
+        let mut queued = queued.lock().unwrap();
+        Some(match args[0].to_ascii_uppercase().as_str() {
+            "MULTI" => {
+                queued.insert(id, Vec::new());
+                "+OK\r\n".into()
+            }
+            "EXEC" => {
+                let cmds = queued.remove(&id).unwrap_or_default();
+                let mut out = format!("*{}\r\n", cmds.len());
+                for cmd in &cmds {
+                    out.push_str(&reply(cmd));
+                }
+                out
+            }
+            _ => match queued.get_mut(&id) {
+                Some(q) => {
+                    q.push(args.to_vec());
+                    "+QUEUED\r\n".into()
+                }
+                None => reply(args),
+            },
+        })
+    })
+}
+
+/// Replies like an empty server that accepts every write, with `PEXPIRE`
+/// failing the way Redis fails an expiry time it cannot hold.
+fn expire_fails(args: &[String]) -> String {
+    match args[0].to_ascii_uppercase().as_str() {
+        "PEXPIRE" => "-ERR invalid expire time in 'pexpire' command\r\n".into(),
+        "TYPE" => "+none\r\n".into(),
+        "EXISTS" => ":0\r\n".into(),
+        "DEL" | "RPUSH" | "RENAMENX" => ":1\r\n".into(),
+        _ => "+OK\r\n".into(),
+    }
+}
+
+#[tokio::test]
+async fn import_transaction_that_ran_with_a_failed_command_says_so_and_audits_unknown() {
+    use rediscope::transfer::{Record, Value};
+    let log: Log = Arc::default();
+    let peer = transactional(log.clone(), expire_fails);
+    let mut profile = peer.profile(Deployment::Standalone);
+    profile.name = unique("exec-error", peer.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    let record = Record {
+        key: b"k".to_vec(),
+        ttl_ms: Some(60_000),
+        value: Value::String(b"new".to_vec()),
+    };
+    let e = client
+        .import_records(&[record], true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("invalid expire time"), "{e}");
+    assert!(!e.contains("not changed"), "{e}");
+    assert!(!e.contains("discarded"), "{e}");
+    assert!(
+        e.contains("its old value is gone") && e.contains("without its TTL"),
+        "{e}"
+    );
+    assert_eq!(count(&log, "EXEC", None), 1);
+    assert_eq!(
+        audit_outcomes(&profile.name, "PIPELINE"),
+        vec!["started", "unknown"]
+    );
+}
+
+#[tokio::test]
+async fn import_rename_that_ran_after_a_failed_ttl_does_not_say_the_key_was_unchanged() {
+    use rediscope::transfer::{Record, Value};
+    let log: Log = Arc::default();
+    let peer = transactional(log.clone(), expire_fails);
+    let mut profile = peer.profile(Deployment::Standalone);
+    profile.name = unique("rename-ran", peer.port);
+    let client = Client::connect(profile.clone()).await.unwrap();
+    // Big enough for more than one pipeline, so it is written aside.
+    let record = Record {
+        key: b"big".to_vec(),
+        ttl_ms: Some(60_000),
+        value: Value::List((0..2_000).map(|_| vec![b'v'; 1_000]).collect()),
+    };
+    let e = client
+        .import_records(&[record], true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("invalid expire time"), "{e}");
+    assert!(!e.contains("not changed"), "{e}");
+    assert!(e.contains("without its TTL"), "{e}");
+    assert_eq!(count(&log, "RENAME", None), 1);
+    // The temporary key was renamed away: there is nothing left to delete.
+    assert_eq!(count(&log, "DEL", None), 0);
+    let outcomes = audit_outcomes(&profile.name, "PIPELINE");
+    assert_eq!(outcomes.last().map(String::as_str), Some("unknown"));
+}
+
+#[tokio::test]
+async fn import_without_overwrite_never_writes_over_a_key_created_after_the_check() {
+    use rediscope::transfer::{Record, Value};
+    // The key does not exist when checked, and exists by the time it is written.
+    let log: Log = Arc::default();
+    let peer = transactional(log.clone(), |args| {
+        match args[0].to_ascii_uppercase().as_str() {
+            "TYPE" => "+none\r\n".into(),
+            "EXISTS" => ":0\r\n".into(),
+            // SET ... NX that finds the key: nothing set.
+            "SET" => "$-1\r\n".into(),
+            "RENAMENX" => ":0\r\n".into(),
+            "RPUSH" | "DEL" | "PEXPIRE" => ":1\r\n".into(),
+            _ => "+OK\r\n".into(),
+        }
+    });
+    let client = Client::connect(peer.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+    let string = Record {
+        key: b"s".to_vec(),
+        ttl_ms: Some(60_000),
+        value: Value::String(b"new".to_vec()),
+    };
+    let e = client
+        .import_records(&[string], false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("created by someone else"), "{e}");
+    let sets: Vec<Vec<String>> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, a)| a[0] == "SET")
+        .map(|(_, a)| a.clone())
+        .collect();
+    assert_eq!(sets, [["SET", "s", "new", "NX", "PX", "60000"]]);
+    assert_eq!(count(&log, "PEXPIRE", None), 0);
+
+    let list = Record {
+        key: b"l".to_vec(),
+        ttl_ms: None,
+        value: Value::List(vec![b"a".to_vec()]),
+    };
+    let e = client
+        .import_records(&[list], false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("created by someone else"), "{e}");
+    let log = log.lock().unwrap();
+    let pushed: Vec<&String> = log
+        .iter()
+        .filter(|(_, a)| a[0] == "RPUSH")
+        .map(|(_, a)| &a[1])
+        .collect();
+    assert_eq!(pushed.len(), 1, "{pushed:?}");
+    assert!(
+        pushed[0].starts_with("rediscope:import-tmp:") && pushed[0].ends_with(":l"),
+        "{pushed:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|(_, a)| a[0] == "RENAMENX" && a[1] == *pushed[0] && a[2] == "l")
+    );
+    assert!(log.iter().any(|(_, a)| a[0] == "DEL" && a[1] == *pushed[0]));
+}
+
+#[tokio::test]
+async fn cluster_import_resend_refused_by_an_expired_lease_is_not_audited_denied() {
+    let release = Arc::new(AtomicBool::new(false));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let (wait, once) = (release.clone(), refused.clone());
+    let nodes = TwoNodes::start(move |node, _, args| {
+        if node == 'b'
+            && args[0] == "SET"
+            && args[2] == "1"
+            && once.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            for _ in 0..5000 {
+                if wait.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            return Some(Some("-TRYAGAIN resharding\r\n".into()));
+        }
+        None
+    });
+    let mut production = nodes.profile();
+    production.name = unique("lease-resend", nodes.a.port);
+    production.environment = rediscope::config::Environment::Production;
+    let client = Client::connect(production.clone()).await.unwrap();
+    client.unlock_writes(&production.name).unwrap();
+    let kb = key_on(false, "resend", 0);
+    let file = rediscope::transfer::parse(format!("SET {kb} 1\nSET {kb} 2\n").as_bytes()).unwrap();
+    let import = {
+        let client = client.clone();
+        tokio::spawn(async move { client.import_parsed(&file, false).await })
+    };
+    for _ in 0..2500 {
+        if count(&nodes.b_log, "SET", None) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    client.lock_writes().unwrap();
+    release.store(true, Ordering::SeqCst);
+    let e = tokio::time::timeout(Duration::from_secs(20), import)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("Pipeline partially applied: 1 of 2"), "{e}");
+    assert!(e.contains("not sent again"), "{e}");
+    assert_eq!(count(&nodes.b_log, "SET", Some(&kb)), 2, "nothing resent");
+    assert_eq!(
+        audit_outcomes(&production.name, "PIPELINE"),
+        vec!["started", "unknown"]
+    );
+}

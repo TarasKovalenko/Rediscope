@@ -674,6 +674,18 @@ impl Transport {
         count: usize,
     ) -> RedisResult<Vec<Value>> {
         let (results, spread) = self.pipeline_results(pipeline, offset, count).await?;
+        if pipeline.is_transaction()
+            && let Some((i, e)) = exec_failure(&results)
+        {
+            let total = match results.last() {
+                Some(Ok(Value::Array(replies))) => replies.len(),
+                _ => 0,
+            };
+            return Err(error(format!(
+                "The transaction ran, but command {} of {total} failed and the others were applied: {e}",
+                i + 1
+            )));
+        }
         let writes = pipeline.cmd_iter().any(|c| !read_route(c).0);
         let total = results.len();
         let applied = results.iter().filter(|r| r.is_ok()).count();
@@ -737,10 +749,16 @@ impl Transport {
         let ep = state.default.clone();
         let mut c = self.connection(&mut state, &ep).await?;
         self.guard(!writes)?;
+        let atomic = pipeline.is_transaction();
         let result: RedisResult<Vec<RedisResult<Value>>> = c
             .req_packed_commands(pipeline, offset, count)
             .await
-            .map(|values| values.into_iter().map(Value::extract_error).collect());
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|v| reply_result(v, atomic))
+                    .collect()
+            });
         match &result {
             Ok(results) => {
                 if let Some(e) = results.iter().find_map(|r| r.as_ref().err()) {
@@ -921,6 +939,10 @@ impl Transport {
             .pipeline_results(pipeline, 0, count)
             .await
             .map(|(r, _)| r);
+        let result = match result {
+            Ok(results) if !atomic => Ok(self.partly_applied(results)),
+            other => other,
+        };
         match &result {
             Err(e) => self.audit_outcome(id, "PIPELINE", targets, Some(e), true, false)?,
             Ok(results) if atomic => match results.last() {
@@ -928,20 +950,58 @@ impl Transport {
                 Some(Err(e)) => {
                     self.audit_outcome(id, "PIPELINE", targets, Some(e), false, false)?
                 }
-                Some(Ok(Value::Array(replies)))
-                    if replies.iter().any(|r| matches!(r, Value::ServerError(_))) =>
-                {
+                // A command failed while the rest of the transaction ran.
+                Some(Ok(_)) if exec_failure(results).is_some() => {
                     let e = error("a command in the transaction failed");
                     self.audit_outcome(id, "PIPELINE", targets, Some(&e), true, false)?
                 }
                 _ => self.audit_outcome(id, "PIPELINE", targets, None, true, false)?,
             },
             Ok(results) => {
+                // Every command here was sent, or followed one that was: even
+                // a guard refusal met while resending is not "nothing sent".
+                // `partly_applied` rewrote those, so none reads as denied.
                 let failure = results.iter().find_map(|r| r.as_ref().err());
                 self.audit_outcome(id, "PIPELINE", targets, failure, true, false)?
             }
         }
         result
+    }
+
+    /// A cluster batch in which some commands failed while others ran says
+    /// so in each failure, as `pipeline_inner` does for the whole batch. A
+    /// command the server redirected or refused unrun, and that the guard then
+    /// kept from being sent again, did not run; but the commands around it
+    /// did, so its error must not read as a batch refused before sending.
+    fn partly_applied(&self, results: Vec<RedisResult<Value>>) -> Vec<RedisResult<Value>> {
+        if self.profile.deployment != Deployment::Cluster || results.iter().all(Result::is_ok) {
+            return results;
+        }
+        let total = results.len();
+        let applied = results.iter().filter(|r| r.is_ok()).count();
+        results
+            .into_iter()
+            .map(|r| {
+                r.map_err(|e| {
+                    let head = if applied > 0 {
+                        format!("Pipeline partially applied: {applied} of {total} commands ran")
+                    } else {
+                        "Pipeline failed after it was sent".to_string()
+                    };
+                    if denied(&e) {
+                        error(format!(
+                            "{head}. This command was redirected or refused before it ran, and was not sent again because writes were locked or the write lease expired mid-batch: {e}"
+                        ))
+                    } else if applied > 0 {
+                        error(format!(
+                            "{head}, and no command that may have run was sent again. {e}"
+                        ))
+                    } else {
+                        e
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Record one event for a whole operation that is not a single command,
@@ -1000,6 +1060,31 @@ impl ConnectionLike for Transport {
     fn get_db(&self) -> i64 {
         self.profile.db
     }
+}
+
+/// One pipeline reply as a result. In a transaction only a top-level error
+/// is an error: the reply to `MULTI`, a command refused while queueing, or
+/// `EXECABORT`. `EXEC`'s array is kept whole, so a command that failed while
+/// the rest of the transaction ran is not mistaken for a transaction that
+/// never ran. `extract_error` would turn that array into its first error.
+fn reply_result(value: Value, atomic: bool) -> RedisResult<Value> {
+    match value {
+        Value::ServerError(_) => value.extract_error(),
+        value if atomic => Ok(value),
+        value => value.extract_error(),
+    }
+}
+
+/// The first error inside a transaction's `EXEC` reply, with its position:
+/// a command that failed while the others ran.
+fn exec_failure(results: &[RedisResult<Value>]) -> Option<(usize, RedisError)> {
+    let Some(Ok(Value::Array(replies))) = results.last() else {
+        return None;
+    };
+    replies.iter().enumerate().find_map(|(i, r)| match r {
+        Value::ServerError(_) => r.clone().extract_error().err().map(|e| (i, e)),
+        _ => None,
+    })
 }
 
 fn route_slot(state: &State, slot: Option<u16>) -> Endpoint {

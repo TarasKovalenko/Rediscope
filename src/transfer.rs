@@ -602,9 +602,22 @@ pub fn json_record(entry: &Json) -> Result<Record> {
 /// for a key that does not expire, so it means no expiry here too. Zero or
 /// any other negative number would make the key vanish the moment it is
 /// written, which is never what a file means, so it is refused.
+///
+/// The server adds a TTL to its own clock and refuses a sum that overflows,
+/// and inside a transaction that refusal comes after the value was already
+/// written, leaving the key without an expiry. So a TTL that far ahead is
+/// refused here, with a day to spare for clocks that differ.
 fn checked_ttl(t: i64) -> Result<Option<i64>> {
+    const SPARE_MS: i64 = 24 * 60 * 60 * 1000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let max = i64::MAX.saturating_sub(now_ms).saturating_sub(SPARE_MS);
     match t {
         -1 => Ok(None),
+        t if t > max => bail!(
+            "ttl_ms {t}, which is too far ahead for the server to hold: the expiry time would overflow its clock. Use at most {max}, or -1 or nothing for no expiry"
+        ),
         t if t > 0 => Ok(Some(t)),
         t => bail!(
             "ttl_ms {t}, which would delete the key as it is written; use a positive number of milliseconds, or -1 or nothing for no expiry"
@@ -2453,6 +2466,34 @@ mod tests {
         assert_eq!(listing(), ["out.json"]);
         assert!(PendingFile::create(dir.join("missing").join("out.json")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_ttl_the_server_cannot_hold_is_refused_before_anything_is_sent() {
+        for t in [i64::MAX, i64::MAX - 1_000] {
+            let err = validate(&Record {
+                ttl_ms: Some(t),
+                ..record(Value::String(b"v".to_vec()))
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(&format!("ttl_ms {t}")), "{err}");
+            assert!(err.contains("too far ahead"), "{err}");
+        }
+        // Far ahead, but still a time the server can hold.
+        for t in [1, 3_155_760_000_000, i64::MAX / 2] {
+            validate(&Record {
+                ttl_ms: Some(t),
+                ..record(Value::String(b"v".to_vec()))
+            })
+            .unwrap();
+        }
+        let line = format!(
+            r#"{{"key":"k","type":"string","ttl_ms":{},"value":"v"}}"#,
+            i64::MAX
+        );
+        let err = parse(line.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("too far ahead"), "{err}");
     }
 
     #[cfg(unix)]

@@ -799,7 +799,13 @@ it can hold secrets. Loosen it yourself if others need to read it.
 **Importing.** The format is read from the file's content. A `dump` file is
 restored with `RESTORE`, as before. For the other formats, without overwrite a
 key that already exists stops the import with an error naming it, and with
-overwrite the key is replaced.
+overwrite the key is replaced. Without overwrite the write never depends on the
+key still being absent after that check, since another client can create it in
+between: a string is written with `SET ... NX`, and any other type under a
+temporary name moved into place with `RENAMENX`, so a key created in the
+meantime is left as it is and the import stops with an error. A TTL so far
+ahead that the server's expiry time would overflow is refused with the other
+checks below.
 
 Before anything is written, every entry is checked for what the server would
 refuse halfway through a key: a score or sample that is not a number, vectors of
@@ -807,14 +813,23 @@ different lengths in one set, stream ids that do not grow, two samples at one
 timestamp. The server is also asked whether it has the commands each type needs,
 so a file with a JSON document is refused whole on a server without RedisJSON.
 Then each key is written so that a failure leaves the existing key as it was.
-A key that fits one pipeline (256 commands, about 1 MB) goes out as one `MULTI`
-transaction. A bigger one is written in pipelines of that size under a
-temporary name, `key:rediscope-import-…`, and renamed over the key at the end,
-so readers see the old value until the new one is complete. On a cluster, which
-runs no transactions, every key takes a temporary name, and one without a hash
-tag gets a tag in front, `{n}key:rediscope-import-…`, that puts it in the key's
-own slot. If a transaction runs but one of its commands fails, which the
-checks above make unlikely, the error says the key is partly written.
+With overwrite, a key that fits one pipeline (256 commands, about 1 MB) goes out
+as one `MULTI` transaction. A bigger one is written in pipelines of that size
+under a temporary name, `rediscope:import-tmp:<pid>-<n>:key`, and renamed over
+the key at the end, so readers see the old value until the new one is complete.
+On a cluster, which runs no transactions, every key takes a temporary name, and
+one without a hash tag gets a tag after the prefix,
+`rediscope:import-tmp:{n}<pid>-<n>:key`, that puts it in the key's own slot. If
+a transaction runs but one of its commands fails, which the checks above make
+unlikely, the error says so and what it left: a key partly written, or the new
+value in place without its TTL.
+
+A failed import deletes its temporary key. One that is killed before its
+rename (a crash, a lost connection) leaves it behind, and every such key
+starts with `rediscope:import-tmp:`, so `SCAN 0 MATCH rediscope:import-tmp:*`
+finds them to delete. The temporary path needs `RENAME` or `RENAMENX` on the
+target: an ACL user without them gets an error saying the key was not changed,
+and cannot import big keys, or any key other than a string without overwrite.
 
 A commands file runs as written, and the overwrite switch does not change it.
 It may only hold commands that write data into a key (`SET`, `HSET`, `RPUSH`,
@@ -1140,7 +1155,10 @@ unrecognised is logged as `OTHER_COMMAND`, so user input can never become a log
 field. `target_key_count` is how many keys the command was aimed at, not a claim
 that they all changed, and is absent when that cannot be known (`FLUSHDB`, an
 arbitrary script). An export, in any format, is one `EXPORT` operation whose
-count is the number of keys asked for. Every operation writes an intent line before it is dispatched
+count is the number of keys asked for. A batch of writes is one `PIPELINE`
+operation. It is `denied` only when nothing in it was sent, and `unknown` when
+it may have run in part, including a transaction in which one command failed
+while the others ran. Every operation writes an intent line before it is dispatched
 and a completion line afterwards, sharing one `operation_id`; `outcome` is
 `success`, `failure`, `denied`, or `unknown` when the reply was lost and the
 operation must not be retried blindly.

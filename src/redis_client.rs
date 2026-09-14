@@ -45,6 +45,9 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const HEX_DUMP_LIMIT: usize = 4_096;
 /// Most decoded text one value read may produce, across all of its elements.
 const DECODE_BUDGET: usize = 64 * 1024 * 1024;
+/// How every temporary key an import writes starts. An import that is killed
+/// before its rename leaves such a key behind, and this is how to find it.
+pub const IMPORT_TEMP_PREFIX: &str = "rediscope:import-tmp:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
@@ -3000,18 +3003,27 @@ return 1
     /// Every record is checked before anything is sent, and so is the
     /// server's support for each type's commands, so a file the target cannot
     /// hold fails whole. Then each key is written so a failure leaves the
-    /// existing key as it was: a key whose commands fit one bounded pipeline
-    /// goes out as one `MULTI` transaction, and a bigger one is written in
-    /// bounded pipelines under a temporary name in the same slot and renamed
-    /// into place at the end. A cluster runs no transactions, so there every
-    /// key takes the temporary name. Only when no such name can be found is a
-    /// key written in place, and a failure then says it is partly written.
+    /// existing key as it was. With `replace`, a key whose commands fit one
+    /// bounded pipeline goes out as one `MULTI` transaction, and a bigger one
+    /// is written in bounded pipelines under a temporary name in the same slot
+    /// and renamed into place at the end. A cluster runs no transactions, so
+    /// there every key takes the temporary name. Only when no such name can
+    /// be found is a key written in place, and a failure then says it is
+    /// partly written.
+    ///
+    /// Without `replace` the key is checked first, for a clear error, but the
+    /// write itself must not depend on that check still being true: another
+    /// client can create the key in between. `WATCH` cannot guard it, because
+    /// the connection is shared and multiplexed, so another caller's `EXEC`
+    /// or `UNWATCH` on it would silently drop the watch. So the write is
+    /// conditional on the server: a string is one `SET ... NX`, and anything
+    /// else is written under a temporary name and moved with `RENAMENX`.
     pub async fn import_records(
         &self,
         records: &[crate::transfer::Record],
         replace: bool,
     ) -> Result<ImportReport> {
-        use crate::transfer::{pipeline_chunks, validate, write_commands};
+        use crate::transfer::{Value, pipeline_chunks, validate, write_commands};
         for (i, record) in records.iter().enumerate() {
             validate(record)
                 .map_err(|e| anyhow!("entry {}: {e}, so nothing was imported", i + 1))?;
@@ -3039,14 +3051,23 @@ return 1
                     report.keys
                 );
             }
-            let sent = writes.len() + usize::from(replace) + usize::from(record.ttl_ms.is_some());
-            let result = if !cluster && pipeline_chunks(&writes).len() == 1 {
-                self.import_in_transaction(record, writes, replace).await
-            } else {
-                match self.temporary_name(&record.key).await? {
-                    Some(temp) => self.import_through(record, &temp, replace).await,
-                    None => self.import_in_place(record, writes, replace).await,
+            let mut sent =
+                writes.len() + usize::from(replace) + usize::from(record.ttl_ms.is_some());
+            let result = match &record.value {
+                Value::String(bytes) if !replace => {
+                    sent = 1;
+                    self.import_string_if_absent(record, bytes).await
                 }
+                _ if replace && !cluster && pipeline_chunks(&writes).len() == 1 => {
+                    self.import_in_transaction(record, writes, replace).await
+                }
+                _ => match self.temporary_name(&record.key).await? {
+                    Some(temp) => self.import_through(record, &temp, replace).await,
+                    None if replace => self.import_in_place(record, writes, replace).await,
+                    None => Err(anyhow!(
+                        "no unused temporary name was found to write it under, so nothing was written"
+                    )),
+                },
             };
             result.map_err(|e| {
                 anyhow!(
@@ -3058,6 +3079,30 @@ return 1
             report.commands += sent as u64;
         }
         Ok(report)
+    }
+
+    /// A string that must not replace a key: `SET ... NX`, with the TTL in
+    /// the same command, so a key someone else created is never touched.
+    async fn import_string_if_absent(
+        &self,
+        record: &crate::transfer::Record,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut pipe = redis::pipe();
+        let cmd = pipe.cmd("SET").arg(&record.key).arg(bytes).arg("NX");
+        if let Some(ttl) = record.ttl_ms {
+            cmd.arg("PX").arg(ttl.max(1));
+        }
+        let results = self.mgr.pipeline_each(&pipe).await?;
+        match results.into_iter().next() {
+            Some(Ok(redis::Value::Nil)) => Err(anyhow!(
+                "the key was created by someone else while it was being imported, and was left as it is"
+            )),
+            Some(Ok(_)) => Ok(()),
+            // A refused SET sets nothing.
+            Some(Err(e)) => Err(anyhow!("{e}; the key was not changed")),
+            None => Err(anyhow!("the server did not answer the write")),
+        }
     }
 
     /// Refuse, before anything is written, a file holding a type whose
@@ -3134,6 +3179,11 @@ return 1
         }
         let results = self.mgr.pipeline_each(&pipe).await?;
         let queued = &results[1..results.len().saturating_sub(1)];
+        let old = if replace {
+            " and its old value is gone"
+        } else {
+            ""
+        };
         match results.last() {
             Some(Err(e)) => {
                 let why = queued
@@ -3151,15 +3201,16 @@ return 1
                     .find_map(|(i, r)| Some((i, nested_error(r)?)))
                 {
                     None => Ok(()),
+                    // Only the TTL failed: the whole value is there.
+                    Some((i, why)) if record.ttl_ms.is_some() && i + 1 == replies.len() => {
+                        Err(anyhow!(
+                            "setting its TTL failed: {why}; the rest of the transaction ran, so the new value was written without its TTL{old}"
+                        ))
+                    }
                     Some((i, why)) => Err(anyhow!(
-                        "command {} of {} failed: {why}; the rest of the transaction ran, so the key is partly written{}",
+                        "command {} of {} failed: {why}; the rest of the transaction ran, so the key is partly written{old}",
                         i + 1,
                         replies.len(),
-                        if replace {
-                            " and its old value is gone"
-                        } else {
-                            ""
-                        }
                     )),
                 }
             }
@@ -3171,27 +3222,35 @@ return 1
     }
 
     /// A name for writing `key` out of sight: unused, and on a cluster in the
-    /// same slot, so `RENAME` can move it into place. It starts with the key
-    /// itself, and on a cluster a key without a hash tag gets one in front,
-    /// chosen to hash to the key's slot. `None` when no unused name turns up.
+    /// same slot, so `RENAME` can move it into place. Every such name starts
+    /// with [`IMPORT_TEMP_PREFIX`], so one left behind by a crash is easy to
+    /// find, and ends with the key itself. On a cluster a key without a hash
+    /// tag gets one right after the prefix, chosen to hash to the key's slot;
+    /// a key with a tag keeps it as the name's first. `None` when no unused
+    /// name turns up.
     async fn temporary_name(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static TEMP: AtomicU64 = AtomicU64::new(0);
         let cluster = self.mgr.deployment() == Deployment::Cluster;
         let mut c = self.mgr.clone();
         for _ in 0..3 {
-            let suffix = format!(
-                ":rediscope-import-{}-{}",
+            let unique = format!(
+                "{}-{}:",
                 std::process::id(),
                 TEMP.fetch_add(1, Ordering::Relaxed)
             );
-            let name = if cluster && topology::hash_tag(key).is_none() {
-                let tag = topology::slot_tags()[usize::from(key_slot(key))];
-                [format!("{{{tag}}}").as_bytes(), key, suffix.as_bytes()].concat()
+            let tag = if cluster && topology::hash_tag(key).is_none() {
+                format!("{{{}}}", topology::slot_tags()[usize::from(key_slot(key))])
             } else {
-                // The key's own hash tag, if any, stays the first one.
-                [key, suffix.as_bytes()].concat()
+                String::new()
             };
+            let name = [
+                IMPORT_TEMP_PREFIX.as_bytes(),
+                tag.as_bytes(),
+                unique.as_bytes(),
+                key,
+            ]
+            .concat();
             if cluster && key_slot(&name) != key_slot(key) {
                 return Ok(None);
             }
@@ -3239,7 +3298,7 @@ return 1
             .arg(temp)
             .arg(&record.key);
         let results = match self.mgr.pipeline_each(&pipe).await {
-            Ok(results) => Ok(results),
+            Ok(results) => results,
             // Refused, or lost on the way: the rename may not have run.
             Err(e) => {
                 return Err(anyhow!(
@@ -3248,22 +3307,64 @@ return 1
                 ));
             }
         };
-        // The rename's own reply, which a transaction wraps in EXEC's.
-        let renamed = match results.as_ref().ok().and_then(|r| r.last()) {
-            Some(Ok(redis::Value::Array(replies))) if !cluster => replies.last().cloned(),
-            Some(Ok(reply)) => Some(reply.clone()),
-            _ => None,
+        // Each command's own reply: a transaction wraps them in EXEC's, and
+        // an error outside that array means none of them ran.
+        let replies: Vec<redis::RedisResult<redis::Value>> = if cluster {
+            results
+        } else {
+            match results.last() {
+                Some(Ok(redis::Value::Array(replies))) => replies
+                    .iter()
+                    .map(|r| match r {
+                        redis::Value::ServerError(_) => r.clone().extract_error(),
+                        r => Ok(r.clone()),
+                    })
+                    .collect(),
+                _ => {
+                    let why = batch_failure(Ok(results))
+                        .unwrap_or_else(|| "the server aborted the transaction".into());
+                    return Err(anyhow!(
+                        "{why}; the key was not changed{}",
+                        self.drop_temporary(temp).await
+                    ));
+                }
+            }
         };
-        if let Some(why) = batch_failure(results) {
+        let (ttl, renamed) = match replies.as_slice() {
+            [ttl, renamed] if record.ttl_ms.is_some() => (Some(ttl), renamed),
+            [renamed] if record.ttl_ms.is_none() => (None, renamed),
+            _ => {
+                return Err(anyhow!(
+                    "the server's reply to the rename did not have the expected shape, so whether the key changed is unknown; the temporary key '{}' may be left to delete",
+                    encode_key(temp)
+                ));
+            }
+        };
+        let why = |r: &redis::RedisResult<redis::Value>| match r {
+            Err(e) => Some(e.to_string()),
+            Ok(v) => nested_error(v),
+        };
+        // A rename that failed moved nothing, whatever happened to the TTL.
+        if let Some(why) = why(renamed) {
             return Err(anyhow!(
                 "{why}; the key was not changed{}",
                 self.drop_temporary(temp).await
             ));
         }
-        if !replace && matches!(renamed, Some(redis::Value::Int(0))) {
+        if !replace && matches!(renamed, Ok(redis::Value::Int(0))) {
             return Err(anyhow!(
                 "the key was created by someone else while it was being imported, and was left as it is{}",
                 self.drop_temporary(temp).await
+            ));
+        }
+        if let Some(why) = ttl.and_then(why) {
+            return Err(anyhow!(
+                "setting its TTL failed: {why}; the rename ran, so the new value is in place without its TTL{}",
+                if replace {
+                    " and its old value is gone"
+                } else {
+                    ""
+                }
             ));
         }
         Ok(())
