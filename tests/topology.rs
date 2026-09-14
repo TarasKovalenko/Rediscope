@@ -3096,3 +3096,165 @@ async fn production_cluster_monitor_prompt_names_the_primaries_it_will_slow() {
     assert!(message.contains("2 of them"), "{message}");
     assert!(message.contains("throughput"), "{message}");
 }
+
+// ---- concurrency: one slow node does not hold up the others ---------------
+
+/// Wait, bounded, until `log` has seen `head`.
+async fn until_seen(log: &Log, head: &str) {
+    for _ in 0..500 {
+        if count(log, head, None) > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("{head} never arrived");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_hanging_on_one_node_does_not_block_a_read_on_another() {
+    let nodes = TwoNodes::start(|node, _, args| {
+        (node == 'b' && args[0] == "GET").then(|| {
+            thread::sleep(Duration::from_secs(3));
+            Some(bulk("slow"))
+        })
+    });
+    let client = nodes.client().await;
+    let (ka, kb) = (key_on(true, "hang", 0), key_on(false, "hang", 0));
+    let slow = client.clone();
+    let hung = tokio::spawn(async move { slow.execute_raw(&format!("GET {kb}")).await });
+    until_seen(&nodes.b_log, "GET").await;
+    let healthy = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.execute_raw(&format!("GET {ka}")),
+    )
+    .await
+    .expect("the healthy node's read waited for the hung one");
+    assert!(healthy.is_ok(), "{healthy:?}");
+    assert!(
+        !hung.is_finished(),
+        "the slow read was meant to still be running"
+    );
+    assert!(hung.await.unwrap().unwrap().contains("slow"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_hanging_on_one_node_does_not_block_reads_or_writes_elsewhere() {
+    let nodes = TwoNodes::start(|node, _, args| {
+        (node == 'b' && args[0] == "UNLINK").then(|| {
+            thread::sleep(Duration::from_secs(3));
+            Some(":1\r\n".into())
+        })
+    });
+    let client = nodes.client().await;
+    let (ka, kb) = (key_on(true, "batch", 0), key_on(false, "batch", 0));
+    let slow = client.clone();
+    let hung = tokio::spawn(async move { slow.delete_keys(&[kb]).await });
+    until_seen(&nodes.b_log, "UNLINK").await;
+    let healthy = tokio::time::timeout(Duration::from_secs(1), async {
+        client.execute_raw(&format!("GET {ka}")).await?;
+        client.set_string(&ka, "v").await
+    })
+    .await
+    .expect("the healthy node waited for the hung batch");
+    assert!(healthy.is_ok(), "{healthy:?}");
+    assert!(!hung.is_finished());
+    assert_eq!(hung.await.unwrap().unwrap(), 1);
+    assert_eq!(count(&nodes.a_log, "SET", Some(&ka)), 1);
+}
+
+/// Two primaries split like `TwoNodes`. The seed `a` answers `CLUSTER SLOTS`
+/// after `delay` once `slow` is set, and counts how often it was asked; `b`
+/// answers everything at once.
+struct SlowDiscovery {
+    a: Peer,
+    b: Peer,
+    slow: Arc<AtomicBool>,
+    asked: Arc<AtomicUsize>,
+}
+impl SlowDiscovery {
+    fn start(delay: Duration) -> Self {
+        let ports = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let slow = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let table = |ports: &[AtomicUsize; 2]| {
+            slots(&[
+                (0, 8191, ports[0].load(Ordering::SeqCst) as u16),
+                (8192, 16383, ports[1].load(Ordering::SeqCst) as u16),
+            ])
+        };
+        let (own, slowed, asks) = (ports.clone(), slow.clone(), asked.clone());
+        let a = Peer::start(move |_, args| match args[0].as_str() {
+            "CLUSTER" => {
+                asks.fetch_add(1, Ordering::SeqCst);
+                if slowed.load(Ordering::SeqCst) {
+                    thread::sleep(delay);
+                }
+                Some(table(&own))
+            }
+            _ => Some("+OK\r\n".into()),
+        });
+        let own = ports.clone();
+        let b = Peer::start(move |_, args| match args[0].as_str() {
+            "CLUSTER" => Some(table(&own)),
+            "GET" => Some(bulk("fast")),
+            _ => Some("+OK\r\n".into()),
+        });
+        ports[0].store(a.port as usize, Ordering::SeqCst);
+        ports[1].store(b.port as usize, Ordering::SeqCst);
+        Self { a, b, slow, asked }
+    }
+    async fn client(&self) -> Client {
+        Client::connect(self.a.profile(Deployment::Cluster))
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_callers_share_one_discovery() {
+    let nodes = SlowDiscovery::start(Duration::from_millis(400));
+    let client = nodes.client().await;
+    nodes.slow.store(true, Ordering::SeqCst);
+    let before = nodes.asked.load(Ordering::SeqCst);
+    let callers: Vec<_> = (0..8)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.refresh_topology().await })
+        })
+        .collect();
+    for caller in callers {
+        let found = caller.await.unwrap().unwrap();
+        assert_eq!(found.len(), 2);
+    }
+    assert_eq!(
+        nodes.asked.load(Ordering::SeqCst) - before,
+        1,
+        "every caller ran a discovery of its own"
+    );
+    // A caller after that one finished asks again.
+    client.refresh_topology().await.unwrap();
+    assert_eq!(nodes.asked.load(Ordering::SeqCst) - before, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_discovery_does_not_block_requests_to_other_nodes() {
+    let nodes = SlowDiscovery::start(Duration::from_secs(3));
+    let client = nodes.client().await;
+    let kb = key_on(false, "during-discovery", 0);
+    nodes.slow.store(true, Ordering::SeqCst);
+    let refreshing = client.clone();
+    let discovery = tokio::spawn(async move { refreshing.refresh_topology().await });
+    while nodes.asked.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let read = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.execute_raw(&format!("GET {kb}")),
+    )
+    .await
+    .expect("a read waited for discovery");
+    assert!(read.unwrap().contains("fast"));
+    assert!(!discovery.is_finished());
+    discovery.await.unwrap().unwrap();
+    let _ = &nodes.b;
+}

@@ -769,6 +769,9 @@ diagnostic endpoint; the browser's total key count sums all primaries.
 Topology also refreshes on redirects, recoverable connection failures, and the
 next command after 30 seconds. Sentinel discovery verifies `ROLE master` and
 repeats discovery after connection loss. Reads use bounded retries and backoff.
+A node that stops answering only holds up the commands sent to it; reads and
+writes for other nodes carry on, and callers that need a fresh topology at
+the same moment share a single discovery.
 A write is sent again only when the server proves it never ran: a `MOVED` or
 `ASK` redirect, or a refusal such as `READONLY` from a primary demoted during
 failover, `TRYAGAIN` mid-migration, `CLUSTERDOWN` or `LOADING`. A single

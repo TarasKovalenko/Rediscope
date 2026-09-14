@@ -6,10 +6,9 @@ use crate::config::Deployment;
 use redis::{Cmd, RedisError, RedisFuture, RedisResult, Value, aio::ConnectionLike};
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
 
 type Endpoint = (String, u16);
 
@@ -27,22 +26,47 @@ impl Node {
     }
 }
 
+/// Shared routing state and the network calls made with it.
+///
+/// The state lock is a plain mutex and is never held across an `.await`, so a
+/// request to a node that hangs cannot hold up requests to the others. Each
+/// call copies what it needs out of the state (a socket, the routing table),
+/// releases it, talks to the network, then takes it again to record what it
+/// learned. Discovery is the one thing callers wait on each other for: it runs
+/// one at a time, and a caller that arrives while one is running takes its
+/// result instead of starting another.
 #[derive(Clone)]
 pub(super) struct Transport {
     profile: Connection,
     safety: crate::safety::Safety,
     audit: crate::audit::Audit,
     state: Arc<Mutex<State>>,
+    /// Held for as long as one discovery runs.
+    discovery: Arc<tokio::sync::Mutex<()>>,
     /// Primaries the last discovery found, readable without the lock.
     primary_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 struct State {
     clients: HashMap<Endpoint, redis::Client>,
-    sockets: HashMap<Endpoint, MultiplexedConnection>,
+    sockets: HashMap<Endpoint, Socket>,
     nodes: Vec<Node>,
     default: Endpoint,
     refreshed: Instant,
     warning: Option<String>,
+    /// Sockets opened so far; the latest one's number is its id.
+    opened: u64,
+    /// Discoveries finished so far, and how the last one went. A caller that
+    /// sees this move while it waited uses that result rather than asking
+    /// again.
+    discovered: u64,
+    last_discovery: RedisResult<()>,
+}
+/// A cached multiplexed connection. The id lets a caller whose request failed
+/// on it drop exactly that socket, not a newer one another caller opened.
+#[derive(Clone)]
+struct Socket {
+    id: u64,
+    conn: MultiplexedConnection,
 }
 /// The guard's refusals. Audit events match them exactly, by kind and text,
 /// so no server reply or script error can pass for one.
@@ -98,7 +122,11 @@ impl Transport {
                 default,
                 refreshed: Instant::now(),
                 warning: None,
+                opened: 0,
+                discovered: 0,
+                last_discovery: Ok(()),
             })),
+            discovery: Arc::default(),
             primary_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         };
         let result = this.refresh().await;
@@ -110,6 +138,14 @@ impl Transport {
         )?;
         result?;
         Ok(this)
+    }
+
+    /// The shared state, for a lookup or an update. Never held across an
+    /// `.await`: the guard is not `Send`, so the compiler refuses that.
+    fn state(&self) -> MutexGuard<'_, State> {
+        // Nothing panics while holding the lock, but a poisoned one must not
+        // take every later request down with it.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn read_only(&self) -> bool {
@@ -175,46 +211,90 @@ impl Transport {
         })
     }
 
-    async fn connection(
-        &self,
-        state: &mut State,
-        ep: &Endpoint,
-    ) -> RedisResult<MultiplexedConnection> {
-        if let Some(c) = state.sockets.get(ep) {
-            return Ok(c.clone());
+    /// The cached socket for `ep`, or a new one. Two callers connecting at
+    /// once both open one; the first to finish is kept and shared.
+    async fn connection(&self, ep: &Endpoint) -> RedisResult<Socket> {
+        if let Some(socket) = self.state().sockets.get(ep) {
+            return Ok(socket.clone());
         }
-        if !state.clients.contains_key(ep) {
-            let mut profile = self.profile.clone();
-            profile.host = ep.0.clone();
-            profile.port = ep.1;
-            let raw = build_client(&profile, None)
-                .await
-                .map_err(|e| error(e.to_string()))?;
-            state.clients.insert(ep.clone(), raw);
+        let client = self.node_client(ep).await?;
+        let conn = socket(&client).await?;
+        let mut state = self.state();
+        if let Some(socket) = state.sockets.get(ep) {
+            return Ok(socket.clone());
         }
-        let c = socket(&state.clients[ep]).await?;
-        state.sockets.insert(ep.clone(), c.clone());
-        Ok(c)
+        state.opened += 1;
+        let socket = Socket {
+            id: state.opened,
+            conn,
+        };
+        state.sockets.insert(ep.clone(), socket.clone());
+        Ok(socket)
     }
 
-    async fn discover(&self, state: &mut State) -> RedisResult<()> {
+    /// Drop the cached socket for `ep` after a failure. With `used`, only
+    /// if it is still the socket that failed.
+    fn forget(&self, ep: &Endpoint, used: Option<u64>) {
+        let mut state = self.state();
+        if used.is_none_or(|id| state.sockets.get(ep).is_some_and(|s| s.id == id)) {
+            state.sockets.remove(ep);
+        }
+    }
+
+    /// Discover the topology, or wait for the discovery already running and
+    /// take its result. Discoveries run one at a time, so a result can only
+    /// ever be replaced by one that started after it.
+    async fn discover(&self) -> RedisResult<()> {
+        let seen = self.state().discovered;
+        let _running = self.discovery.lock().await;
+        {
+            let state = self.state();
+            if state.discovered != seen {
+                return state.last_discovery.clone();
+            }
+        }
         // A long seed list cannot leave a caller waiting indefinitely.
-        tokio::time::timeout(Duration::from_secs(10), self.discover_inner(state))
+        let result = tokio::time::timeout(Duration::from_secs(10), self.discover_inner())
             .await
-            .map_err(|_| error("Topology discovery timed out"))?
+            .unwrap_or_else(|_| Err(error("Topology discovery timed out")));
+        let mut state = self.state();
+        if let Ok(Some((nodes, default))) = &result {
+            let primaries = nodes.iter().filter(|n| n.primary).count();
+            self.primary_count
+                .store(primaries.max(1), std::sync::atomic::Ordering::Relaxed);
+            state.default = default.clone();
+            state.nodes = nodes.clone();
+            state.refreshed = Instant::now();
+            state.warning = None;
+        }
+        let result = result.map(|_| ());
+        state.discovered += 1;
+        state.last_discovery = result.clone();
+        result
     }
 
-    async fn discover_inner(&self, state: &mut State) -> RedisResult<()> {
+    /// Discover, and keep a failure as the topology warning.
+    async fn rediscover(&self) -> RedisResult<()> {
+        let result = self.discover().await;
+        if let Err(e) = &result {
+            self.state().warning = Some(e.to_string());
+        }
+        result
+    }
+
+    /// The nodes and the default endpoint, for everything but a standalone
+    /// profile, which only checks that its server answers.
+    async fn discover_inner(&self) -> RedisResult<Option<(Vec<Node>, Endpoint)>> {
         if self.profile.deployment == Deployment::Standalone {
-            let ep = state.default.clone();
-            let mut c = self.connection(state, &ep).await?;
+            let ep = self.state().default.clone();
+            let mut c = self.connection(&ep).await?.conn;
             redis::cmd("PING").query_async::<()>(&mut c).await?;
-            return Ok(());
+            return Ok(None);
         }
         let mut seeds = vec![(self.profile.host.clone(), self.profile.port)];
         seeds.extend(self.profile.seeds.iter().filter_map(|s| endpoint(s).ok()));
         if self.profile.deployment == Deployment::Cluster {
-            seeds.extend(state.nodes.iter().map(Node::endpoint));
+            seeds.extend(self.state().nodes.iter().map(Node::endpoint));
         }
         let mut failures = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -222,6 +302,7 @@ impl Transport {
             if !visited.insert(ep.clone()) {
                 continue;
             }
+            let mut used = None;
             let result: RedisResult<Vec<Node>> = async {
                 if self.profile.deployment == Deployment::Sentinel {
                     let mut sentinel = self.profile.clone();
@@ -243,8 +324,8 @@ impl Transport {
                     let address =
                         address.ok_or_else(|| error("Sentinel does not know this service"))?;
                     // Always establish a fresh socket on rediscovery and verify the role.
-                    state.sockets.remove(&address);
-                    let mut primary = self.connection(state, &address).await?;
+                    self.forget(&address, None);
+                    let mut primary = self.connection(&address).await?.conn;
                     let role: Vec<Value> = redis::cmd("ROLE").query_async(&mut primary).await?;
                     if role.first().map(scalar).as_deref() != Some("master") {
                         return Err(error("Sentinel candidate is not a primary"));
@@ -257,7 +338,9 @@ impl Transport {
                         slots: vec![],
                     }])
                 } else {
-                    let mut c = self.connection(state, &ep).await?;
+                    let socket = self.connection(&ep).await?;
+                    used = Some(socket.id);
+                    let mut c = socket.conn;
                     let reply: Value = redis::cmd("CLUSTER")
                         .arg("SLOTS")
                         .query_async(&mut c)
@@ -268,23 +351,17 @@ impl Transport {
             .await;
             match result {
                 Ok(nodes) if !nodes.is_empty() => {
-                    state.default = nodes
+                    let default = nodes
                         .iter()
                         .find(|n| n.primary && n.endpoint() == ep)
                         .or_else(|| nodes.iter().find(|n| n.primary))
                         .ok_or_else(|| error("No primary discovered"))?
                         .endpoint();
-                    let primaries = nodes.iter().filter(|n| n.primary).count();
-                    self.primary_count
-                        .store(primaries.max(1), std::sync::atomic::Ordering::Relaxed);
-                    state.nodes = nodes;
-                    state.refreshed = Instant::now();
-                    state.warning = None;
-                    return Ok(());
+                    return Ok(Some((nodes, default)));
                 }
                 Ok(_) => failures.push(format!("{}:{}: empty topology", ep.0, ep.1)),
                 Err(e) => {
-                    state.sockets.remove(&ep);
+                    self.forget(&ep, used);
                     failures.push(format!("{}:{}: {e}", ep.0, ep.1));
                 }
             }
@@ -295,29 +372,67 @@ impl Transport {
     /// Rediscover when the topology is older than 30 seconds. Only a Sentinel
     /// failure is an error: its primary may have moved, and a stale address
     /// must never be written to. A cluster keeps routing on what it knows.
-    async fn refresh_if_stale(&self, state: &mut State) -> RedisResult<()> {
+    async fn refresh_if_stale(&self) -> RedisResult<()> {
         if self.profile.deployment == Deployment::Standalone
-            || state.refreshed.elapsed() < Duration::from_secs(30)
+            || self.state().refreshed.elapsed() < Duration::from_secs(30)
         {
             return Ok(());
         }
-        if let Err(e) = self.discover(state).await {
-            state.warning = Some(e.to_string());
-            if self.profile.deployment == Deployment::Sentinel {
-                return Err(e);
-            }
+        if let Err(e) = self.rediscover().await
+            && self.profile.deployment == Deployment::Sentinel
+        {
+            return Err(e);
         }
         Ok(())
+    }
+
+    /// Where a command for `slot` goes, by the topology as it is now.
+    fn route(&self, slot: Option<u16>) -> Endpoint {
+        route_slot(&self.state(), slot)
+    }
+
+    /// Record a `MOVED`: it is authoritative for its slot even when discovery
+    /// is unavailable.
+    fn moved(&self, slot: u16, target: &Endpoint) {
+        let mut state = self.state();
+        for n in &mut state.nodes {
+            let mut ranges = Vec::new();
+            for &(a, b) in &n.slots {
+                if slot < a || slot > b {
+                    ranges.push((a, b));
+                } else {
+                    if a < slot {
+                        ranges.push((a, slot - 1));
+                    }
+                    if slot < b {
+                        ranges.push((slot + 1, b));
+                    }
+                }
+            }
+            n.slots = ranges;
+        }
+        if let Some(n) = state.nodes.iter_mut().find(|n| n.endpoint() == *target) {
+            n.primary = true;
+            n.slots.push((slot, slot));
+        } else {
+            state.nodes.push(Node {
+                id: "MOVED".into(),
+                host: target.0.clone(),
+                port: target.1,
+                primary: true,
+                slots: vec![(slot, slot)],
+            });
+        }
     }
 
     /// The slot a command must be sent to on a cluster, or `None` when it has
     /// no keys and can go to any primary. Refuses, before anything is sent,
     /// keys in different slots and keyless writes that would silently touch
     /// only one primary of many.
-    async fn cluster_slot(&self, state: &mut State, cmd: &Cmd) -> RedisResult<Option<u16>> {
+    async fn cluster_slot(&self, cmd: &Cmd) -> RedisResult<Option<u16>> {
         let keys = match command_keys(cmd) {
             Keys::Known(keys) => keys,
-            Keys::Unknown => self.server_keys(state, cmd).await?,
+            Keys::Unknown => self.server_keys(cmd).await?,
         };
         let Some(first) = keys.first() else {
             if !read_route(cmd).0 && !keyless_on_any_node(cmd) {
@@ -339,15 +454,16 @@ impl Transport {
 
     /// Ask the server which arguments are keys, for a command the local
     /// table does not know: a module command, or a newer one.
-    async fn server_keys(&self, state: &mut State, cmd: &Cmd) -> RedisResult<Vec<Vec<u8>>> {
+    async fn server_keys(&self, cmd: &Cmd) -> RedisResult<Vec<Vec<u8>>> {
         let mut probe = redis::cmd("COMMAND");
         probe.arg("GETKEYS");
         // The connect below can fail without anything being sent.
         for arg in simple_args(cmd) {
             probe.arg(arg);
         }
-        let ep = state.default.clone();
-        let mut c = self.connection(state, &ep).await?;
+        let ep = self.state().default.clone();
+        let socket = self.connection(&ep).await?;
+        let mut c = socket.conn;
         match c
             .req_packed_command(&probe)
             .await
@@ -362,10 +478,8 @@ impl Transport {
                 Ok(Vec::new())
             }
             Err(e) if e.is_io_error() => {
-                state.sockets.remove(&ep);
-                if let Err(refresh) = self.discover(state).await {
-                    state.warning = Some(refresh.to_string());
-                }
+                self.forget(&ep, Some(socket.id));
+                let _ = self.rediscover().await;
                 Err(error(format!(
                     "Cannot look up the keys of {} on {}:{}; nothing was sent, and the topology was refreshed, so try again: {e}",
                     command_name(cmd),
@@ -381,23 +495,17 @@ impl Transport {
     }
 
     pub async fn refresh(&self) -> RedisResult<()> {
-        let mut state = self.state.lock().await;
-        let result = self.discover(&mut state).await;
-        if let Err(e) = &result {
-            state.warning = Some(e.to_string());
-        }
-        result
+        self.rediscover().await
     }
     /// Where keyless commands go: the node diagnostics describe. Refreshed
     /// first when stale; if that refresh fails, the last known node is used.
     pub async fn default_endpoint(&self) -> Endpoint {
-        let mut state = self.state.lock().await;
-        let _ = self.refresh_if_stale(&mut state).await;
-        state.default.clone()
+        let _ = self.refresh_if_stale().await;
+        self.state().default.clone()
     }
     /// The default node as last discovered, without refreshing first.
     pub async fn known_default(&self) -> Endpoint {
-        self.state.lock().await.default.clone()
+        self.state().default.clone()
     }
     pub fn deployment(&self) -> Deployment {
         self.profile.deployment
@@ -411,8 +519,7 @@ impl Transport {
     /// standalone profile this is the client the profile connected with, so a
     /// tunnel or a Unix socket still applies.
     pub async fn node_client(&self, ep: &Endpoint) -> RedisResult<redis::Client> {
-        let mut state = self.state.lock().await;
-        if let Some(client) = state.clients.get(ep) {
+        if let Some(client) = self.state().clients.get(ep) {
             return Ok(client.clone());
         }
         let mut profile = self.profile.clone();
@@ -421,17 +528,21 @@ impl Transport {
         let raw = build_client(&profile, None)
             .await
             .map_err(|e| error(e.to_string()))?;
-        state.clients.insert(ep.clone(), raw.clone());
-        Ok(raw)
+        Ok(self
+            .state()
+            .clients
+            .entry(ep.clone())
+            .or_insert(raw)
+            .clone())
     }
     pub async fn nodes(&self) -> Vec<Node> {
-        self.state.lock().await.nodes.clone()
+        self.state().nodes.clone()
     }
     pub async fn warning(&self) -> Option<String> {
-        self.state.lock().await.warning.clone()
+        self.state().warning.clone()
     }
     pub async fn primaries(&self) -> Vec<Endpoint> {
-        let state = self.state.lock().await;
+        let state = self.state();
         if state.nodes.is_empty() {
             vec![state.default.clone()]
         } else {
@@ -462,18 +573,17 @@ impl Transport {
     async fn direct_inner(&self, ep: &Endpoint, cmd: &Cmd) -> RedisResult<Value> {
         let read = read_route(cmd).0;
         self.guard(read)?;
-        let mut state = self.state.lock().await;
-        let mut c = self.connection(&mut state, ep).await?;
-        drop(state);
-        // Again at the moment of sending: the lock can take a while.
+        let socket = self.connection(ep).await?;
+        // Again at the moment of sending: connecting can take a while.
         self.guard(read)?;
+        let mut c = socket.conn;
         let result = c
             .req_packed_command(cmd)
             .await
             .and_then(Value::extract_error);
         // A server error (NOPERM from a managed service) leaves the socket good.
         if result.as_ref().is_err_and(RedisError::is_io_error) {
-            self.state.lock().await.sockets.remove(ep);
+            self.forget(ep, Some(socket.id));
         }
         result
     }
@@ -488,12 +598,11 @@ impl Transport {
         if pipeline.cmd_iter().any(|c| !read_route(c).0) {
             self.guard(false)?;
         }
-        let mut state = self.state.lock().await;
-        let mut c = self.connection(&mut state, ep).await?;
-        drop(state);
+        let socket = self.connection(ep).await?;
+        let mut c = socket.conn;
         let result = c.req_packed_commands(&pipeline, 0, names.len() * 2).await;
         if result.is_err() {
-            self.state.lock().await.sockets.remove(ep);
+            self.forget(ep, Some(socket.id));
         }
         result
     }
@@ -515,28 +624,28 @@ impl Transport {
     async fn request_inner(&self, cmd: &Cmd) -> RedisResult<Value> {
         let read = read_route(cmd).0;
         self.guard(read)?;
-        let mut state = self.state.lock().await;
-        self.refresh_if_stale(&mut state).await?;
+        self.refresh_if_stale().await?;
         let slot = if self.profile.deployment == Deployment::Cluster {
-            self.cluster_slot(&mut state, cmd).await?
+            self.cluster_slot(cmd).await?
         } else {
             None
         };
-        let route = |state: &State| route_slot(state, slot);
         // A script's own error reply can look like `TRYAGAIN` or `MOVED`
         // after it has already written, and so can a module command's. Only
         // commands whose behaviour is known are ever sent twice.
         let opaque = never_resent(cmd);
-        let mut ep = route(&state);
+        let mut ep = self.route(slot);
         let mut asking = false;
         for attempt in 0..4 {
             // Set once the command is on the wire. A failure before that, such
             // as a node that refuses the connection, proves nothing ran.
             let mut sent = false;
+            // The cached socket the attempt used, if any.
+            let mut used = None;
             let result = async {
                 if asking {
                     // Dedicated socket keeps ASKING and the redirected command adjacent.
-                    let raw = state.clients.get(&ep).cloned();
+                    let raw = self.state().clients.get(&ep).cloned();
                     let raw = match raw {
                         Some(raw) => raw,
                         None => {
@@ -556,7 +665,9 @@ impl Transport {
                         .await
                         .and_then(Value::extract_error)
                 } else {
-                    let mut c = self.connection(&mut state, &ep).await?;
+                    let socket = self.connection(&ep).await?;
+                    used = Some(socket.id);
+                    let mut c = socket.conn;
                     self.guard(read)?;
                     sent = true;
                     c.req_packed_command(cmd)
@@ -581,9 +692,7 @@ impl Transport {
                             if slot == Some(redirect) {
                                 // Likely genuine: refresh so the next attempt
                                 // goes to the right node, without resending.
-                                if let Err(refresh) = self.discover(&mut state).await {
-                                    state.warning = Some(refresh.to_string());
-                                }
+                                let _ = self.rediscover().await;
                                 return Err(error(format!(
                                     "{e}; the command was not sent again, because its reply cannot prove it never ran. The topology was refreshed, so try again"
                                 )));
@@ -599,39 +708,9 @@ impl Transport {
                         let target = endpoint(&address).map_err(|e| error(e.to_string()))?;
                         asking = e.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::Ask);
                         if !asking {
-                            if let Err(refresh) = self.discover(&mut state).await {
-                                state.warning = Some(refresh.to_string());
-                            }
+                            let _ = self.rediscover().await;
                             // A MOVED is authoritative for this slot even if discovery is unavailable.
-                            for n in &mut state.nodes {
-                                let mut ranges = Vec::new();
-                                for &(a, b) in &n.slots {
-                                    if slot < a || slot > b {
-                                        ranges.push((a, b));
-                                    } else {
-                                        if a < slot {
-                                            ranges.push((a, slot - 1));
-                                        }
-                                        if slot < b {
-                                            ranges.push((slot + 1, b));
-                                        }
-                                    }
-                                }
-                                n.slots = ranges;
-                            }
-                            if let Some(n) = state.nodes.iter_mut().find(|n| n.endpoint() == target)
-                            {
-                                n.primary = true;
-                                n.slots.push((slot, slot));
-                            } else {
-                                state.nodes.push(Node {
-                                    id: "MOVED".into(),
-                                    host: target.0.clone(),
-                                    port: target.1,
-                                    primary: true,
-                                    slots: vec![(slot, slot)],
-                                });
-                            }
+                            self.moved(slot, &target);
                         }
                         ep = target;
                         continue;
@@ -643,20 +722,17 @@ impl Transport {
                         if opaque
                             && rejected_unrun(&e)
                             && self.profile.deployment != Deployment::Standalone
-                            && let Err(refresh) = self.discover(&mut state).await
                         {
-                            state.warning = Some(refresh.to_string());
+                            let _ = self.rediscover().await;
                         }
                         return Err(e);
                     }
-                    state.sockets.remove(&ep);
+                    self.forget(&ep, used);
                     if !read && sent && !refused {
                         // Never resent, but the next command should not be
                         // aimed at a primary that is gone.
-                        if self.profile.deployment != Deployment::Standalone
-                            && let Err(refresh) = self.discover(&mut state).await
-                        {
-                            state.warning = Some(refresh.to_string());
+                        if self.profile.deployment != Deployment::Standalone {
+                            let _ = self.rediscover().await;
                         }
                         return Err(error(format!(
                             "Write outcome unknown; command was not retried: {e}"
@@ -672,14 +748,12 @@ impl Transport {
                     }
                     tokio::time::sleep(Duration::from_millis(50 * (1 << attempt))).await;
                     if self.profile.deployment != Deployment::Standalone
-                        && let Err(refresh) = self.discover(&mut state).await
+                        && let Err(refresh) = self.rediscover().await
+                        && self.profile.deployment == Deployment::Sentinel
                     {
-                        state.warning = Some(refresh.to_string());
-                        if self.profile.deployment == Deployment::Sentinel {
-                            return Err(refresh);
-                        }
+                        return Err(refresh);
                     }
-                    ep = route(&state);
+                    ep = self.route(slot);
                     asking = false;
                 }
             }
@@ -716,35 +790,30 @@ impl Transport {
             }
             return Ok(values.into_iter().skip(offset).take(count).collect());
         }
-        let mut state = self.state.lock().await;
-        self.refresh_if_stale(&mut state).await?;
-        let ep = state.default.clone();
-        let mut c = self.connection(&mut state, &ep).await?;
+        self.refresh_if_stale().await?;
+        let ep = self.state().default.clone();
+        let socket = self.connection(&ep).await?;
         self.guard(!writes)?;
+        let mut c = socket.conn;
         let result = c
             .req_packed_commands(pipeline, offset, count)
             .await
             .and_then(|values| values.into_iter().map(Value::extract_error).collect());
         if let Err(e) = &result {
-            state.sockets.remove(&ep);
+            self.forget(&ep, Some(socket.id));
             // A Sentinel primary demoted during failover refuses writes as a
             // replica. Find the new primary now, so a retry reaches it.
             if self.profile.deployment == Deployment::Sentinel && writes && rejected_unrun(e) {
-                if let Err(refresh) = self.discover(&mut state).await {
-                    state.warning = Some(refresh.to_string());
-                }
+                let _ = self.rediscover().await;
                 return Err(error(format!(
                     "The primary stopped accepting writes partway through this batch ({e}); commands before that point may have been applied. The topology was refreshed; try again to reach the new primary"
                 )));
             }
             if e.is_io_error() {
-                if self.profile.deployment == Deployment::Sentinel
-                    && let Err(refresh) = self.discover(&mut state).await
-                {
-                    state.warning = Some(refresh.to_string());
+                if self.profile.deployment == Deployment::Sentinel {
+                    let _ = self.rediscover().await;
                 }
                 if !pipeline.is_transaction() && pipeline.cmd_iter().all(|cmd| read_route(cmd).0) {
-                    drop(state);
                     let mut values = Vec::new();
                     for cmd in pipeline.cmd_iter() {
                         values.push(self.request(cmd).await?);
@@ -773,17 +842,21 @@ impl Transport {
         count: usize,
     ) -> RedisResult<Vec<Value>> {
         let cmds: Vec<&Cmd> = pipeline.cmd_iter().collect();
-        let mut state = self.state.lock().await;
-        self.refresh_if_stale(&mut state).await?;
-        let mut groups: Vec<(Endpoint, Vec<usize>)> = Vec::new();
+        self.refresh_if_stale().await?;
         let mut slots = Vec::with_capacity(cmds.len());
-        for (i, cmd) in cmds.iter().enumerate() {
-            let slot = self.cluster_slot(&mut state, cmd).await?;
-            slots.push(slot);
-            let ep = route_slot(&state, slot);
-            match groups.iter_mut().find(|(e, _)| *e == ep) {
-                Some((_, indices)) => indices.push(i),
-                None => groups.push((ep, vec![i])),
+        for cmd in &cmds {
+            slots.push(self.cluster_slot(cmd).await?);
+        }
+        // Every command is routed by the same view of the topology.
+        let mut groups: Vec<(Endpoint, Vec<usize>)> = Vec::new();
+        {
+            let state = self.state();
+            for (i, slot) in slots.iter().enumerate() {
+                let ep = route_slot(&state, *slot);
+                match groups.iter_mut().find(|(e, _)| *e == ep) {
+                    Some((_, indices)) => indices.push(i),
+                    None => groups.push((ep, vec![i])),
+                }
             }
         }
         let mut replies: Vec<Option<RedisResult<Value>>> = cmds.iter().map(|_| None).collect();
@@ -806,8 +879,8 @@ impl Transport {
                     ep.0, ep.1
                 ))
             };
-            let mut c = match self.connection(&mut state, ep).await {
-                Ok(c) => c,
+            let socket = match self.connection(ep).await {
+                Ok(socket) => socket,
                 Err(e) if sent == 0 => return Err(e),
                 Err(e) => return Err(earlier("its commands were not sent", &e)),
             };
@@ -822,6 +895,7 @@ impl Transport {
                     &error("writes were locked or the write lease expired mid-batch"),
                 ));
             }
+            let mut c = socket.conn;
             match c.req_packed_commands(&sub, 0, indices.len()).await {
                 Ok(values) => {
                     for (&i, value) in indices.iter().zip(values) {
@@ -841,15 +915,12 @@ impl Transport {
                     }
                 }
                 Err(e) => {
-                    state.sockets.remove(ep);
-                    if let Err(refresh) = self.discover(&mut state).await {
-                        state.warning = Some(refresh.to_string());
-                    }
+                    self.forget(ep, Some(socket.id));
+                    let _ = self.rediscover().await;
                     return Err(earlier("outcome unknown for its commands", &e));
                 }
             }
         }
-        drop(state);
         // Redirected and refused commands never ran, so each is safe to send
         // once more, through the single-command path that follows redirects.
         // Among them the batch's order is kept; on one key it can only differ
