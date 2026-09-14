@@ -797,6 +797,13 @@ impl Client {
         self.mgr.primary_count()
     }
 
+    /// Before a write, `PING` a cached connection that has been unused for
+    /// longer than `after` (30 seconds unless changed). Only tests change it.
+    #[doc(hidden)]
+    pub fn idle_ping_after(&self, after: std::time::Duration) {
+        self.mgr.idle_ping_after(after);
+    }
+
     /// Command names for console completion, and the subset flagged `write`.
     /// `COMMAND` works on every server version, unlike `COMMAND LIST`, and one
     /// reply per connection is cheap. The write set is what a read-only

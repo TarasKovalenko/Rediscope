@@ -779,6 +779,10 @@ write whose connection failed before it was sent is also tried again; a bulk
 batch that cannot reach one of its nodes stops instead. A write whose
 reply is lost reports an unknown outcome and is never replayed, and the
 topology is refreshed at once so the next command finds the new primary.
+A load balancer or firewall can drop a quiet connection without telling
+either side, so a write about to go out on a connection unused for 30 seconds
+sends a `PING` first; if that fails, the write has not been sent, and it goes
+out once on a new connection instead of ending as an unknown outcome.
 The shared console refuses connection-state commands such as `AUTH` and `MULTI`;
 use profile settings for authentication and the database selector (or `SELECT`
 in the TUI) to open a fresh database connection.

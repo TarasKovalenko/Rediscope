@@ -6,7 +6,10 @@ use crate::config::Deployment;
 use redis::{Cmd, RedisError, RedisFuture, RedisResult, Value, aio::ConnectionLike};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -45,7 +48,17 @@ pub(super) struct Transport {
     discovery: Arc<tokio::sync::Mutex<()>>,
     /// Primaries the last discovery found, readable without the lock.
     primary_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Socket activity is measured in milliseconds from here.
+    epoch: Instant,
+    /// How long, in milliseconds, a cached socket may sit unused before a
+    /// write on it is preceded by a `PING`.
+    idle_ping_ms: Arc<AtomicU64>,
 }
+/// Load balancers and firewalls drop connections that sit quiet for a few
+/// minutes without telling either end. A write sent into such a socket is
+/// lost with an unknown outcome, so a socket unused for this long is checked
+/// with a `PING` first.
+const IDLE_PING: Duration = Duration::from_secs(30);
 struct State {
     clients: HashMap<Endpoint, redis::Client>,
     sockets: HashMap<Endpoint, Socket>,
@@ -67,6 +80,10 @@ struct State {
 struct Socket {
     id: u64,
     conn: MultiplexedConnection,
+    /// When the socket was last handed out, shared by every copy.
+    last: Arc<AtomicU64>,
+    /// How long it had been unused when this copy was handed out.
+    idle: Duration,
 }
 /// The guard's refusals. Audit events match them exactly, by kind and text,
 /// so no server reply or script error can pass for one.
@@ -128,6 +145,8 @@ impl Transport {
             })),
             discovery: Arc::default(),
             primary_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            epoch: Instant::now(),
+            idle_ping_ms: Arc::new(AtomicU64::new(IDLE_PING.as_millis() as u64)),
         };
         let result = this.refresh().await;
         this.audit.record(
@@ -214,22 +233,62 @@ impl Transport {
     /// The cached socket for `ep`, or a new one. Two callers connecting at
     /// once both open one; the first to finish is kept and shared.
     async fn connection(&self, ep: &Endpoint) -> RedisResult<Socket> {
-        if let Some(socket) = self.state().sockets.get(ep) {
-            return Ok(socket.clone());
+        if let Some(socket) = self.cached(ep) {
+            return Ok(socket);
         }
         let client = self.node_client(ep).await?;
         let conn = socket(&client).await?;
-        let mut state = self.state();
-        if let Some(socket) = state.sockets.get(ep) {
-            return Ok(socket.clone());
+        if let Some(socket) = self.cached(ep) {
+            return Ok(socket);
         }
+        let mut state = self.state();
         state.opened += 1;
         let socket = Socket {
             id: state.opened,
             conn,
+            last: Arc::new(AtomicU64::new(self.now_ms())),
+            idle: Duration::ZERO,
         };
         state.sockets.insert(ep.clone(), socket.clone());
         Ok(socket)
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// The cached socket for `ep`, marked as used now.
+    fn cached(&self, ep: &Endpoint) -> Option<Socket> {
+        let mut socket = self.state().sockets.get(ep)?.clone();
+        let now = self.now_ms();
+        let last = socket.last.swap(now, Ordering::Relaxed);
+        socket.idle = Duration::from_millis(now.saturating_sub(last));
+        Some(socket)
+    }
+
+    /// A socket a write can be sent on. One that sat idle is asked for a
+    /// `PING` first: if that fails, the connection was already dead and the
+    /// write has not been sent, so it goes out once on a fresh socket instead
+    /// of being lost with an unknown outcome. Any other reply means the
+    /// connection is alive.
+    async fn for_write(&self, ep: &Endpoint, socket: Socket) -> RedisResult<Socket> {
+        if socket.idle < Duration::from_millis(self.idle_ping_ms.load(Ordering::Relaxed)) {
+            return Ok(socket);
+        }
+        let mut c = socket.conn.clone();
+        match redis::cmd("PING").query_async::<Value>(&mut c).await {
+            Err(e) if e.is_io_error() => {
+                self.forget(ep, Some(socket.id));
+                self.connection(ep).await
+            }
+            _ => Ok(socket),
+        }
+    }
+
+    /// Check sockets idle for longer than `after` before writing on them.
+    pub fn idle_ping_after(&self, after: Duration) {
+        self.idle_ping_ms
+            .store(after.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Drop the cached socket for `ep` after a failure. With `used`, only
@@ -573,7 +632,10 @@ impl Transport {
     async fn direct_inner(&self, ep: &Endpoint, cmd: &Cmd) -> RedisResult<Value> {
         let read = read_route(cmd).0;
         self.guard(read)?;
-        let socket = self.connection(ep).await?;
+        let mut socket = self.connection(ep).await?;
+        if !read {
+            socket = self.for_write(ep, socket).await?;
+        }
         // Again at the moment of sending: connecting can take a while.
         self.guard(read)?;
         let mut c = socket.conn;
@@ -665,7 +727,10 @@ impl Transport {
                         .await
                         .and_then(Value::extract_error)
                 } else {
-                    let socket = self.connection(&ep).await?;
+                    let mut socket = self.connection(&ep).await?;
+                    if !read {
+                        socket = self.for_write(&ep, socket).await?;
+                    }
                     used = Some(socket.id);
                     let mut c = socket.conn;
                     self.guard(read)?;
@@ -792,7 +857,10 @@ impl Transport {
         }
         self.refresh_if_stale().await?;
         let ep = self.state().default.clone();
-        let socket = self.connection(&ep).await?;
+        let mut socket = self.connection(&ep).await?;
+        if writes {
+            socket = self.for_write(&ep, socket).await?;
+        }
         self.guard(!writes)?;
         let mut c = socket.conn;
         let result = c
@@ -879,7 +947,8 @@ impl Transport {
                     ep.0, ep.1
                 ))
             };
-            let socket = match self.connection(ep).await {
+            let socket = match async { self.for_write(ep, self.connection(ep).await?).await }.await
+            {
                 Ok(socket) => socket,
                 Err(e) if sent == 0 => return Err(e),
                 Err(e) => return Err(earlier("its commands were not sent", &e)),

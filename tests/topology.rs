@@ -3258,3 +3258,102 @@ async fn a_slow_discovery_does_not_block_requests_to_other_nodes() {
     discovery.await.unwrap().unwrap();
     let _ = &nodes.b;
 }
+
+// ---- idle sockets are checked before a write --------------------------------
+
+/// A standalone server that logs every command with its socket, and closes
+/// a socket right after answering `GET drop`, the way a load balancer cuts an
+/// idle connection without telling the client.
+fn cutting_server() -> (Peer, Log) {
+    let log: Log = Arc::default();
+    let seen = log.clone();
+    let peer = Peer::start(move |id, args| {
+        seen.lock().unwrap().push((id, args.to_vec()));
+        Some(match (args[0].as_str(), args.get(1).map(String::as_str)) {
+            ("GET", Some("drop")) => bulk("bye") + CLOSE,
+            ("GET", _) => bulk("value"),
+            ("PING", _) => "+PONG\r\n".into(),
+            _ => "+OK\r\n".into(),
+        })
+    });
+    (peer, log)
+}
+fn sockets_for(log: &Log, head: &str) -> Vec<usize> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, args)| args[0] == head)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_write_on_an_idle_socket_that_died_goes_out_once_on_a_fresh_one() {
+    let (server, log) = cutting_server();
+    let client = Client::connect(server.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+    client.idle_ping_after(Duration::ZERO);
+    client.execute_raw("GET drop").await.unwrap();
+    // Give the client a moment to see the socket close.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.set_string("key", "v").await.unwrap();
+    let sets = sockets_for(&log, "SET");
+    assert_eq!(sets.len(), 1, "the write went out exactly once");
+    assert_ne!(
+        sets[0],
+        sockets_for(&log, "GET")[0],
+        "the write used a new socket"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_socket_that_answers_ping_is_kept_and_reads_never_ping() {
+    let (server, log) = cutting_server();
+    let client = Client::connect(server.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+    let pings = |log: &Log| sockets_for(log, "PING").len();
+    let after_connect = pings(&log);
+    client.idle_ping_after(Duration::ZERO);
+    client.execute_raw("GET key").await.unwrap();
+    assert_eq!(pings(&log), after_connect, "a read sent a PING");
+    client.set_string("key", "v").await.unwrap();
+    assert_eq!(pings(&log), after_connect + 1);
+    let heads = heads(&log);
+    assert_eq!(&heads[heads.len() - 2..], ["PING", "SET"]);
+    let socket = sockets_for(&log, "GET")[0];
+    assert_eq!(sockets_for(&log, "SET"), vec![socket]);
+
+    // With the default threshold a busy socket is not pinged.
+    client.idle_ping_after(Duration::from_secs(30));
+    client.set_string("key", "w").await.unwrap();
+    assert_eq!(pings(&log), after_connect + 1);
+}
+
+#[tokio::test]
+async fn cluster_writes_and_batches_check_idle_sockets_too() {
+    let nodes = TwoNodes::start(|node, _, args| {
+        (node == 'b' && args[0] == "GET").then(|| Some(bulk("bye") + CLOSE))
+    });
+    let client = nodes.client().await;
+    let kb = key_on(false, "idle", 0);
+    let kb2 = key_on(false, "idle", 1);
+    client.idle_ping_after(Duration::ZERO);
+    // Open b's socket, then have b drop it.
+    client.execute_raw(&format!("GET {kb}")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.set_string(&kb, "v").await.unwrap();
+    assert_eq!(count(&nodes.b_log, "SET", Some(&kb)), 1);
+
+    client.execute_raw(&format!("GET {kb}")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        client
+            .delete_keys(&[kb.clone(), kb2.clone()])
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(count(&nodes.b_log, "UNLINK", None), 2);
+}
