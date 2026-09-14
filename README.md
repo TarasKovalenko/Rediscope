@@ -792,9 +792,15 @@ commands file, which have no way to write one. `rediscope export` stops at 5,000
 keys, like the key tree; narrow `--pattern` to export more. An export to a file
 is written beside it and renamed into place when it is complete, so an export
 that fails leaves an existing file as it was. If the path is a symlink, the file
-it points to is replaced and the link stays. A file that is replaced keeps its
-permissions; a new export file is created `0600`, readable only by you, because
-it can hold secrets. Loosen it yourself if others need to read it.
+it points to is replaced and the link stays. On Linux and macOS a symlink that
+belongs to another user is refused (one of root's only outside a sticky
+directory such as `/tmp` that root does not own), so a link someone leaves in
+`/tmp` cannot turn an export into an overwrite of one of your files. A file of
+yours that is replaced keeps its permission bits and group, never setuid,
+setgid or sticky; if its group cannot be kept, the group bits are dropped. A
+new export file, or one replacing a file that is not yours, is created `0600`,
+readable only by you, because it can hold secrets. Loosen it yourself if others
+need to read it.
 
 **Importing.** The format is read from the file's content. A `dump` file is
 restored with `RESTORE`, as before. For the other formats, without overwrite a

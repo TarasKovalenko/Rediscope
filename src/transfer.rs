@@ -1480,12 +1480,31 @@ pub struct PendingFile {
 
 /// Follow `path` through symlinks to the file they finally name, which need
 /// not exist yet. A loop, or a chain longer than the kernel would follow, is
-/// an error.
+/// an error, and so is a link [`may_follow`] refuses.
 fn resolve_links(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let mut path = path.to_path_buf();
     for _ in 0..40 {
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let dir = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(std::path::Path::new("."));
+                    let dir_meta = std::fs::metadata(dir)?;
+                    if !may_follow(meta.uid(), dir_meta.uid(), dir_meta.mode(), euid()) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "refusing to follow the symlink {}: it belongs to another user (uid {}), so it could point the export at a file of yours it should not replace",
+                                path.display(),
+                                meta.uid()
+                            ),
+                        ));
+                    }
+                }
                 let link = std::fs::read_link(&path)?;
                 path = match path.parent() {
                     Some(parent) if link.is_relative() => parent.join(link),
@@ -1498,6 +1517,42 @@ fn resolve_links(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> 
     Err(std::io::Error::other(
         "the path is a chain of too many symlinks",
     ))
+}
+
+/// The effective user id of this process.
+#[cfg(unix)]
+fn euid() -> u32 {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Whether an export may write through a symlink owned by `link_uid`, in a
+/// directory owned by `dir_uid` with mode `dir_mode`, for the user `euid`.
+/// A link of the user's own is always followed. Anyone else's is followed
+/// only when it is root's, and then in a sticky world-writable directory
+/// such as `/tmp` only when the directory is root's too. That is at least
+/// as strict as Linux's `fs.protected_symlinks`, which this check stands in
+/// for: the export opens the resolved path, so the kernel never sees the link.
+/// Otherwise another user could leave a link in `/tmp` that turns an export
+/// into an overwrite of the victim's `~/.ssh/authorized_keys`.
+#[cfg(unix)]
+fn may_follow(link_uid: u32, dir_uid: u32, dir_mode: u32, euid: u32) -> bool {
+    let sticky_world_writable = dir_mode & 0o1002 == 0o1002;
+    link_uid == euid || (link_uid == 0 && (!sticky_world_writable || dir_uid == 0))
+}
+
+/// The mode a new file takes from the file it replaces: that file's
+/// permission bits, never setuid, setgid or sticky, and only from a regular
+/// file of the user's own. Without its group (`group_kept` false) the group
+/// bits go too, since they would apply to a different group. `None` keeps
+/// the new file's own `0600`.
+#[cfg(unix)]
+fn inherited_mode(mode: u32, uid: u32, regular: bool, euid: u32, group_kept: bool) -> Option<u32> {
+    if !regular || uid != euid {
+        return None;
+    }
+    let mode = mode & 0o777;
+    Some(if group_kept { mode } else { mode & !0o070 })
 }
 
 impl PendingFile {
@@ -1564,8 +1619,16 @@ impl PendingFile {
     /// this moment, so a change made during the export is kept too.
     pub fn commit(mut self) -> std::io::Result<()> {
         #[cfg(unix)]
-        if let Ok(meta) = std::fs::metadata(&self.target) {
-            std::fs::set_permissions(&self.temp, meta.permissions())?;
+        if let Ok(meta) = std::fs::symlink_metadata(&self.target) {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let me = euid();
+            if meta.file_type().is_file() && meta.uid() == me {
+                let group_kept = std::fs::metadata(&self.temp)?.gid() == meta.gid()
+                    || std::os::unix::fs::chown(&self.temp, None, Some(meta.gid())).is_ok();
+                if let Some(mode) = inherited_mode(meta.mode(), meta.uid(), true, me, group_kept) {
+                    std::fs::set_permissions(&self.temp, std::fs::Permissions::from_mode(mode))?;
+                }
+            }
         }
         std::fs::rename(&self.temp, &self.target)?;
         self.done = true;
@@ -2498,6 +2561,67 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn symlinks_are_followed_only_when_their_owner_can_be_trusted() {
+        let (me, other, root) = (501, 502, 0);
+        let (tmp, private, shared) = (0o41777, 0o40755, 0o40777);
+        // The user's own link, anywhere.
+        assert!(may_follow(me, root, tmp, me));
+        assert!(may_follow(me, other, tmp, me));
+        assert!(may_follow(me, other, private, me));
+        // Another user's link, even in that user's own directory or in /tmp.
+        assert!(!may_follow(other, root, tmp, me));
+        assert!(!may_follow(other, other, tmp, me));
+        assert!(!may_follow(other, other, private, me));
+        assert!(!may_follow(other, me, shared, me));
+        // Root's link: not in a sticky world-writable directory someone else owns.
+        assert!(may_follow(root, root, tmp, me));
+        assert!(may_follow(root, other, private, me));
+        assert!(may_follow(root, other, shared, me));
+        assert!(!may_follow(root, other, tmp, me));
+        // Root following root's link.
+        assert!(may_follow(root, other, tmp, root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_of_the_users_own_in_a_sticky_directory_is_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rediscope-sticky-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let real = dir.join("real.json");
+        std::os::unix::fs::symlink(&real, dir.join("link.json")).unwrap();
+        assert_eq!(resolve_links(&dir.join("link.json")).unwrap(), real);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_mode_drops_special_bits_and_foreign_files() {
+        let me = 501;
+        assert_eq!(inherited_mode(0o100640, me, true, me, true), Some(0o640));
+        assert_eq!(inherited_mode(0o106755, me, true, me, true), Some(0o755));
+        assert_eq!(inherited_mode(0o101644, me, true, me, true), Some(0o644));
+        // The group could not be kept: its bits would reach another group.
+        assert_eq!(inherited_mode(0o100664, me, true, me, false), Some(0o604));
+        // Not the user's file, or not a regular file: the new file stays 0600.
+        assert_eq!(inherited_mode(0o100644, 502, true, me, true), None);
+        assert_eq!(inherited_mode(0o020666, me, false, me, true), None);
+    }
+
+    /// A group the current user is in, other than `not`.
+    #[cfg(unix)]
+    fn other_group(not: u32) -> Option<u32> {
+        let mut groups = vec![0 as libc::gid_t; 256];
+        // SAFETY: the buffer holds as many entries as the length passed.
+        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(n).ok()?);
+        groups.into_iter().find(|g| *g != not)
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_pending_file_keeps_permissions_and_writes_through_symlinks() {
         use std::os::unix::fs::PermissionsExt;
         let dir =
@@ -2559,6 +2683,33 @@ mod tests {
             std::fs::read_to_string(dir.join("real").join("later.json")).unwrap(),
             "created"
         );
+
+        // Special bits are never passed on: only the permission bits are.
+        let special = dir.join("setuid.json");
+        std::fs::write(&special, "old").unwrap();
+        std::fs::set_permissions(&special, std::fs::Permissions::from_mode(0o4750)).unwrap();
+        if std::fs::metadata(&special).unwrap().permissions().mode() & 0o4000 != 0 {
+            write(&special, "new");
+            let full = std::fs::metadata(&special).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(full, 0o750, "{full:o}");
+        }
+
+        // A file in another of the user's groups keeps that group, and with it
+        // the group bits.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let grouped = dir.join("grouped.json");
+            std::fs::write(&grouped, "old").unwrap();
+            let own = std::fs::metadata(&grouped).unwrap().gid();
+            if let Some(other) = other_group(own) {
+                std::os::unix::fs::chown(&grouped, None, Some(other)).unwrap();
+                std::fs::set_permissions(&grouped, std::fs::Permissions::from_mode(0o640)).unwrap();
+                write(&grouped, "new");
+                let meta = std::fs::metadata(&grouped).unwrap();
+                assert_eq!(meta.gid(), other);
+                assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+            }
+        }
 
         // No temporary file is left anywhere.
         for sub in [dir.clone(), dir.join("real")] {
