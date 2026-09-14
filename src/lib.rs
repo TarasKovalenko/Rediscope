@@ -16,6 +16,7 @@ pub mod palette;
 pub mod redis_client;
 pub mod secrets;
 pub mod theme;
+pub mod transfer;
 pub mod tree;
 pub mod ui;
 pub mod xml;

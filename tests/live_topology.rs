@@ -411,6 +411,37 @@ async fn real_cluster_and_sentinel_accept_routed_writes() {
         }
     );
 
+    // Readable export and import: each key read from and written to its owner.
+    use rediscope::transfer::{self, Format};
+    for format in [Format::Jsonl, Format::Commands] {
+        let (report, bytes) = client
+            .export_to(&names, format, false, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(report.written, 3);
+        assert_eq!(client.delete_keys(&names).await.unwrap(), 3);
+        let parsed = transfer::parse(&bytes).unwrap();
+        assert_eq!(client.import_parsed(&parsed, false).await.unwrap().keys, 3);
+        assert_eq!(
+            raw_get(owner(&servers, &nodes, &names[0]), &names[0])
+                .await
+                .as_deref(),
+            Some("edited")
+        );
+        assert!(raw_exists(owner(&servers, &nodes, &names[2]), &names[2]).await);
+    }
+    // A command file line over keys in different slots is refused unsent.
+    let line = format!("MSET {} 1 {} 2\n", names[0], names[1]);
+    let parsed = transfer::parse(line.as_bytes()).unwrap();
+    let err = client.import_parsed(&parsed, false).await.unwrap_err();
+    assert!(err.to_string().contains("different cluster slots"), "{err}");
+    assert_eq!(
+        raw_get(owner(&servers, &nodes, &names[0]), &names[0])
+            .await
+            .as_deref(),
+        Some("edited")
+    );
+
     // Sentinel: writes land on the primary it names.
     let primary = Server::start(false, None).await;
     let sentinel = Server::start(false, Some(primary.port)).await;

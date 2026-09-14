@@ -151,19 +151,30 @@ impl Transport {
         pipeline: bool,
         opaque: bool,
     ) -> RedisResult<()> {
-        let outcome = match result {
-            Ok(_) => "success",
-            Err(e) if denied(e) => "denied",
+        self.audit_outcome(id, action, count, result.as_ref().err(), pipeline, opaque)
+    }
+    fn audit_outcome(
+        &self,
+        id: u64,
+        action: &str,
+        count: Option<usize>,
+        failure: Option<&RedisError>,
+        pipeline: bool,
+        opaque: bool,
+    ) -> RedisResult<()> {
+        let outcome = match failure {
+            None => "success",
+            Some(e) if denied(e) => "denied",
             // A batch that fails may have run part of itself, and a script or
             // module command may have written before its error.
-            Err(_) if pipeline || opaque => "unknown",
-            Err(e)
+            Some(_) if pipeline || opaque => "unknown",
+            Some(e)
                 if e.is_io_error()
                     || (own_error(e) && e.to_string().contains("outcome unknown")) =>
             {
                 "unknown"
             }
-            Err(_) => "failure",
+            Some(_) => "failure",
         };
         self.audit.record(id, action, outcome, count).map_err(|_| {
             error(format!(
@@ -662,6 +673,46 @@ impl Transport {
         offset: usize,
         count: usize,
     ) -> RedisResult<Vec<Value>> {
+        let (results, spread) = self.pipeline_results(pipeline, offset, count).await?;
+        let writes = pipeline.cmd_iter().any(|c| !read_route(c).0);
+        let total = results.len();
+        let applied = results.iter().filter(|r| r.is_ok()).count();
+        let values: RedisResult<Vec<Value>> = results.into_iter().collect();
+        match values {
+            Ok(values) => Ok(values),
+            Err(e) if self.profile.deployment != Deployment::Cluster => {
+                // A Sentinel primary demoted during failover refuses writes as a
+                // replica. The topology was refreshed, so a retry reaches it.
+                if self.profile.deployment == Deployment::Sentinel && writes && rejected_unrun(&e) {
+                    return Err(error(format!(
+                        "The primary stopped accepting writes partway through this batch ({e}); commands before that point may have been applied. The topology was refreshed; try again to reach the new primary"
+                    )));
+                }
+                Err(e)
+            }
+            // One failure must not hide the commands that did run.
+            Err(e) if applied > 0 => Err(error(format!(
+                "Pipeline partially applied: {applied} of {total} commands ran, and nothing was retried. First failure: {e}"
+            ))),
+            // A refusal met only while resending still followed sends that may
+            // have run: it must not read as a batch refused before sending.
+            Err(e) if denied(&e) && spread => Err(error(format!(
+                "Pipeline stopped: writes were locked or the write lease expired before every command was sent; commands already sent may have been applied. {e}"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send a pipeline and give back each command's own reply or error, with
+    /// the outer error kept for a batch whose outcome is unknown or that was
+    /// never sent. The flag says whether a cluster batch went to more than
+    /// one node or resent commands.
+    async fn pipeline_results(
+        &self,
+        pipeline: &redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisResult<(Vec<RedisResult<Value>>, bool)> {
         let writes = pipeline.cmd_iter().any(|c| !read_route(c).0);
         if self.read_only() && writes {
             return Err(error(PIPELINE_DENIED));
@@ -677,51 +728,57 @@ impl Transport {
             }
             let mut values = Vec::new();
             for cmd in pipeline.cmd_iter() {
-                values.push(self.request(cmd).await?);
+                values.push(Ok(self.request(cmd).await?));
             }
-            return Ok(values.into_iter().skip(offset).take(count).collect());
+            return Ok((values.into_iter().skip(offset).take(count).collect(), false));
         }
         let mut state = self.state.lock().await;
         self.refresh_if_stale(&mut state).await?;
         let ep = state.default.clone();
         let mut c = self.connection(&mut state, &ep).await?;
         self.guard(!writes)?;
-        let result = c
+        let result: RedisResult<Vec<RedisResult<Value>>> = c
             .req_packed_commands(pipeline, offset, count)
             .await
-            .and_then(|values| values.into_iter().map(Value::extract_error).collect());
-        if let Err(e) = &result {
-            state.sockets.remove(&ep);
-            // A Sentinel primary demoted during failover refuses writes as a
-            // replica. Find the new primary now, so a retry reaches it.
-            if self.profile.deployment == Deployment::Sentinel && writes && rejected_unrun(e) {
-                if let Err(refresh) = self.discover(&mut state).await {
-                    state.warning = Some(refresh.to_string());
-                }
-                return Err(error(format!(
-                    "The primary stopped accepting writes partway through this batch ({e}); commands before that point may have been applied. The topology was refreshed; try again to reach the new primary"
-                )));
-            }
-            if e.is_io_error() {
-                if self.profile.deployment == Deployment::Sentinel
-                    && let Err(refresh) = self.discover(&mut state).await
-                {
-                    state.warning = Some(refresh.to_string());
-                }
-                if !pipeline.is_transaction() && pipeline.cmd_iter().all(|cmd| read_route(cmd).0) {
-                    drop(state);
-                    let mut values = Vec::new();
-                    for cmd in pipeline.cmd_iter() {
-                        values.push(self.request(cmd).await?);
+            .map(|values| values.into_iter().map(Value::extract_error).collect());
+        match &result {
+            Ok(results) => {
+                if let Some(e) = results.iter().find_map(|r| r.as_ref().err()) {
+                    state.sockets.remove(&ep);
+                    if self.profile.deployment == Deployment::Sentinel
+                        && writes
+                        && rejected_unrun(e)
+                        && let Err(refresh) = self.discover(&mut state).await
+                    {
+                        state.warning = Some(refresh.to_string());
                     }
-                    return Ok(values.into_iter().skip(offset).take(count).collect());
                 }
-                return Err(error(format!(
-                    "Pipeline outcome unknown; no commands retried: {e}"
-                )));
+            }
+            Err(e) => {
+                state.sockets.remove(&ep);
+                if e.is_io_error() {
+                    if self.profile.deployment == Deployment::Sentinel
+                        && let Err(refresh) = self.discover(&mut state).await
+                    {
+                        state.warning = Some(refresh.to_string());
+                    }
+                    if !pipeline.is_transaction()
+                        && pipeline.cmd_iter().all(|cmd| read_route(cmd).0)
+                    {
+                        drop(state);
+                        let mut values = Vec::new();
+                        for cmd in pipeline.cmd_iter() {
+                            values.push(Ok(self.request(cmd).await?));
+                        }
+                        return Ok((values.into_iter().skip(offset).take(count).collect(), false));
+                    }
+                    return Err(error(format!(
+                        "Pipeline outcome unknown; no commands retried: {e}"
+                    )));
+                }
             }
         }
-        result
+        result.map(|r| (r, false))
     }
 
     /// A non-transactional pipeline with writes, on a cluster. Every command's
@@ -736,7 +793,7 @@ impl Transport {
         pipeline: &redis::Pipeline,
         offset: usize,
         count: usize,
-    ) -> RedisResult<Vec<Value>> {
+    ) -> RedisResult<(Vec<RedisResult<Value>>, bool)> {
         let cmds: Vec<&Cmd> = pipeline.cmd_iter().collect();
         let mut state = self.state.lock().await;
         self.refresh_if_stale(&mut state).await?;
@@ -824,25 +881,92 @@ impl Transport {
         for i in again {
             replies[i] = Some(self.request_inner(cmds[i]).await);
         }
-        let total = replies.len();
-        let applied = replies.iter().filter(|r| matches!(r, Some(Ok(_)))).count();
-        let values: RedisResult<Vec<Value>> = replies
+        let results = replies
             .into_iter()
             .map(|r| r.unwrap_or_else(|| Err(error("Pipeline reply missing"))))
+            .skip(offset)
+            .take(count)
             .collect();
-        match values {
-            Ok(values) => Ok(values.into_iter().skip(offset).take(count).collect()),
-            // One failure must not hide the commands that did run.
-            Err(e) if applied > 0 => Err(error(format!(
-                "Pipeline partially applied: {applied} of {total} commands ran, and nothing was retried. First failure: {e}"
-            ))),
-            // A refusal met only while resending still followed sends that may
-            // have run: it must not read as a batch refused before sending.
-            Err(e) if denied(&e) && (resent || groups.len() > 1) => Err(error(format!(
-                "Pipeline stopped: writes were locked or the write lease expired before every command was sent; commands already sent may have been applied. {e}"
-            ))),
-            Err(e) => Err(e),
+        Ok((results, resent || groups.len() > 1))
+    }
+}
+
+impl Transport {
+    /// Send a pipeline and give back every command's own reply or error,
+    /// instead of only the first error, so a caller can tell exactly which
+    /// commands ran. The outer error is for a batch refused before sending,
+    /// or one whose outcome is unknown. A transaction (`atomic`) gives back
+    /// every reply: `MULTI`'s, each `QUEUED`, and `EXEC`'s last. A batch with
+    /// writes is audited once, like any other pipeline; a transaction the
+    /// server aborted before running anything is logged as a failure.
+    pub(super) async fn pipeline_each(
+        &self,
+        pipeline: &redis::Pipeline,
+    ) -> RedisResult<Vec<RedisResult<Value>>> {
+        let commands = pipeline.cmd_iter().count();
+        let atomic = pipeline.is_transaction();
+        let count = if atomic { commands + 2 } else { commands };
+        let writes = pipeline.cmd_iter().any(|c| !read_route(c).0);
+        if !writes {
+            return Ok(self.pipeline_results(pipeline, 0, count).await?.0);
         }
+        let id = self.audit.id();
+        let targets = pipeline.cmd_iter().try_fold(0usize, |sum, c| {
+            crate::audit::command(c).1.and_then(|n| sum.checked_add(n))
+        });
+        self.audit
+            .record(id, "PIPELINE", "started", targets)
+            .map_err(|_| error("Audit unavailable; pipeline was not sent"))?;
+        let result = self
+            .pipeline_results(pipeline, 0, count)
+            .await
+            .map(|(r, _)| r);
+        match &result {
+            Err(e) => self.audit_outcome(id, "PIPELINE", targets, Some(e), true, false)?,
+            Ok(results) if atomic => match results.last() {
+                // EXECABORT: the server queued nothing it would run.
+                Some(Err(e)) => {
+                    self.audit_outcome(id, "PIPELINE", targets, Some(e), false, false)?
+                }
+                Some(Ok(Value::Array(replies)))
+                    if replies.iter().any(|r| matches!(r, Value::ServerError(_))) =>
+                {
+                    let e = error("a command in the transaction failed");
+                    self.audit_outcome(id, "PIPELINE", targets, Some(&e), true, false)?
+                }
+                _ => self.audit_outcome(id, "PIPELINE", targets, None, true, false)?,
+            },
+            Ok(results) => {
+                let failure = results.iter().find_map(|r| r.as_ref().err());
+                self.audit_outcome(id, "PIPELINE", targets, failure, true, false)?
+            }
+        }
+        result
+    }
+
+    /// Record one event for a whole operation that is not a single command,
+    /// such as an export.
+    pub(super) fn audit_event(
+        &self,
+        action: &str,
+        outcome: &str,
+        count: Option<usize>,
+    ) -> Result<u64> {
+        let id = self.audit.id();
+        self.audit.record(id, action, outcome, count)?;
+        Ok(id)
+    }
+    pub(super) fn audit_finish(
+        &self,
+        id: u64,
+        action: &str,
+        outcome: &str,
+        count: Option<usize>,
+    ) -> Result<()> {
+        self.audit.record(id, action, outcome, count)
+    }
+    pub(super) fn deployment(&self) -> Deployment {
+        self.profile.deployment
     }
 }
 
@@ -1113,14 +1237,43 @@ pub(super) fn read_route(cmd: &Cmd) -> (bool, Option<Vec<u8>>) {
 
 pub fn key_slot(key: &[u8]) -> u16 {
     let mut hash = key;
-    if let Some(start) = key.iter().position(|b| *b == b'{')
-        && let Some(end) = key[start + 1..].iter().position(|b| *b == b'}')
-        && end > 0
-    {
-        hash = &key[start + 1..start + 1 + end];
+    if let Some(tag) = hash_tag(key) {
+        hash = tag;
     }
-    let mut crc = 0u16;
-    for byte in hash {
+    crc16(0, hash) % 16384
+}
+
+/// A short hash tag for every cluster slot: `{n}` puts a key in slot `i`
+/// when `n` is `slot_tags()[i]`. Worked out once, by counting up until every
+/// slot has one, which takes about 170,000 small CRCs.
+pub(super) fn slot_tags() -> &'static [u32] {
+    static TAGS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    TAGS.get_or_init(|| {
+        let mut tags = vec![u32::MAX; 16384];
+        let mut left = tags.len();
+        let mut n = 0u32;
+        while left > 0 {
+            let slot = usize::from(crc16(0, n.to_string().as_bytes()) % 16384);
+            if tags[slot] == u32::MAX {
+                tags[slot] = n;
+                left -= 1;
+            }
+            n += 1;
+        }
+        tags
+    })
+}
+
+/// The part of a key name that decides its slot, when it has one.
+pub(super) fn hash_tag(key: &[u8]) -> Option<&[u8]> {
+    let start = key.iter().position(|b| *b == b'{')?;
+    let end = key[start + 1..].iter().position(|b| *b == b'}')?;
+    (end > 0).then(|| &key[start + 1..start + 1 + end])
+}
+
+/// CRC16/XMODEM over `bytes`, continuing from `crc`, as cluster slots use.
+pub(super) fn crc16(mut crc: u16, bytes: &[u8]) -> u16 {
+    for byte in bytes {
         crc ^= (*byte as u16) << 8;
         for _ in 0..8 {
             crc = if crc & 0x8000 != 0 {
@@ -1130,7 +1283,7 @@ pub fn key_slot(key: &[u8]) -> u16 {
             };
         }
     }
-    crc % 16384
+    crc
 }
 
 fn parse_slots(value: Value, source: &str) -> RedisResult<Vec<Node>> {
@@ -1194,6 +1347,15 @@ fn parse_slots(value: Value, source: &str) -> RedisResult<Vec<Node>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_slot_has_a_short_tag() {
+        let tags = slot_tags();
+        assert_eq!(tags.len(), 16384);
+        for (slot, n) in tags.iter().enumerate() {
+            assert_eq!(usize::from(key_slot(format!("x{{{n}}}y").as_bytes())), slot);
+        }
+    }
+
     #[test]
     fn redis_hash_tags_and_crc() {
         assert_eq!(key_slot(b"123456789"), 0x31c3);
