@@ -464,3 +464,377 @@ async fn real_cluster_and_sentinel_accept_routed_writes() {
     assert!(!raw_exists(&primary, "sentinel:write").await);
     drop(servers);
 }
+
+/// A key's type and whole value, read with plain commands on one server.
+async fn canonical(server: &Server, key: &[u8]) -> (String, String) {
+    let mut c = server.raw().await;
+    let kind: String = redis::cmd("TYPE")
+        .arg(key)
+        .query_async(&mut c)
+        .await
+        .unwrap();
+    let pttl: i64 = redis::cmd("PTTL")
+        .arg(key)
+        .query_async(&mut c)
+        .await
+        .unwrap();
+    let read = |name: &str, args: &[&str]| {
+        let mut cmd = redis::cmd(name);
+        cmd.arg(key);
+        for a in args {
+            cmd.arg(*a);
+        }
+        cmd
+    };
+    let value: redis::Value = match kind.as_str() {
+        "string" => read("GET", &[]),
+        "hash" => read("HGETALL", &[]),
+        "list" => read("LRANGE", &["0", "-1"]),
+        "set" => read("SMEMBERS", &[]),
+        "zset" => read("ZRANGE", &["0", "-1", "WITHSCORES"]),
+        "stream" => read("XRANGE", &["-", "+"]),
+        _ => read("DUMP", &[]),
+    }
+    .query_async(&mut c)
+    .await
+    .unwrap();
+    // Hash and set replies come in the server's own order.
+    let mut text = match (kind.as_str(), value) {
+        ("hash", redis::Value::Array(items)) => {
+            let mut pairs: Vec<String> = items.chunks(2).map(|p| format!("{p:?}")).collect();
+            pairs.sort();
+            pairs.join(",")
+        }
+        ("set", redis::Value::Array(items)) => {
+            let mut members: Vec<String> = items.iter().map(|m| format!("{m:?}")).collect();
+            members.sort();
+            members.join(",")
+        }
+        (_, v) => format!("{v:?}"),
+    };
+    text.push_str(if pttl > 0 {
+        " (expires)"
+    } else {
+        " (persistent)"
+    });
+    (kind, text)
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn real_cluster_exports_and_imports_every_format_across_nodes() {
+    use rediscope::transfer::{self, Format};
+    let _serial = SERIAL.lock().await;
+    let servers = start_cluster().await;
+    let cluster = Client::connect(servers[0].profile(Deployment::Cluster))
+        .await
+        .unwrap();
+    let nodes = cluster.refresh_topology().await.unwrap();
+    let standalone = Server::start(false, None).await;
+    let single = Client::connect(standalone.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+
+    // Thirty keys of five types, spread over every primary, some expiring,
+    // some with bytes that are not text.
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for i in 0..30u32 {
+        let mut key = format!("xfer:{i}:").into_bytes();
+        if i % 7 == 0 {
+            key.extend_from_slice(&[0xff, b'\n', b' ']);
+        }
+        let slot = key_slot(&key);
+        let server = servers
+            .iter()
+            .find(|s| {
+                nodes.iter().any(|n| {
+                    n.port == s.port
+                        && n.primary
+                        && n.slots.iter().any(|(a, b)| (*a..=*b).contains(&slot))
+                })
+            })
+            .unwrap();
+        let mut c = server.raw().await;
+        let mut pipe = redis::pipe();
+        match i % 5 {
+            0 => {
+                pipe.cmd("SET").arg(&key).arg(&[0u8, 0xfe, b'"'][..]);
+            }
+            1 => {
+                for f in 0..700 {
+                    pipe.cmd("HSET").arg(&key).arg(format!("f{f}")).arg(f);
+                }
+            }
+            2 => {
+                for f in 0..1200 {
+                    pipe.cmd("RPUSH").arg(&key).arg(f % 3);
+                }
+            }
+            3 => {
+                for f in 0..600 {
+                    pipe.cmd("ZADD")
+                        .arg(&key)
+                        .arg(f64::from(f) / 4.0)
+                        .arg(format!("m{f}"));
+                }
+            }
+            _ => {
+                for f in 1..=1100u32 {
+                    pipe.cmd("XADD")
+                        .arg(&key)
+                        .arg(format!("1-{f}"))
+                        .arg("a")
+                        .arg(f)
+                        .arg("b")
+                        .arg("c");
+                }
+            }
+        }
+        if i % 3 == 0 {
+            pipe.cmd("PEXPIRE").arg(&key).arg(900_000);
+        }
+        let _: redis::Value = pipe.query_async(&mut c).await.unwrap();
+        keys.push(key);
+    }
+    let owner_of = |key: &[u8]| {
+        let slot = key_slot(key);
+        servers
+            .iter()
+            .find(|s| {
+                nodes.iter().any(|n| {
+                    n.port == s.port
+                        && n.primary
+                        && n.slots.iter().any(|(a, b)| (*a..=*b).contains(&slot))
+                })
+            })
+            .unwrap()
+    };
+    let owners: std::collections::HashSet<u16> = keys.iter().map(|k| owner_of(k).port).collect();
+    assert_eq!(owners.len(), 3, "the keys cover every primary");
+    let mut expected = Vec::new();
+    for key in &keys {
+        expected.push(canonical(owner_of(key), key).await);
+    }
+    let names: Vec<String> = cluster
+        .scan_report("xfer:*", 1000)
+        .await
+        .unwrap()
+        .keys
+        .into_iter()
+        .map(|k| k.name)
+        .collect();
+    assert_eq!(names.len(), keys.len());
+    let flush_single = async || {
+        let _: () = redis::cmd("FLUSHALL")
+            .query_async(&mut standalone.raw().await)
+            .await
+            .unwrap();
+    };
+
+    for format in Format::ALL {
+        // Cluster to a standalone server.
+        let (report, bytes) = cluster
+            .export_to(&names, format, false, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(report.written, 30, "{format:?}");
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        flush_single().await;
+        let parsed = transfer::parse(&bytes).unwrap();
+        single.import_parsed(&parsed, false).await.unwrap();
+        for (key, want) in keys.iter().zip(&expected) {
+            assert_eq!(
+                &canonical(&standalone, key).await,
+                want,
+                "{format:?} into standalone"
+            );
+        }
+
+        // And back into the cluster, each key landing on its owner.
+        assert_eq!(cluster.delete_keys(&names).await.unwrap(), 30);
+        cluster.import_parsed(&parsed, false).await.unwrap();
+        for (key, want) in keys.iter().zip(&expected) {
+            assert_eq!(
+                &canonical(owner_of(key), key).await,
+                want,
+                "{format:?} into cluster"
+            );
+        }
+        // Overwriting in place works too.
+        if format != Format::Commands {
+            assert!(
+                cluster.import_parsed(&parsed, false).await.is_err(),
+                "{format:?}"
+            );
+            cluster.import_parsed(&parsed, true).await.unwrap();
+            for (key, want) in keys.iter().zip(&expected) {
+                assert_eq!(
+                    &canonical(owner_of(key), key).await,
+                    want,
+                    "{format:?} replaced"
+                );
+            }
+        }
+
+        // Standalone to the cluster.
+        let (_, bytes) = single
+            .export_to(&names, format, format == Format::Commands, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(cluster.delete_keys(&names).await.unwrap(), 30);
+        cluster
+            .import_parsed(&transfer::parse(&bytes).unwrap(), false)
+            .await
+            .unwrap();
+        for (key, want) in keys.iter().zip(&expected) {
+            assert_eq!(
+                &canonical(owner_of(key), key).await,
+                want,
+                "{format:?} from standalone"
+            );
+        }
+    }
+
+    // A hand-written file that jumps between slots runs key by key.
+    let text: Vec<&String> = names.iter().filter(|n| !n.contains('\\')).collect();
+    let (a, b) = (text[0], text[1]);
+    let file = format!(
+        "DEL {a}\nDEL {b}\nRPUSH {a} x\nRPUSH {b} y\nRPUSH {a} z\nPEXPIRE {b} 100000\nMSET {{tag}}:1 one {{tag}}:2 two\n"
+    );
+    let report = cluster
+        .import_parsed(&transfer::parse(file.as_bytes()).unwrap(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.commands, 7);
+    let list: Vec<String> = redis::cmd("LRANGE")
+        .arg(a.as_str())
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut owner_of(a.as_bytes()).raw().await)
+        .await
+        .unwrap();
+    assert_eq!(list, ["x", "z"]);
+    assert_eq!(
+        raw_get(owner(&servers, &nodes, "{tag}:2"), "{tag}:2")
+            .await
+            .as_deref(),
+        Some("two")
+    );
+    // A multi-key line across slots is refused, and neither key is touched,
+    // even after earlier lines of the same file ran.
+    let other = text
+        .iter()
+        .find(|n| key_slot(n.as_bytes()) != key_slot(a.as_bytes()))
+        .unwrap();
+    for line in [format!("DEL {a} {other}"), format!("MSET {a} 1 {other} 2")] {
+        let file = format!("SET {{tag}}:3 before\n{line}\nSET {{tag}}:4 after\n");
+        let err = cluster
+            .import_parsed(&transfer::parse(file.as_bytes()).unwrap(), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("line 2: "), "{err}");
+        assert!(err.contains("different cluster slots"), "{err}");
+        assert!(err.contains("1 command(s) before it ran"), "{err}");
+        assert!(raw_exists(owner_of(a.as_bytes()), a).await);
+        assert!(raw_exists(owner_of(other.as_bytes()), other).await);
+        assert!(!raw_exists(owner(&servers, &nodes, "{tag}:4"), "{tag}:4").await);
+    }
+    drop(servers);
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server and redis-cli; starts disposable local instances"]
+async fn big_keys_replace_whole_on_a_cluster_and_through_sentinel() {
+    use rediscope::transfer::{Record, Value};
+    let _serial = SERIAL.lock().await;
+    let servers = start_cluster().await;
+    let cluster = Client::connect(servers[0].profile(Deployment::Cluster))
+        .await
+        .unwrap();
+    let nodes = cluster.refresh_topology().await.unwrap();
+    let primary = Server::start(false, None).await;
+    let sentinel = Server::start(false, Some(primary.port)).await;
+    let mut profile = sentinel.profile(Deployment::Sentinel);
+    profile.sentinel_master = "test-primary".into();
+    let through_sentinel = Client::connect(profile).await.unwrap();
+
+    // With and without a hash tag, big enough for many pipelines, and small.
+    let records = |ttl: Option<i64>| {
+        vec![
+            Record {
+                key: b"big:plain".to_vec(),
+                ttl_ms: ttl,
+                value: Value::List((0..120_000).map(|i| i.to_string().into_bytes()).collect()),
+            },
+            Record {
+                key: b"{big}:tagged".to_vec(),
+                ttl_ms: None,
+                value: Value::Hash(
+                    (0..40_000)
+                        .map(|i| (format!("f{i:08}").into_bytes(), vec![b'v'; 30]))
+                        .collect(),
+                ),
+            },
+            Record {
+                key: b"small".to_vec(),
+                ttl_ms: ttl,
+                value: Value::Set(vec![b"a".to_vec(), b"b".to_vec()]),
+            },
+        ]
+    };
+    let dbsize = async |server: &Server| -> i64 {
+        redis::cmd("DBSIZE")
+            .query_async(&mut server.raw().await)
+            .await
+            .unwrap()
+    };
+    for key in ["big:plain", "{big}:tagged", "small"] {
+        cluster.set_string(key, "old").await.unwrap();
+        through_sentinel.set_string(key, "old").await.unwrap();
+    }
+    assert!(cluster.import_records(&records(None), false).await.is_err());
+    for (client, what) in [(&cluster, "cluster"), (&through_sentinel, "sentinel")] {
+        let report = client
+            .import_records(&records(Some(600_000)), true)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(report.keys, 3, "{what}");
+    }
+    for key in ["big:plain", "{big}:tagged", "small"] {
+        let server = owner(&servers, &nodes, key);
+        for (server, what) in [(server, "cluster"), (&primary, "sentinel")] {
+            let kind: String = redis::cmd("TYPE")
+                .arg(key)
+                .query_async(&mut server.raw().await)
+                .await
+                .unwrap();
+            let want = match key {
+                "big:plain" => "list",
+                "small" => "set",
+                _ => "hash",
+            };
+            assert_eq!(kind, want, "{what} {key}");
+        }
+    }
+    let len: i64 = redis::cmd("LLEN")
+        .arg("big:plain")
+        .query_async(&mut owner(&servers, &nodes, "big:plain").raw().await)
+        .await
+        .unwrap();
+    assert_eq!(len, 120_000);
+    let ttl: i64 = redis::cmd("PTTL")
+        .arg("big:plain")
+        .query_async(&mut primary.raw().await)
+        .await
+        .unwrap();
+    assert!(ttl > 500_000, "{ttl}");
+    // Nothing temporary is left on any node.
+    let mut total = 0;
+    for server in &servers {
+        total += dbsize(server).await;
+    }
+    assert_eq!(total, 3);
+    assert_eq!(dbsize(&primary).await, 3);
+    drop(servers);
+}
