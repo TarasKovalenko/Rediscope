@@ -69,12 +69,20 @@ the first version goes in by hand:
    Windows machine, `winget install --manifest <that directory>`.
 3. Open the pull request and wait for it to be merged. `wingetcreate submit`
    does steps 1 and 3 for you if you prefer.
-4. Fork `microsoft/winget-pkgs` under `TarasKovalenko` if it isn't already.
-   The action pushes its branches there.
-5. Create a classic personal access token with the `public_repo` scope, which
-   is what winget-releaser asks for, and add it as `WINGET_TOKEN`. It opens
-   pull requests on a repository you don't own, so a fine-grained token
-   limited to your own repositories won't do.
+4. Create a separate GitHub account for this, say `rediscope-bot`, and fork
+   `microsoft/winget-pkgs` under it. The action pushes its branches there.
+5. On that account, create a classic personal access token with the
+   `public_repo` scope and add it here as `WINGET_TOKEN`. Set the repository
+   variable `WINGET_FORK_USER` to the account's name.
+
+   Why a second account: a classic `public_repo` token can push to every
+   public repository its owner has, and the action runs tools it downloads at
+   release time. On your own account that would include this repository.
+
+The files in `winget/` only matter for that first pull request. Later
+versions are built by the action from the manifest already in winget-pkgs,
+so a change to the templates (a new dependency, say) has to be made in
+winget-pkgs by hand as well.
 
 Add the secret only after step 3. Before that the job fails, because the
 package doesn't exist yet.

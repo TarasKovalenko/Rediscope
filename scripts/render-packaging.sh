@@ -62,7 +62,8 @@ out="${3:-dist/packaging}"
 sha_of() {
   name="$(asset_name "$tag" "$1")"
   hash="$(awk -v n="$name" '$2 == n || $2 == "*" n {print $1}' "$sums")"
-  printf '%s' "$hash" | grep -Eq '^[0-9a-fA-F]{64}$' \
+  [ "$(printf '%s\n' "$hash" | grep -c .)" -eq 1 ] \
+    && printf '%s' "$hash" | grep -Eq '^[0-9a-fA-F]{64}$' \
     || die "missing or ambiguous checksum for $name in $sums"
   printf '%s' "$hash" | tr 'A-F' 'a-f'
 }
