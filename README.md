@@ -284,8 +284,13 @@ rediscope
   keeps commands whose name or arguments match. A busy server runs more
   commands than a terminal can show, so the feed takes at most 500 every
   100 ms and counts the rest as "too fast to show" instead of queueing them,
-  and keeps the first 2 KiB of each command's arguments. The `MONITOR`
-  connection closes with the feed, however the feed goes away.
+  and keeps the first 2 KiB of each command's arguments. `d` narrows the list
+  to one database: the one the profile has open, then each other database a
+  command has been seen in, then all of them again. The title names the
+  database while the list is narrowed.
+  It only changes what is listed, so switching is instant and loses nothing;
+  the rate, the totals and that 500 per batch still cover every database. The
+  `MONITOR` connection closes with the feed, however the feed goes away.
   A production profile asks before starting it, because `MONITOR` costs the
   server real throughput while it runs; `Esc` stops it. Standalone profiles
   only for now, like pub/sub.
@@ -535,6 +540,7 @@ Press `?` in the app for this list at any time.
 | Key | Action |
 |---|---|
 | `s` | Change what the feed is subscribed to · in the command monitor, change its filter |
+| `d` | In the command monitor: all databases, the profile's own, or each one seen so far |
 | `w` | Publish a message |
 | `f` | Follow the newest message · `↑` `↓` `PgUp` `PgDn` scroll back |
 | `c` / `y` | Clear the feed and its statistics · copy it |

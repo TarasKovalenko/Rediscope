@@ -2968,6 +2968,8 @@ pub struct MonitorLine {
     /// Database and client, then the arguments as Redis quoted them:
     /// `db0 127.0.0.1:52100  "user:1" "ada"`.
     pub detail: String,
+    /// The database the command ran against, when the line names one.
+    pub db: Option<i64>,
 }
 
 impl MonitorLine {
@@ -3006,6 +3008,7 @@ pub fn parse_monitor_line(line: &str) -> Option<MonitorLine> {
         detail: format!("db{db} {client}  {arguments}")
             .trim_end()
             .to_string(),
+        db: db.parse().ok(),
     })
 }
 
@@ -3669,12 +3672,19 @@ mod tests {
             line.detail,
             r#"db0 127.0.0.1:52100  "user:1" "ada lovelace""#
         );
+        assert_eq!(line.db, Some(0));
 
         let lua = parse_monitor_line(r#"1718000000.1 [3 lua] "incr" "hits""#).unwrap();
         assert_eq!(
             (lua.command.as_str(), lua.detail.as_str()),
             ("INCR", r#"db3 lua  "hits""#)
         );
+        assert_eq!(lua.db, Some(3), "a script's commands name its database");
+        let high = parse_monitor_line(r#"1.0 [15 10.0.0.1:6000] "get" "k""#).unwrap();
+        assert_eq!(high.db, Some(15));
+        // A source the feed cannot read a database from is still shown.
+        let odd = parse_monitor_line(r#"1.0 [? 10.0.0.1:6000] "get" "k""#).unwrap();
+        assert_eq!((odd.command.as_str(), odd.db), ("GET", None));
 
         let unix = parse_monitor_line(r#"1.0 [0 unix:/tmp/redis.sock] "ping""#).unwrap();
         assert_eq!(unix.command, "PING");

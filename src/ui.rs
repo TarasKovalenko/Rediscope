@@ -1779,7 +1779,7 @@ fn pubsub_feed(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette)
     clear_area(f, rect, palette);
     let title = if state.monitor {
         format!(
-            "{} — s filter · f follow · c clear · y copy · esc stops",
+            "{} — s filter · d database · f follow · c clear · y copy · esc stops",
             state.title()
         )
     } else {
@@ -1804,8 +1804,8 @@ fn pubsub_feed(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palette)
     // The selected message gets a preview pane when its payload is structured,
     // the way the value pane previews a selected element.
     let selected = state
-        .messages
-        .get(state.scroll.min(state.messages.len().saturating_sub(1)));
+        .shown_iter()
+        .nth(state.scroll.min(state.shown_len().saturating_sub(1)));
     let preview =
         selected.and_then(|m| structured_document(std::slice::from_ref(&m.payload), palette));
     let panes = if preview.is_some() && rows[2].height >= 10 {
@@ -1883,7 +1883,7 @@ fn feed_header(f: &mut Frame, spark: Rect, counters: Rect, state: &PubSubState, 
                     "  ·  peak {}  ·  {} total  ·  {} shown",
                     state.peak,
                     state.total,
-                    state.messages.len()
+                    state.shown_len(),
                 ),
                 Style::new().fg(palette.dim),
             ),
@@ -1965,7 +1965,7 @@ fn feed_messages(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palett
     let height = area.height as usize;
     // Follow mode keeps the newest message in view; otherwise the cursor
     // decides which window to show.
-    let last = state.messages.len().saturating_sub(1);
+    let last = state.shown_len().saturating_sub(1);
     let anchor = state.scroll.min(last);
     let start = anchor.saturating_sub(height.saturating_sub(1));
     // A 10-column terminal leaves nothing for a channel column; clamp rather
@@ -1976,8 +1976,7 @@ fn feed_messages(f: &mut Frame, area: Rect, state: &PubSubState, palette: Palett
         .max(1);
     let payload_width = (area.width as usize).saturating_sub(channel_width + age_width + 2);
     let lines: Vec<Line> = state
-        .messages
-        .iter()
+        .shown_iter()
         .enumerate()
         .skip(start)
         .take(height)
@@ -2463,6 +2462,10 @@ fn help_text(palette: Palette) -> Vec<Line<'static>> {
         row(
             "P",
             "pub/sub feed    N  keyspace events    W  command monitor",
+        ),
+        row(
+            "W  then d",
+            "monitor every database, this one, or one the feed has seen",
         ),
         row(
             "S",

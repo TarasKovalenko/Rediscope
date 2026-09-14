@@ -1205,6 +1205,40 @@ async fn the_monitor_feed_and_filtered_collections_render_at_any_size() {
     assert!(render_text(&mut a, 140, 40).contains("waiting for commands"));
 }
 
+/// `d` narrows the monitor to one database; the header names it, and only
+/// that database's commands are listed.
+#[tokio::test]
+async fn the_monitor_lists_one_database_after_d() {
+    let mut a = app();
+    populate(&mut a);
+    let mut feed = rediscope::app::PubSubState::monitor(vec![]);
+    for (db, key) in [(0, "zero:1"), (3, "three:1"), (0, "zero:2"), (3, "three:2")] {
+        feed.push_command(rediscope::redis_client::MonitorLine {
+            command: "GET".into(),
+            detail: format!("db{db} 10.0.0.7:51234  \"{key}\""),
+            db: Some(db),
+        });
+    }
+    a.modal = Some(Modal::PubSub(feed));
+    let screen = render_text(&mut a, 140, 30);
+    assert!(!screen.contains(" only"), "every database: {screen}");
+    assert!(screen.contains("d database"), "{screen}");
+    assert!(
+        screen.contains("three:2") && screen.contains("zero:2"),
+        "{screen}"
+    );
+
+    press(&mut a, KeyCode::Char('d')); // db0, this profile's
+    press(&mut a, KeyCode::Char('d')); // db3, seen in the feed
+    render_all_sizes(&mut a);
+    let screen = render_text(&mut a, 140, 30);
+    assert!(screen.contains("db3 only"), "{screen}");
+    assert!(screen.contains("2 shown"), "{screen}");
+    assert!(screen.contains("4 total"), "{screen}");
+    assert!(screen.contains("three:1"), "{screen}");
+    assert!(!screen.contains("zero:1"), "{screen}");
+}
+
 /// The footer drops whole hints when it runs out of room, never help and
 /// quit, which stay pinned to the right on both screens. `v` is only offered
 /// once some profile has a group.

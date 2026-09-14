@@ -334,3 +334,91 @@ async fn the_filter_sees_arguments_past_the_part_the_feed_keeps() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn d_narrows_the_feed_to_one_database() {
+    let Some(conn) = conn(Environment::Development) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let client = Client::connect(conn.clone()).await.unwrap();
+    let elsewhere = Client::connect(Connection { db: 6, ..conn }).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(Store::default(), tx);
+    app.screen = Screen::Browser;
+    app.client = Some(client.clone());
+    app.on_key(KeyEvent::from(KeyCode::Char('W')));
+    app.on_key(KeyEvent::from(KeyCode::Char('s')));
+    for c in "mondb:".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    for i in 0..3 {
+        client
+            .execute_raw(&format!("SET mondb:zero:{i} x"))
+            .await
+            .unwrap();
+        elsewhere
+            .execute_raw(&format!("SET mondb:six:{i} x"))
+            .await
+            .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            app.on_msg(msg);
+        }
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("the feed closed")
+        };
+        if state.total >= 6 || tokio::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    let payloads = |app: &App| -> Vec<String> {
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("the feed closed")
+        };
+        state.shown().iter().map(|m| m.payload.clone()).collect()
+    };
+    assert_eq!(payloads(&app).len(), 6, "every database to start with");
+
+    // This profile's own database first.
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    let zero = payloads(&app);
+    assert_eq!(zero.len(), 3, "{zero:?}");
+    assert!(
+        zero.iter()
+            .all(|p| p.starts_with("db0 ") && p.contains("mondb:zero"))
+    );
+
+    // Then the other database the feed has seen.
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    let six = payloads(&app);
+    assert_eq!(six.len(), 3, "{six:?}");
+    assert!(
+        six.iter()
+            .all(|p| p.starts_with("db6 ") && p.contains("mondb:six"))
+    );
+
+    // A new text filter keeps the database it was showing.
+    app.on_key(KeyEvent::from(KeyCode::Char('s')));
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    let Some(Modal::PubSub(state)) = &app.modal else {
+        panic!("the feed closed")
+    };
+    assert_eq!(state.db_filter, Some(6));
+
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    let (mut zero_keys, mut six_keys) = (String::from("DEL"), String::from("DEL"));
+    for i in 0..3 {
+        zero_keys.push_str(&format!(" mondb:zero:{i}"));
+        six_keys.push_str(&format!(" mondb:six:{i}"));
+    }
+    client.execute_raw(&zero_keys).await.unwrap();
+    elsewhere.execute_raw(&six_keys).await.unwrap();
+}

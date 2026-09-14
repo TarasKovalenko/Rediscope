@@ -20,8 +20,8 @@ use crate::memory::{PrefixRow, Rollup};
 use crate::palette::{PaletteState, Target};
 use crate::redis_client::{
     Client, CommandTable, Coverage, Diagnostics, EditOutcome, EditTarget, ExportEntry, KEY_LIMIT,
-    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, ServerInfo, Similar, SimilarTo, StreamGroup,
-    StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
+    KEY_LIMIT_MAX, KeyInfo, KeyType, KeyValue, MonitorLine, ServerInfo, Similar, SimilarTo,
+    StreamGroup, StreamGroupDetail, VALUE_LIMIT, VALUE_LIMIT_MAX, Window, is_destructive,
 };
 use crate::theme::Theme;
 use crate::tree::{SortMode, Tree, VisibleRow};
@@ -103,7 +103,7 @@ pub enum Msg {
     /// Commands seen by `MONITOR` since the last batch, as (command, detail),
     /// and how many more arrived than a batch keeps.
     MonitorBatch {
-        lines: Vec<(String, String)>,
+        lines: Vec<MonitorLine>,
         dropped: u64,
     },
     /// Consumer groups of the open stream.
@@ -218,7 +218,10 @@ pub enum Action {
     /// Start `MONITOR`, after a production profile confirmed it.
     Monitor,
     /// Restart `MONITOR` keeping only commands matching the typed patterns.
-    MonitorFilter,
+    /// The database the feed was showing comes back with it.
+    MonitorFilter {
+        db: Option<i64>,
+    },
     /// Publish a message from the pub/sub feed.
     Publish,
     /// Delete every marked key.
@@ -840,6 +843,8 @@ pub struct FeedMessage {
     pub at: std::time::Instant,
     pub channel: String,
     pub payload: String,
+    /// The database a monitored command ran against. `None` for pub/sub.
+    pub db: Option<i64>,
 }
 
 pub struct PubSubState {
@@ -873,6 +878,18 @@ pub struct PubSubState {
     pub peak: u32,
     /// Messages per channel, in the order the channels first appeared.
     pub channels: Vec<(String, u64)>,
+    /// The database the monitored profile has open, offered first by `d`.
+    pub current_db: i64,
+    /// The one database the monitor shows, or `None` for all of them. Only
+    /// what is listed changes: the rate and totals still count everything.
+    pub db_filter: Option<i64>,
+    /// Every database a command has been seen in, in order.
+    pub dbs: Vec<i64>,
+    /// How many of `messages` pass `db_filter`, and the filter and message
+    /// count it was taken for. Kept up to date as commands arrive, so a busy
+    /// monitor does not recount the whole buffer for every one of them.
+    listed: usize,
+    listed_for: (Option<i64>, usize),
 }
 
 /// How many messages the feed keeps.
@@ -904,6 +921,11 @@ impl PubSubState {
             total: 0,
             peak: 0,
             channels: Vec::new(),
+            current_db: 0,
+            db_filter: None,
+            dbs: Vec::new(),
+            listed: 0,
+            listed_for: (None, 0),
         }
     }
 
@@ -938,6 +960,95 @@ impl PubSubState {
     }
 
     pub fn push_at(&mut self, channel: String, payload: String, at: std::time::Instant) {
+        self.push_entry(channel, payload, None, at);
+    }
+
+    /// One command from `MONITOR`, grouped under its name and tagged with its
+    /// database.
+    pub fn push_command(&mut self, line: MonitorLine) {
+        self.push_command_at(line, std::time::Instant::now());
+    }
+
+    pub fn push_command_at(&mut self, line: MonitorLine, at: std::time::Instant) {
+        if let Some(db) = line.db
+            && let Err(slot) = self.dbs.binary_search(&db)
+        {
+            self.dbs.insert(slot, db);
+        }
+        self.push_entry(line.command, line.detail, line.db, at);
+    }
+
+    /// Whether `message` passes the database filter.
+    fn shows(&self, message: &FeedMessage) -> bool {
+        self.db_filter.is_none() || message.db == self.db_filter
+    }
+
+    /// The messages the feed lists, oldest first. `scroll` indexes into this.
+    pub fn shown(&self) -> Vec<&FeedMessage> {
+        self.shown_iter().collect()
+    }
+
+    /// [`shown`](Self::shown) without collecting it.
+    pub fn shown_iter(&self) -> impl Iterator<Item = &FeedMessage> {
+        self.messages.iter().filter(|m| self.shows(m))
+    }
+
+    /// How many messages the feed lists. Constant time while the count is
+    /// current, which it is unless `messages` or `db_filter` was changed
+    /// from outside.
+    pub fn shown_len(&self) -> usize {
+        if self.listed_for == (self.db_filter, self.messages.len()) {
+            self.listed
+        } else {
+            self.shown_iter().count()
+        }
+    }
+
+    /// Recount what is listed if the filter or the messages changed from
+    /// outside since the last count.
+    fn sync_listed(&mut self) {
+        self.listed = self.shown_len();
+        self.listed_for = (self.db_filter, self.messages.len());
+    }
+
+    /// `d` in the monitor: every database, then the profile's own, then each
+    /// other database seen so far, then every database again. The cursor goes
+    /// to the newest command that is still listed.
+    pub fn cycle_db(&mut self) {
+        let mut order: Vec<Option<i64>> = vec![None, Some(self.current_db)];
+        order.extend(
+            self.dbs
+                .iter()
+                .filter(|db| **db != self.current_db)
+                .map(|db| Some(*db)),
+        );
+        let at = order.iter().position(|f| *f == self.db_filter).unwrap_or(0);
+        self.db_filter = order[(at + 1) % order.len()];
+        self.sync_listed();
+        let last = self.listed.saturating_sub(1);
+        self.scroll = if self.follow {
+            last
+        } else {
+            self.scroll.min(last)
+        };
+    }
+
+    /// Which databases the monitor lists, for its header.
+    pub fn db_scope(&self) -> String {
+        match self.db_filter {
+            None => "all databases".into(),
+            Some(db) => format!("db{db} only"),
+        }
+    }
+
+    fn push_entry(
+        &mut self,
+        channel: String,
+        payload: String,
+        db: Option<i64>,
+        at: std::time::Instant,
+    ) {
+        self.sync_listed();
         self.advance_to(at);
         self.rate[self.slot(self.bucket)] += 1;
         self.peak = self.peak.max(self.rate[self.slot(self.bucket)]);
@@ -947,18 +1058,30 @@ impl PubSubState {
             None => self.channels.push((channel.clone(), 1)),
         }
 
-        self.messages.push(FeedMessage {
+        let message = FeedMessage {
             at,
             channel,
             payload,
-        });
+            db,
+        };
+        if self.shows(&message) {
+            self.listed += 1;
+        }
+        self.messages.push(message);
         if self.messages.len() > PUBSUB_LIMIT {
             let overflow = self.messages.len() - PUBSUB_LIMIT;
+            // The cursor counts listed messages, so only those move it.
+            let listed = self.messages[..overflow]
+                .iter()
+                .filter(|m| self.shows(m))
+                .count();
             self.messages.drain(..overflow);
-            self.scroll = self.scroll.saturating_sub(overflow);
+            self.listed -= listed;
+            self.scroll = self.scroll.saturating_sub(listed);
         }
+        self.listed_for = (self.db_filter, self.messages.len());
         if self.follow {
-            self.scroll = self.messages.len().saturating_sub(1);
+            self.scroll = self.listed.saturating_sub(1);
         }
     }
 
@@ -993,6 +1116,7 @@ impl PubSubState {
     pub fn clear(&mut self) {
         self.dropped = 0;
         self.messages.clear();
+        self.sync_listed();
         self.channels.clear();
         self.rate = [0; PUBSUB_RATE_WINDOW];
         self.total = 0;
@@ -1020,10 +1144,16 @@ impl PubSubState {
 
     pub fn title(&self) -> String {
         if self.monitor {
-            return if self.patterns.is_empty() {
-                "Command monitor — every command".into()
+            let what = if self.patterns.is_empty() {
+                "every command".to_string()
             } else {
-                format!("Command monitor — {}", self.patterns.join(" "))
+                self.patterns.join(" ")
+            };
+            // Every database is the usual case, and the title is already
+            // long enough to be cut off, so only a narrowed feed says so.
+            return match self.db_filter {
+                None => format!("Command monitor — {what}"),
+                Some(_) => format!("Command monitor — {what} · {}", self.db_scope()),
             };
         }
         let what = if self.keyspace {
@@ -1813,8 +1943,8 @@ impl App {
                 };
                 match feed {
                     Some(state) => {
-                        for (command, detail) in lines {
-                            state.push(command, detail);
+                        for line in lines {
+                            state.push_command(line);
                         }
                         state.push_dropped(dropped);
                     }
@@ -3656,7 +3786,7 @@ impl App {
             });
             return;
         }
-        self.start_monitor(Vec::new());
+        self.start_monitor(Vec::new(), None);
     }
 
     /// Open a `MONITOR` connection and stream what it sees into the feed.
@@ -3664,7 +3794,7 @@ impl App {
     /// A busy server runs far more commands than a terminal can show, so the
     /// reader batches them every [`MONITOR_FLUSH`] and keeps at most
     /// [`MONITOR_BATCH`] per batch; the rest are counted, not queued.
-    fn start_monitor(&mut self, filters: Vec<String>) {
+    fn start_monitor(&mut self, filters: Vec<String>, db_filter: Option<i64>) {
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -3672,6 +3802,9 @@ impl App {
             old.stop();
         }
         let mut state = PubSubState::monitor(filters.clone());
+        state.current_db = client.conn.db;
+        state.db_filter = db_filter;
+        state.dbs.extend(db_filter);
         // Lowercased once here, and each line once below, rather than both
         // for every pattern on every command.
         let patterns: Vec<Vec<u8>> = filters
@@ -3690,7 +3823,7 @@ impl App {
             };
             let mut stream = monitor.into_on_message::<String>();
             let mut tick = tokio::time::interval(MONITOR_FLUSH);
-            let mut batch: Vec<(String, String)> = Vec::new();
+            let mut batch: Vec<MonitorLine> = Vec::new();
             let mut dropped = 0u64;
             loop {
                 tokio::select! {
@@ -3718,8 +3851,7 @@ impl App {
                             }
                         }
                         if batch.len() < MONITOR_BATCH {
-                            let parsed = parsed.shortened();
-                            batch.push((parsed.command, parsed.detail));
+                            batch.push(parsed.shortened());
                         } else {
                             dropped += 1;
                         }
@@ -4764,20 +4896,30 @@ impl App {
                 KeyCode::Char('f') => {
                     state.follow = !state.follow;
                     if state.follow {
-                        state.scroll = state.messages.len().saturating_sub(1);
+                        state.scroll = state.shown_len().saturating_sub(1);
                     }
                 }
                 KeyCode::Char('s') if state.monitor => {
                     state.stop();
                     let current = state.patterns.join(" ");
+                    let db = state.db_filter;
                     self.modal = Some(Modal::Form {
                         title: "Monitor filter".into(),
                         hint: "Space-separated globs or words, matched against the command and its arguments · empty watches everything".into(),
                         fields: vec![Field::text("Keep commands matching", &current)],
                         focus: 0,
                         error: None,
-                        action: Action::MonitorFilter,
+                        action: Action::MonitorFilter { db },
                     });
+                }
+                KeyCode::Char('d') if state.monitor => {
+                    state.cycle_db();
+                    let own = if state.db_filter == Some(state.current_db) {
+                        ", the database this profile has open"
+                    } else {
+                        ""
+                    };
+                    self.status = format!("Command monitor: {}{own}", state.db_scope());
                 }
                 KeyCode::Char('w') if state.monitor => {
                     self.status = "Publishing belongs to the pub/sub feed (P)".into();
@@ -4816,7 +4958,7 @@ impl App {
                 }
                 KeyCode::Char('y') => {
                     let text = state
-                        .messages
+                        .shown()
                         .iter()
                         .map(|m| format!("{}  {}", m.channel, m.payload))
                         .collect::<Vec<_>>()
@@ -4826,7 +4968,7 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     state.follow = false;
-                    state.scroll = (state.scroll + 1).min(state.messages.len().saturating_sub(1));
+                    state.scroll = (state.scroll + 1).min(state.shown_len().saturating_sub(1));
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.follow = false;
@@ -4834,7 +4976,7 @@ impl App {
                 }
                 KeyCode::PageDown => {
                     state.follow = false;
-                    state.scroll = (state.scroll + 10).min(state.messages.len().saturating_sub(1));
+                    state.scroll = (state.scroll + 10).min(state.shown_len().saturating_sub(1));
                 }
                 KeyCode::PageUp => {
                     state.follow = false;
@@ -4845,7 +4987,7 @@ impl App {
                     state.scroll = 0;
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    state.scroll = state.messages.len().saturating_sub(1);
+                    state.scroll = state.shown_len().saturating_sub(1);
                     state.follow = true;
                 }
                 _ => {}
@@ -5346,10 +5488,10 @@ impl App {
             Action::StreamDel { key, id } => self.mutate("Entry deleted", move |c| async move {
                 c.stream_delete(&key, &id).await
             }),
-            Action::Monitor => self.start_monitor(Vec::new()),
-            Action::MonitorFilter => {
+            Action::Monitor => self.start_monitor(Vec::new(), None),
+            Action::MonitorFilter { db } => {
                 let filters = v(0).split_whitespace().map(str::to_string).collect();
-                self.start_monitor(filters);
+                self.start_monitor(filters, db);
             }
             Action::Subscribe => {
                 let patterns: Vec<String> = v(0).split_whitespace().map(str::to_string).collect();
@@ -7249,9 +7391,9 @@ mod tests {
         app.modal = Some(Modal::PubSub(PubSubState::monitor(vec![])));
         app.on_msg(Msg::MonitorBatch {
             lines: vec![
-                ("SET".into(), "db0 1.2.3.4:5  \"k\" \"v\"".into()),
-                ("GET".into(), "db0 1.2.3.4:5  \"k\"".into()),
-                ("SET".into(), "db0 1.2.3.4:5  \"k2\" \"v\"".into()),
+                command("SET", 0, "\"k\" \"v\""),
+                command("GET", 0, "\"k\""),
+                command("SET", 0, "\"k2\" \"v\""),
             ],
             dropped: 7,
         });
@@ -7267,7 +7409,7 @@ mod tests {
         // A monitor batch never lands in a pub/sub feed.
         app.modal = Some(Modal::PubSub(PubSubState::new(vec!["*".into()], false)));
         app.on_msg(Msg::MonitorBatch {
-            lines: vec![("SET".into(), "x".into())],
+            lines: vec![command("SET", 0, "x")],
             dropped: 0,
         });
         let Some(Modal::PubSub(state)) = &app.modal else {
@@ -7287,8 +7429,154 @@ mod tests {
         let Some(Modal::Form { action, fields, .. }) = &app.modal else {
             panic!("expected the filter form")
         };
-        assert!(matches!(action, Action::MonitorFilter));
+        assert!(matches!(action, Action::MonitorFilter { db: None }));
         assert_eq!(fields[0].input.value(), "user:*");
+    }
+
+    fn command(name: &str, db: i64, args: &str) -> MonitorLine {
+        MonitorLine {
+            command: name.into(),
+            detail: format!("db{db} 1.2.3.4:5  {args}"),
+            db: Some(db),
+        }
+    }
+
+    fn listed(state: &PubSubState) -> Vec<String> {
+        state.shown().iter().map(|m| m.payload.clone()).collect()
+    }
+
+    #[test]
+    fn d_cycles_the_monitor_through_all_this_and_each_seen_database() {
+        let mut state = PubSubState::monitor(vec![]);
+        state.current_db = 2;
+        for (db, args) in [(0, "a"), (5, "b"), (2, "c"), (0, "d"), (11, "e")] {
+            state.push_command(command("GET", db, args));
+        }
+        assert_eq!(state.dbs, [0, 2, 5, 11]);
+        let dbs_listed = |state: &PubSubState| -> Vec<Option<i64>> {
+            state.shown().iter().map(|m| m.db).collect()
+        };
+        assert_eq!(state.shown().len(), 5);
+        assert_eq!(state.db_scope(), "all databases");
+        assert_eq!(state.title(), "Command monitor — every command");
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            state.cycle_db();
+            seen.push((state.db_filter, state.shown().len()));
+        }
+        assert_eq!(
+            seen,
+            [
+                (Some(2), 1),
+                (Some(0), 2),
+                (Some(5), 1),
+                (Some(11), 1),
+                (None, 5)
+            ],
+            "this database first, then the others in order"
+        );
+
+        state.cycle_db();
+        assert_eq!(state.db_scope(), "db2 only");
+        assert_eq!(dbs_listed(&state), [Some(2)]);
+        state.cycle_db();
+        assert_eq!(state.db_scope(), "db0 only");
+        assert_eq!(listed(&state), ["db0 1.2.3.4:5  a", "db0 1.2.3.4:5  d"]);
+        assert!(state.title().contains("db0 only"), "{}", state.title());
+        // The totals still count every database.
+        assert_eq!(state.total, 5);
+        assert_eq!(state.channels, [("GET".to_string(), 5)]);
+    }
+
+    #[test]
+    fn the_listed_count_follows_pushes_overflow_filters_and_clearing() {
+        let mut state = PubSubState::monitor(vec![]);
+        let check = |state: &PubSubState, when: &str| {
+            assert_eq!(state.shown_len(), state.shown().len(), "{when}");
+            if state.follow {
+                assert_eq!(state.scroll, state.shown_len().saturating_sub(1), "{when}");
+            }
+        };
+        for i in 0..PUBSUB_LIMIT + 700 {
+            state.push_command(command("GET", (i % 3) as i64, "k"));
+            if i % 250 == 0 {
+                state.cycle_db();
+            }
+            check(&state, &format!("push {i}"));
+        }
+        // Set from outside the methods: still counted right, and the next
+        // push picks the new filter up.
+        state.db_filter = Some(1);
+        check(&state, "filter set directly");
+        state.push_command(command("GET", 1, "k"));
+        check(&state, "push after the direct filter");
+        state.clear();
+        check(&state, "cleared");
+        state.push_command(command("GET", 1, "k"));
+        check(&state, "push after clearing");
+        assert_eq!(state.shown_len(), 1);
+    }
+
+    #[test]
+    fn a_database_filter_keeps_the_cursor_on_listed_commands() {
+        let mut state = PubSubState::monitor(vec![]);
+        for i in 0..10 {
+            state.push_command(command("SET", i % 2, &i.to_string()));
+        }
+        state.cycle_db(); // db0, the current one
+        assert_eq!(state.shown().len(), 5);
+        assert_eq!(state.scroll, 4, "following, so on the newest listed");
+
+        state.follow = false;
+        state.scroll = 1;
+        state.push_command(command("SET", 1, "hidden"));
+        assert_eq!(state.scroll, 1, "an unlisted command does not move it");
+
+        // Past the cap, dropping unlisted commands leaves the cursor alone.
+        let mut state = PubSubState::monitor(vec![]);
+        state.push_command(command("GET", 0, "kept"));
+        for _ in 0..PUBSUB_LIMIT {
+            state.push_command(command("GET", 1, "other"));
+        }
+        state.cycle_db();
+        assert!(state.shown().is_empty(), "db0's one command fell off");
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn d_in_the_monitor_changes_the_database_and_survives_a_new_filter() {
+        let mut app = tick_app(vec![]);
+        let mut state = PubSubState::monitor(vec![]);
+        state.push_command(command("GET", 0, "a"));
+        state.push_command(command("GET", 4, "b"));
+        app.modal = Some(Modal::PubSub(state));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(
+            app.status,
+            "Command monitor: db0 only, the database this profile has open"
+        );
+        press(&mut app, KeyCode::Char('d'));
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("feed closed")
+        };
+        assert_eq!(state.db_filter, Some(4));
+        assert!(app.status.contains("db4 only"), "{}", app.status);
+
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('s'));
+        let Some(Modal::Form { action, .. }) = &app.modal else {
+            panic!("expected the filter form")
+        };
+        assert!(matches!(action, Action::MonitorFilter { db: Some(4) }));
+
+        // A pub/sub feed has no databases to pick from.
+        app.modal = Some(Modal::PubSub(feed()));
+        press(&mut app, KeyCode::Char('d'));
+        let Some(Modal::PubSub(state)) = &app.modal else {
+            panic!("feed closed")
+        };
+        assert_eq!(state.db_filter, None);
     }
 
     #[test]
