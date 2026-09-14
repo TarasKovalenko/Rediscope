@@ -79,9 +79,8 @@ fn title_bar(f: &mut Frame, area: Rect, app: &App, palette: Palette) {
                 Style::new().fg(palette.warning).bold(),
             ));
         }
-        let scheme = if c.tls { "rediss" } else { "redis" };
         spans.push(Span::styled(
-            format!("{}  {scheme}://{}:{}/{}", c.name, c.host, c.port, c.db),
+            format!("{}  {}", c.name, c.address()),
             Style::new().fg(palette.foreground),
         ));
         if !app.server_line.is_empty() {
@@ -245,16 +244,7 @@ fn connection_line(c: &Connection, app: &App, palette: Palette) -> Vec<Span<'sta
             format!("{:<16}", truncate(&c.name, 16)),
             Style::new().bold(),
         ),
-        Span::styled(
-            format!(
-                "{}://{}:{}/{}",
-                if c.tls { "rediss" } else { "redis" },
-                c.host,
-                c.port,
-                c.db
-            ),
-            Style::new().fg(palette.dim),
-        ),
+        Span::styled(c.address(), Style::new().fg(palette.dim)),
     ];
     if c.environment != crate::config::Environment::Development {
         spans.push(Span::styled(

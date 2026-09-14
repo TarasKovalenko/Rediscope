@@ -143,6 +143,10 @@ pub struct Connection {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// A Unix domain socket to connect through instead of `host` and `port`.
+    /// Empty for a TCP profile, and then left out of the file entirely.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub socket: String,
     #[serde(default)]
     pub db: i64,
     #[serde(default)]
@@ -202,6 +206,7 @@ impl Default for Connection {
             sentinel_password: String::new(),
             host: default_host(),
             port: default_port(),
+            socket: String::new(),
             db: 0,
             username: String::new(),
             password: String::new(),
@@ -222,6 +227,7 @@ impl Default for Connection {
 
 impl Connection {
     pub fn validate_topology(&self) -> Result<()> {
+        self.validate_socket()?;
         anyhow::ensure!(
             self.deployment != Deployment::Cluster || self.db == 0,
             "Cluster supports database 0 only"
@@ -251,6 +257,60 @@ impl Connection {
     /// True when this profile reaches the server through an SSH tunnel.
     pub fn uses_ssh(&self) -> bool {
         !self.ssh_host.trim().is_empty()
+    }
+
+    /// True when this profile connects through a Unix domain socket.
+    pub fn uses_socket(&self) -> bool {
+        !self.socket_path().is_empty()
+    }
+
+    /// The socket path as it is connected to and shown. Surrounding
+    /// whitespace is dropped everywhere, so a stray space in a hand-edited
+    /// file cannot make the profile look like a socket profile but dial a
+    /// path that does not exist.
+    pub fn socket_path(&self) -> &str {
+        self.socket.trim()
+    }
+
+    /// A socket profile talks to one local server, so everything that needs a
+    /// network address has nothing to work with.
+    pub fn validate_socket(&self) -> Result<()> {
+        if !self.uses_socket() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            cfg!(unix),
+            "Unix sockets are not available on this platform; use host and port"
+        );
+        anyhow::ensure!(
+            self.deployment == Deployment::Standalone,
+            "A Unix socket reaches one server; Cluster and Sentinel need host and port"
+        );
+        anyhow::ensure!(
+            !self.uses_ssh(),
+            "A Unix socket is local; it cannot go through an SSH tunnel"
+        );
+        anyhow::ensure!(!self.tls, "TLS does not apply to a Unix socket");
+        Ok(())
+    }
+
+    /// Where the profile points, the way the server list and title bar show
+    /// it: `redis://host:port/db`, `rediss://` with TLS, or `unix://path?db=N`.
+    pub fn address(&self) -> String {
+        if self.uses_socket() {
+            return format!("unix://{}?db={}", url_path(self.socket_path()), self.db);
+        }
+        let scheme = if self.tls { "rediss" } else { "redis" };
+        format!("{scheme}://{}:{}/{}", self.host, self.port, self.db)
+    }
+
+    /// The server part of [`Connection::address`], for status lines.
+    pub fn endpoint(&self) -> String {
+        if self.uses_socket() {
+            self.socket_path().to_string()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
     }
 
     /// The password to authenticate with: the keychain entry when this profile
@@ -286,24 +346,43 @@ impl Connection {
         }
     }
 
-    /// Parse `redis://user:pass@host:port/db` (or `rediss://`) into a profile.
+    /// Parse `redis://user:pass@host:port/db` (or `rediss://`) into a profile,
+    /// or `unix:///path/to/redis.sock?db=N` (also `redis+unix://`), where the
+    /// credentials go in `user` and `pass` query parameters.
     pub fn from_url(url: &str) -> Result<Self> {
+        #[cfg(not(unix))]
+        anyhow::ensure!(
+            !["unix:", "redis+unix:", "valkey+unix:"]
+                .iter()
+                .any(|scheme| url.trim_start().starts_with(scheme)),
+            "Unix sockets are not available on this platform: {url}"
+        );
         let info: redis::ConnectionInfo = url
             .parse::<redis::ConnectionInfo>()
             .with_context(|| format!("invalid redis url: {url}"))?;
-        let (host, port, tls) = match info.addr() {
-            redis::ConnectionAddr::Tcp(h, p) => (h.clone(), p, false),
-            redis::ConnectionAddr::TcpTls { host, port, .. } => (host.clone(), port, true),
-            redis::ConnectionAddr::Unix(path) => {
-                anyhow::bail!("unix sockets are not supported yet: {}", path.display())
+        let (host, port, tls, socket) = match info.addr() {
+            redis::ConnectionAddr::Tcp(h, p) => (h.clone(), *p, false, String::new()),
+            redis::ConnectionAddr::TcpTls { host, port, .. } => {
+                (host.clone(), *port, true, String::new())
             }
+            redis::ConnectionAddr::Unix(path) => (
+                default_host(),
+                default_port(),
+                false,
+                path.display().to_string(),
+            ),
             other => anyhow::bail!("unsupported redis address: {other}"),
         };
         let settings = info.redis_settings();
         Ok(Self {
-            name: host.clone(),
+            name: if socket.is_empty() {
+                host.clone()
+            } else {
+                socket.clone()
+            },
             host,
-            port: *port,
+            port,
+            socket,
             db: settings.db(),
             username: settings.username().unwrap_or_default().to_string(),
             password: settings.password().unwrap_or_default().to_string(),
@@ -311,6 +390,25 @@ impl Connection {
             ..Default::default()
         })
     }
+}
+
+/// `path` written as the path of a URL: the characters that would end the
+/// path or start an escape are percent-encoded, so an address holding a
+/// space, `%`, `?` or `#` still parses back to the same socket.
+fn url_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let escape = |c: char| matches!(c, '%' | '?' | '#' | ' ') || c.is_ascii_control();
+    if !path.contains(escape) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if escape(c) {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 pub fn config_dir() -> PathBuf {
@@ -726,6 +824,152 @@ mod tests {
         assert!(c.tls);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_address_parses_back_to_the_same_path() {
+        for path in [
+            "/tmp/r.sock",
+            "/tmp/my dir/r.sock",
+            "/tmp/100%/r.sock",
+            "/tmp/a?b#c/r.sock",
+            "/tmp/%20/r.sock",
+            "/tmp/café/r.sock",
+        ] {
+            let c = Connection {
+                socket: format!("  {path} "),
+                db: 5,
+                ..Connection::default()
+            };
+            assert_eq!(c.socket_path(), path);
+            let back = Connection::from_url(&c.address()).unwrap();
+            assert_eq!(
+                (back.socket.as_str(), back.db),
+                (path, 5),
+                "{}",
+                c.address()
+            );
+        }
+        let plain = Connection {
+            socket: "/run/redis.sock".into(),
+            ..Connection::default()
+        };
+        assert_eq!(plain.address(), "unix:///run/redis.sock?db=0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_urls_become_socket_profiles() {
+        let c = Connection::from_url("unix:///run/redis/redis.sock").unwrap();
+        assert_eq!(c.socket, "/run/redis/redis.sock");
+        assert_eq!(c.name, "/run/redis/redis.sock");
+        assert_eq!(c.db, 0);
+        assert!(!c.tls);
+        assert!(c.validate_topology().is_ok());
+
+        let c = Connection::from_url("redis+unix:///tmp/r.sock?db=4&user=ada&pass=s3cret").unwrap();
+        assert_eq!(c.socket, "/tmp/r.sock");
+        assert_eq!(c.db, 4);
+        assert_eq!(c.username, "ada");
+        assert_eq!(c.password, "s3cret");
+        assert_eq!(c.address(), "unix:///tmp/r.sock?db=4");
+        assert_eq!(c.endpoint(), "/tmp/r.sock");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn socket_urls_are_refused_where_there_are_no_sockets() {
+        let err = Connection::from_url("unix:///run/redis.sock").unwrap_err();
+        assert!(err.to_string().contains("not available"), "{err}");
+        let socket = Connection {
+            socket: "/run/redis.sock".into(),
+            ..Default::default()
+        };
+        assert!(socket.validate_topology().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_profile_refuses_what_needs_a_network_address() {
+        let socket = || Connection {
+            socket: "/tmp/redis.sock".into(),
+            ..Default::default()
+        };
+        assert!(socket().validate_topology().is_ok());
+        let cases = [
+            (
+                Connection {
+                    tls: true,
+                    ..socket()
+                },
+                "TLS",
+            ),
+            (
+                Connection {
+                    ssh_host: "bastion".into(),
+                    ..socket()
+                },
+                "SSH",
+            ),
+            (
+                Connection {
+                    deployment: Deployment::Cluster,
+                    ..socket()
+                },
+                "Cluster",
+            ),
+            (
+                Connection {
+                    deployment: Deployment::Sentinel,
+                    sentinel_master: "m".into(),
+                    ..socket()
+                },
+                "Sentinel",
+            ),
+        ];
+        for (conn, word) in cases {
+            let err = conn.validate_topology().unwrap_err().to_string();
+            assert!(err.contains(word), "{word}: {err}");
+        }
+        // Whitespace alone is not a socket.
+        let blank = Connection {
+            socket: "  ".into(),
+            tls: true,
+            ..Default::default()
+        };
+        assert!(!blank.uses_socket());
+        assert!(blank.validate_topology().is_ok());
+        assert_eq!(blank.address(), "rediss://127.0.0.1:6379/0");
+    }
+
+    #[test]
+    fn a_socket_path_is_written_only_when_set() {
+        let mut env = ScopedEnv::new();
+        let dir = tempdir();
+        env.set("REDISCOPE_HOME", &dir);
+        let store = Store {
+            connections: vec![
+                Connection {
+                    name: "tcp".into(),
+                    ..Default::default()
+                },
+                Connection {
+                    name: "local socket".into(),
+                    socket: "/tmp/redis.sock".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        store.save().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_file()).unwrap()).unwrap();
+        assert!(json["connections"][0].get("socket").is_none());
+        assert_eq!(json["connections"][1]["socket"], "/tmp/redis.sock");
+        let (loaded, _) = Store::load();
+        assert_eq!(loaded.connections[1].socket, "/tmp/redis.sock");
+        assert!(loaded.connections[0].socket.is_empty());
+    }
+
     #[test]
     fn tilde_expands_with_either_separator() {
         let home = dirs::home_dir().expect("a home directory");
@@ -1014,7 +1258,12 @@ mod tests {
         assert_eq!(store.connection_view, ConnectionView::Grouped);
         store.save().unwrap();
         let text = fs::read_to_string(config_file()).unwrap();
-        for key in ["\"group\"", "connection_view", "collapsed_groups"] {
+        for key in [
+            "\"group\"",
+            "connection_view",
+            "collapsed_groups",
+            "\"socket\"",
+        ] {
             assert!(!text.contains(key), "{key} written: {text}");
         }
     }

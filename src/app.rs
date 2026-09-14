@@ -1336,7 +1336,7 @@ impl App {
             let _ = client.lock_writes();
         }
         self.connecting = true;
-        self.status = format!("Connecting to {}:{} ...", conn.host, conn.port);
+        self.status = format!("Connecting to {} ...", conn.endpoint());
         self.spawn(async move {
             Msg::Connected(Box::new(
                 Client::connect(conn).await.map_err(|e| e.to_string()),
@@ -2137,6 +2137,7 @@ impl App {
             .filter(|(_, c)| {
                 c.name.to_lowercase().contains(&needle)
                     || c.host.to_lowercase().contains(&needle)
+                    || c.socket.to_lowercase().contains(&needle)
                     || c.group_name()
                         .is_some_and(|g| g.to_lowercase().contains(&needle))
             })
@@ -2368,7 +2369,7 @@ impl App {
         };
         let name = conn.name.clone();
         self.testing = Some(name.clone());
-        self.status = format!("Testing {}:{} ...", conn.host, conn.port);
+        self.status = format!("Testing {} ...", conn.endpoint());
         self.spawn(async move {
             let result = Client::probe(conn).await.map_err(|e| e.to_string());
             Msg::Probe(name, Box::new(result))
@@ -2465,6 +2466,7 @@ impl App {
                 Field::text("Group (optional)", c.group_name().unwrap_or_default()),
                 Field::text("Host", &c.host),
                 Field::text("Port", &c.port.to_string()),
+                Field::text("Unix socket (blank uses host and port)", &c.socket),
                 Field::text("Database", &c.db.to_string()),
                 Field::boolean(
                     "Read-only (refuse every write from this profile)",
@@ -5063,6 +5065,7 @@ impl App {
                         if h.is_empty() { "127.0.0.1".into() } else { h }
                     },
                     port: v(f::PORT).trim().parse().unwrap_or(6379),
+                    socket: v(f::SOCKET).trim().to_string(),
                     db: v(f::DATABASE).trim().parse().unwrap_or(0),
                     read_only: v(f::READ_ONLY) == "true",
                     username: v(f::USERNAME).trim().to_string(),
@@ -5659,26 +5662,27 @@ mod conn_field {
     pub const GROUP: usize = 1;
     pub const HOST: usize = 2;
     pub const PORT: usize = 3;
-    pub const DATABASE: usize = 4;
-    pub const READ_ONLY: usize = 5;
-    pub const USERNAME: usize = 6;
-    pub const PASSWORD: usize = 7;
-    pub const KEYCHAIN: usize = 8;
-    pub const TLS: usize = 9;
-    pub const TLS_CA: usize = 10;
-    pub const TLS_CERT: usize = 11;
-    pub const TLS_KEY: usize = 12;
-    pub const TLS_INSECURE: usize = 13;
-    pub const SSH_HOST: usize = 14;
-    pub const SSH_USER: usize = 15;
-    pub const SSH_PORT: usize = 16;
-    pub const SSH_KEY: usize = 17;
-    pub const DEPLOYMENT: usize = 18;
-    pub const SEEDS: usize = 19;
-    pub const SENTINEL_MASTER: usize = 20;
-    pub const SENTINEL_USERNAME: usize = 21;
-    pub const SENTINEL_PASSWORD: usize = 22;
-    pub const ENVIRONMENT: usize = 23;
+    pub const SOCKET: usize = 4;
+    pub const DATABASE: usize = 5;
+    pub const READ_ONLY: usize = 6;
+    pub const USERNAME: usize = 7;
+    pub const PASSWORD: usize = 8;
+    pub const KEYCHAIN: usize = 9;
+    pub const TLS: usize = 10;
+    pub const TLS_CA: usize = 11;
+    pub const TLS_CERT: usize = 12;
+    pub const TLS_KEY: usize = 13;
+    pub const TLS_INSECURE: usize = 14;
+    pub const SSH_HOST: usize = 15;
+    pub const SSH_USER: usize = 16;
+    pub const SSH_PORT: usize = 17;
+    pub const SSH_KEY: usize = 18;
+    pub const DEPLOYMENT: usize = 19;
+    pub const SEEDS: usize = 20;
+    pub const SENTINEL_MASTER: usize = 21;
+    pub const SENTINEL_USERNAME: usize = 22;
+    pub const SENTINEL_PASSWORD: usize = 23;
+    pub const ENVIRONMENT: usize = 24;
 }
 
 /// Field-level validation that must happen before the modal closes.
@@ -5710,6 +5714,25 @@ fn validate(action: &Action, values: &[String]) -> Option<String> {
             }
             if get(f::DATABASE).parse::<i64>().is_err() {
                 return Some("Database must be a number".into());
+            }
+            if !get(f::SOCKET).is_empty() {
+                if !cfg!(unix) {
+                    return Some("Unix sockets are not available on this platform".into());
+                }
+                if matches!(get(f::DEPLOYMENT), "cluster" | "sentinel") {
+                    return Some(
+                        "A Unix socket reaches one server; Cluster and Sentinel need host and port"
+                            .into(),
+                    );
+                }
+                if get(f::TLS) == "true" {
+                    return Some("TLS does not apply to a Unix socket".into());
+                }
+                if !get(f::SSH_HOST).is_empty() {
+                    return Some(
+                        "A Unix socket is local; it cannot go through an SSH tunnel".into(),
+                    );
+                }
             }
             if get(f::DEPLOYMENT) == "cluster" && get(f::DATABASE) != "0" {
                 return Some("Cluster supports database 0 only".into());

@@ -256,7 +256,15 @@ fn connection_info(conn: &Connection, password: &str, via: Option<u16>) -> Resul
         Some(local) => ("127.0.0.1", local),
         None => (conn.host.as_str(), conn.port),
     };
-    let mut info = (host, port).into_connection_info()?;
+    let mut info = if conn.uses_socket() {
+        // Checked again here rather than trusted: TLS or a tunnel would be
+        // silently ignored on a socket otherwise.
+        conn.validate_socket()?;
+        ConnectionAddr::Unix(crate::config::expand_home(conn.socket_path()))
+            .into_connection_info()?
+    } else {
+        (host, port).into_connection_info()?
+    };
     if conn.tls {
         info = info.set_addr(ConnectionAddr::TcpTls {
             host: conn.host.clone(),
@@ -690,7 +698,13 @@ impl Client {
         };
         let via = tunnel.as_ref().map(|t| t.local_port);
         let client = build_client(&conn, via).await?;
-        let mgr = Transport::new(conn.clone(), client.clone()).await?;
+        let mgr = match Transport::new(conn.clone(), client.clone()).await {
+            // A bare "No such file or directory" does not say which file.
+            Err(e) if conn.uses_socket() => {
+                anyhow::bail!("cannot connect to {}: {e}", conn.socket_path())
+            }
+            other => other?,
+        };
         Ok(Self {
             conn,
             mgr,

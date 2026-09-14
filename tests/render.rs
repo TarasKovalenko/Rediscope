@@ -400,6 +400,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         "checkout",       // Group
         "cache.example",  // Host
         "6380",           // Port
+        "",               // Unix socket, left blank
         "3",              // Database
         "",               // read-only switch, left off
         "reader",         // Username
@@ -416,7 +417,7 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
         "",               // SSH key
     ];
     for (i, value) in inputs.iter().enumerate() {
-        if i == 9 {
+        if i == 10 {
             press(&mut a, KeyCode::Char(' ')); // switch TLS on
         } else if !value.is_empty() {
             app_ctrl(&mut a, 'u');
@@ -449,6 +450,67 @@ async fn connection_form_writes_every_field_to_the_right_slot() {
     assert!(!c.read_only);
     assert!(c.ssh_host.is_empty());
     assert_eq!(c.ssh_port, 22);
+    assert!(c.socket.is_empty());
+}
+
+/// A socket profile shows its path where a TCP profile shows host and port,
+/// and the form refuses the settings a socket cannot use.
+#[tokio::test]
+async fn socket_profiles_show_their_path_and_refuse_tls() {
+    let mut a = app();
+    press(&mut a, KeyCode::Char('n'));
+    type_str(&mut a, "sock");
+    for _ in 0..4 {
+        press(&mut a, KeyCode::Tab); // group, host, port, socket
+    }
+    type_str(&mut a, "/tmp/redis.sock");
+    for _ in 0..6 {
+        press(&mut a, KeyCode::Tab); // on to the TLS switch
+    }
+    press(&mut a, KeyCode::Char(' '));
+    press(&mut a, KeyCode::Enter);
+    if !cfg!(unix) {
+        // Without sockets the path itself is refused, before TLS comes up.
+        let Some(Modal::Form { error, .. }) = &a.modal else {
+            panic!("a socket profile must not save here")
+        };
+        assert_eq!(
+            error.as_deref(),
+            Some("Unix sockets are not available on this platform")
+        );
+        render_all_sizes(&mut a);
+        return;
+    }
+    match &a.modal {
+        Some(Modal::Form { error, .. }) => {
+            assert_eq!(
+                error.as_deref(),
+                Some("TLS does not apply to a Unix socket")
+            );
+        }
+        _ => panic!("a socket with TLS must not save"),
+    }
+    press(&mut a, KeyCode::Char(' ')); // TLS off again
+    press(&mut a, KeyCode::Enter);
+    assert!(a.modal.is_none(), "{:?}", a.status);
+    let saved = a
+        .store
+        .connections
+        .iter()
+        .find(|c| c.name == "sock")
+        .unwrap();
+    assert_eq!(saved.socket, "/tmp/redis.sock");
+    assert!(!saved.tls);
+
+    let list = render_text(&mut a, 120, 20);
+    assert!(list.contains("unix:///tmp/redis.sock?db=0"), "{list}");
+    render_all_sizes(&mut a);
+
+    // The server-list filter finds it by path.
+    press(&mut a, KeyCode::Char('/'));
+    type_str(&mut a, "redis.sock");
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.visible_connections().len(), 1);
 }
 
 #[tokio::test]
@@ -456,7 +518,7 @@ async fn certificate_files_require_tls() {
     let mut a = app();
     press(&mut a, KeyCode::Char('n'));
     type_str(&mut a, "certs-only");
-    for _ in 0..10 {
+    for _ in 0..11 {
         press(&mut a, KeyCode::Tab); // walk to the CA certificate field
     }
     type_str(&mut a, "/tmp/ca.pem");
@@ -820,11 +882,11 @@ async fn sentinel_form_persists_discovery_fields() {
     let mut inputs: Vec<_> = fields.iter_mut().filter(|f| f.is_input()).collect();
     inputs[0].input.set("sentinel-profile");
     inputs[3].input.set("26379");
-    inputs[18].choice = 2;
-    inputs[19].input.set("[::1]:26380,redis-b:26379");
-    inputs[20].input.set("primary-service");
-    inputs[21].input.set("sentinel-reader");
-    inputs[22].input.set("${SENTINEL_PASSWORD}");
+    inputs[19].choice = 2;
+    inputs[20].input.set("[::1]:26380,redis-b:26379");
+    inputs[21].input.set("primary-service");
+    inputs[22].input.set("sentinel-reader");
+    inputs[23].input.set("${SENTINEL_PASSWORD}");
     press(&mut a, KeyCode::Enter);
     assert!(a.modal.is_none());
     let saved = a

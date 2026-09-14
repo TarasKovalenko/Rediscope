@@ -316,6 +316,11 @@ rediscope
   edits, deletes, TTLs, bulk actions, imports, and the writing commands in the
   console, which are identified from the server's own command table rather than
   a guess. The title bar says `READ-ONLY` while such a session is open.
+- **Unix sockets.** A profile can point at a socket path instead of a host and
+  port, for a server on the same machine that only listens on
+  `/run/redis/redis.sock`. So can `--socket` and a `unix://` URL. The list and
+  the title bar show the path. TLS, SSH tunnels, Cluster and Sentinel need a
+  network address, so a socket profile refuses them. Not available on Windows.
 - **SSH tunnels.** Give a profile a jump host and rediscope runs
   `ssh -N -L …` for the life of the connection, then connects through the local
   port. It uses your system ssh, so your agent, `~/.ssh/config` and
@@ -569,6 +574,8 @@ restores the previous one.
 rediscope                                  # start at the saved-server list
 rediscope -H 127.0.0.1 -p 6379 -n 0        # connect immediately
 rediscope --url rediss://user@host:6380/2  # or via a URL
+rediscope --socket /run/redis/redis.sock   # through a Unix socket
+rediscope --url 'unix:///run/redis/redis.sock?db=2'
 
 # TLS against a private CA, and mutual TLS
 rediscope -H cache.internal --tls-ca ~/certs/ca.pem
@@ -579,10 +586,11 @@ rediscope -H cache.internal --tls-cert ~/certs/client.crt --tls-key ~/certs/clie
 |---|---|
 | `-H`, `--host` | Redis host. Given, rediscope connects straight away and skips the server list |
 | `-p`, `--port` | Port (default `6379`) |
+| `-s`, `--socket PATH` | Connect through a Unix socket instead of host and port. Not with `--host`, `--url`, the TLS flags or `--ssh` |
 | `-n`, `--db` | Database index (default `0`) |
 | `-u`, `--username` | ACL username (Redis 6+) |
 | `-a`, `--password` | Password. Prefer `REDISCOPE_PASSWORD` |
-| `--url` | `redis://` or `rediss://` URL. Overrides the other flags |
+| `--url` | `redis://`, `rediss://` or `unix://` (also `redis+unix://`) URL. Overrides the other flags. A socket URL takes the database and credentials as `?db=2&user=ada&pass=...` |
 | `--tls` | Connect over TLS |
 | `--tls-ca FILE` | PEM root certificate for a private CA |
 | `--tls-cert FILE` | PEM client certificate (needs `--tls-key`) |
@@ -640,9 +648,9 @@ rediscope --profile prod import --file users.json \
 
 ## Connections and secrets
 
-A connection profile holds the server address, an optional group, database
-index, optional ACL username, TLS settings, a read-only switch, an optional SSH
-jump host, and how to find its password. The editor is one form with `Server`,
+A connection profile holds the server address or a Unix socket path, an
+optional group, database index, optional ACL username, TLS settings, a
+read-only switch, an optional SSH jump host, and how to find its password. The editor is one form with `Server`,
 `Authentication`, `TLS` and `SSH tunnel` sections (the group is set under
 `Server`); `Tab` moves between fields, `Space` toggles a switch, and the form
 scrolls when the terminal is short.
@@ -777,6 +785,18 @@ rediscope --config-path
 The same file keeps your theme, so the colours come back on the next run, and
 one entry per profile recording where you left it — database, search pattern,
 open folders and selected key.
+
+### Unix sockets
+
+A profile with `socket` set connects through that path and ignores `host` and
+`port`. A leading `~` is expanded. The key is left out of the file for every
+other profile, so existing files are written exactly as before. A socket
+profile has to be standalone, without TLS or an SSH host; the form and the
+connection both refuse the combination with a message saying why.
+
+```json
+{ "name": "local socket", "socket": "/run/redis/redis.sock", "db": 0 }
+```
 
 ### Connection groups
 
@@ -999,6 +1019,11 @@ production transport, the `Ctrl+W` unlock, typed confirmations, the headless
 import flags, conflict-safe edits, and the audit file's contents. Point
 `REDISCOPE_AUDIT_FILE` at a scratch path when you run it, or it appends to your
 own log.
+
+`tests/unix_socket.rs` connects through a socket. With `REDISCOPE_TEST_PORT` set
+it starts a throwaway `redis-server --unixsocket` of its own, and skips when
+there is no `redis-server` on the `PATH`. `REDISCOPE_TEST_SOCKET` points it at a
+socket you already have instead. It does not build on Windows.
 
 The TLS suite needs two more instances and a certificate set; `.github/workflows/ci.yml`
 has the exact `openssl` and `redis-server` invocations. Point it at them with

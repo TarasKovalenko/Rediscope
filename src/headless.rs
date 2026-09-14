@@ -19,7 +19,7 @@ pub fn resolve(profile: Option<&str>, flags: Option<Connection>) -> Result<Conne
             .cloned()
             .with_context(|| format!("no saved profile called '{name}'"));
     }
-    flags.context("name a server with --host/--url, or a saved profile with --profile")
+    flags.context("name a server with --host, --socket or --url, or a saved profile with --profile")
 }
 
 /// `rediscope keys` — the keyspace as one line per key.
