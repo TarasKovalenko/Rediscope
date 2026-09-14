@@ -3065,6 +3065,118 @@ async fn import_without_overwrite_never_writes_over_a_key_created_after_the_chec
 }
 
 #[tokio::test]
+async fn import_report_counts_every_command_it_sent() {
+    use rediscope::transfer::{Record, Value};
+    let log: Log = Arc::default();
+    let peer = transactional(log.clone(), |args| {
+        match args[0].to_ascii_uppercase().as_str() {
+            "TYPE" => "+none\r\n".into(),
+            "EXISTS" => ":0\r\n".into(),
+            "RPUSH" | "DEL" | "PEXPIRE" | "RENAMENX" => ":1\r\n".into(),
+            _ => "+OK\r\n".into(),
+        }
+    });
+    let client = Client::connect(peer.profile(Deployment::Standalone))
+        .await
+        .unwrap();
+    let list = |key: &[u8], ttl_ms| Record {
+        key: key.to_vec(),
+        ttl_ms,
+        value: Value::List(vec![b"a".to_vec()]),
+    };
+    let string = Record {
+        key: b"s".to_vec(),
+        ttl_ms: Some(60_000),
+        value: Value::String(b"v".to_vec()),
+    };
+    let writes = |log: &Log| {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, a)| {
+                !matches!(
+                    a[0].to_ascii_uppercase().as_str(),
+                    "TYPE" | "EXISTS" | "MULTI" | "EXEC" | "COMMAND" | "PING" | "SELECT" | "HELLO"
+                )
+            })
+            .count() as u64
+    };
+    // Without overwrite: SET NX; RPUSH and RENAMENX; RPUSH, PEXPIRE and RENAMENX.
+    let report = client
+        .import_records(&[string, list(b"l", None), list(b"t", Some(60_000))], false)
+        .await
+        .unwrap();
+    assert_eq!(report.commands, 6);
+    assert_eq!(report.commands, writes(&log));
+    // With overwrite: DEL, RPUSH and PEXPIRE in one transaction.
+    log.lock().unwrap().clear();
+    let report = client
+        .import_records(&[list(b"t", Some(60_000))], true)
+        .await
+        .unwrap();
+    assert_eq!(report.commands, 3);
+    assert_eq!(report.commands, writes(&log));
+}
+
+/// A cluster whose node `b` refuses `head` once with TRYAGAIN and then drops
+/// the connection on the resend, so its outcome is unknown.
+fn lost_on_resend(head: &'static str) -> TwoNodes {
+    let sent = Arc::new(AtomicUsize::new(0));
+    TwoNodes::start(move |node, _, args| {
+        if node != 'b' {
+            return None;
+        }
+        match args[0].as_str() {
+            "TYPE" => Some(Some("+none\r\n".into())),
+            "EXISTS" => Some(Some(":0\r\n".into())),
+            "RPUSH" => Some(Some(":1\r\n".into())),
+            h if h == head => Some(match sent.fetch_add(1, Ordering::SeqCst) {
+                0 => Some("-TRYAGAIN resharding\r\n".into()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    })
+}
+
+#[tokio::test]
+async fn cluster_import_write_lost_on_resend_does_not_say_the_key_was_unchanged() {
+    use rediscope::transfer::{Record, Value};
+    let kb = key_on(false, "lost-import", 0);
+    let nodes = lost_on_resend("SET");
+    let client = nodes.client().await;
+    let string = Record {
+        key: kb.as_bytes().to_vec(),
+        ttl_ms: None,
+        value: Value::String(b"v".to_vec()),
+    };
+    let e = client
+        .import_records(&[string], false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("outcome unknown"), "{e}");
+    assert!(!e.contains("not changed"), "{e}");
+    assert_eq!(count(&nodes.b_log, "SET", Some(&kb)), 2);
+
+    let nodes = lost_on_resend("RENAMENX");
+    let client = nodes.client().await;
+    let list = Record {
+        key: kb.as_bytes().to_vec(),
+        ttl_ms: None,
+        value: Value::List(vec![b"a".to_vec()]),
+    };
+    let e = client
+        .import_records(&[list], false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("outcome unknown"), "{e}");
+    assert!(!e.contains("not changed"), "{e}");
+    assert_eq!(count(&nodes.b_log, "RENAMENX", None), 2);
+}
+
+#[tokio::test]
 async fn cluster_import_resend_refused_by_an_expired_lease_is_not_audited_denied() {
     let release = Arc::new(AtomicBool::new(false));
     let refused = Arc::new(AtomicUsize::new(0));

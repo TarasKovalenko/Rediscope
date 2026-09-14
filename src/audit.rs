@@ -48,7 +48,7 @@ impl Audit {
             .unwrap_or_else(|| crate::config::config_file().with_file_name("audit.jsonl"));
         Self::at(p, path)
     }
-    fn at(p: &Connection, path: PathBuf) -> Result<Self> {
+    pub(crate) fn at(p: &Connection, path: PathBuf) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Cannot create the audit directory {}", parent.display())

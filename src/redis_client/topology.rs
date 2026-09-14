@@ -51,6 +51,12 @@ fn own_error(e: &RedisError) -> bool {
     e.kind() == redis::ErrorKind::InvalidClientConfig
 }
 
+/// An error that leaves open whether the command ran: a lost connection, or
+/// this module's own report of one.
+pub(super) fn outcome_unknown(e: &RedisError) -> bool {
+    e.is_io_error() || (own_error(e) && e.to_string().contains("outcome unknown"))
+}
+
 fn denied(e: &RedisError) -> bool {
     own_error(e) && matches!(e.detail(), Some(DENIED | PIPELINE_DENIED))
 }
@@ -168,12 +174,7 @@ impl Transport {
             // A batch that fails may have run part of itself, and a script or
             // module command may have written before its error.
             Some(_) if pipeline || opaque => "unknown",
-            Some(e)
-                if e.is_io_error()
-                    || (own_error(e) && e.to_string().contains("outcome unknown")) =>
-            {
-                "unknown"
-            }
+            Some(e) if outcome_unknown(e) => "unknown",
             Some(_) => "failure",
         };
         self.audit.record(id, action, outcome, count).map_err(|_| {
@@ -1027,7 +1028,12 @@ impl Transport {
         pipeline: &redis::Pipeline,
     ) -> RedisResult<Vec<Value>> {
         let count = pipeline.cmd_iter().count();
-        if pipeline.is_transaction() || pipeline.cmd_iter().any(|c| !read_route(c).0) {
+        if pipeline.is_transaction() {
+            return Err(error(
+                "A transaction is not a read-only pipeline; nothing was sent",
+            ));
+        }
+        if pipeline.cmd_iter().any(|c| !read_route(c).0) {
             let mut c = self.clone();
             return c.req_packed_commands(pipeline, 0, count).await;
         }
@@ -1501,6 +1507,35 @@ mod tests {
         for (slot, n) in tags.iter().enumerate() {
             assert_eq!(usize::from(key_slot(format!("x{{{n}}}y").as_bytes())), slot);
         }
+    }
+
+    #[tokio::test]
+    async fn an_unaudited_read_pipeline_refuses_a_transaction_before_sending() {
+        let dir = std::env::temp_dir().join(format!("rediscope-unaudited-{}", std::process::id()));
+        // Nothing listens on port 1: any attempt to send would fail differently.
+        let profile = Connection {
+            host: "127.0.0.1".into(),
+            port: 1,
+            ..Default::default()
+        };
+        let transport = Transport {
+            audit: crate::audit::Audit::at(&profile, dir.join("audit.jsonl")).unwrap(),
+            safety: crate::safety::Safety::default(),
+            state: Arc::new(Mutex::new(State {
+                clients: HashMap::new(),
+                sockets: HashMap::new(),
+                nodes: vec![],
+                default: (profile.host.clone(), profile.port),
+                refreshed: Instant::now(),
+                warning: None,
+            })),
+            profile,
+        };
+        let mut pipe = redis::pipe();
+        pipe.atomic().cmd("GET").arg("k");
+        let e = transport.read_pipeline_unaudited(&pipe).await.unwrap_err();
+        assert!(e.to_string().contains("nothing was sent"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

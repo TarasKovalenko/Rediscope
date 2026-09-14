@@ -3063,8 +3063,9 @@ return 1
                     report.keys
                 );
             }
-            let mut sent =
-                writes.len() + usize::from(replace) + usize::from(record.ttl_ms.is_some());
+            // The writes and the TTL, plus one more: the DEL before them, or
+            // the RENAME or RENAMENX that moves a temporary key into place.
+            let mut sent = writes.len() + 1 + usize::from(record.ttl_ms.is_some());
             let result = match &record.value {
                 Value::String(bytes) if !replace => {
                     sent = 1;
@@ -3114,8 +3115,8 @@ return 1
                 "the key was created by someone else while it was being imported, and was left as it is"
             )),
             Some(Ok(_)) => Ok(()),
-            // A refused SET sets nothing.
-            Some(Err(e)) => Err(anyhow!("{e}; the key was not changed")),
+            // A refused SET sets nothing; a lost one may have set it.
+            Some(Err(e)) => Err(anyhow!("{e}{}", unchanged_unless_unknown(&e))),
             None => Err(anyhow!("the server did not answer the write")),
         }
     }
@@ -3360,6 +3361,15 @@ return 1
             Err(e) => Some(e.to_string()),
             Ok(v) => nested_error(v),
         };
+        // A rename lost on the way may have run: nothing more is sent.
+        if let Err(e) = renamed
+            && topology::outcome_unknown(e)
+        {
+            return Err(anyhow!(
+                "{e}; whether the rename ran is unknown, so the key may already hold the new value, or the temporary key '{}' may be left to delete",
+                encode_key(temp)
+            ));
+        }
         // A rename that failed moved nothing, whatever happened to the TTL.
         if let Some(why) = why(renamed) {
             return Err(anyhow!(
@@ -4196,6 +4206,16 @@ fn temporary_name(key: &[u8], unique: &str, cluster: bool) -> Vec<u8> {
         .into_iter()
         .find(|name| key_slot(name) == slot)
         .unwrap_or(first)
+}
+
+/// "; the key was not changed", for a write the server refused, and nothing
+/// for one whose outcome is unknown.
+fn unchanged_unless_unknown(e: &redis::RedisError) -> &'static str {
+    if topology::outcome_unknown(e) {
+        ""
+    } else {
+        "; the key was not changed"
+    }
 }
 
 /// Why a batch of writes did not all succeed, if it did not.
