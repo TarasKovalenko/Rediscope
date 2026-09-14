@@ -786,7 +786,9 @@ diagnostics tabs, and the tabs show the discovery error instead of reading
 the old primary. A `CONFIG SET` from the Config tab is refused, unsent, once
 a discovery has found a different primary than the one the tab was read from;
 disconnecting a client or resetting the slow log still goes to the node that
-listed it. Reads use bounded retries and backoff.
+listed it. A failover that no discovery has seen yet (they run every 30
+seconds, and after any failure) can still let that `CONFIG SET` reach the
+demoted node, since a replica accepts it. Reads use bounded retries and backoff.
 A node that stops answering only holds up the commands sent to it; reads and
 writes for other nodes carry on, and callers that need a fresh topology at
 the same moment share a single discovery. A command that just failed never

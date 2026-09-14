@@ -1123,7 +1123,9 @@ impl Transport {
                         && let Err(refresh) = self.rediscover().await
                         && self.profile.deployment == Deployment::Sentinel
                     {
-                        return Err(refresh);
+                        // Every earlier attempt was refused unrun, so nothing
+                        // from this command has reached a server.
+                        return Err(not_sent(refresh));
                     }
                     ep = self.route(slot);
                     redirected = false;
