@@ -45,9 +45,10 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const HEX_DUMP_LIMIT: usize = 4_096;
 /// Most decoded text one value read may produce, across all of its elements.
 const DECODE_BUDGET: usize = 64 * 1024 * 1024;
-/// How every temporary key an import writes starts. An import that is killed
-/// before its rename leaves such a key behind, and this is how to find it.
-pub const IMPORT_TEMP_PREFIX: &str = "rediscope:import-tmp:";
+/// What every temporary key an import writes has right after the key's own
+/// name. An import that is killed before its rename leaves such a key behind,
+/// and this is how to find it.
+pub const IMPORT_TEMP_MARKER: &str = ":rediscope-import-tmp:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
@@ -3072,11 +3073,14 @@ return 1
                 _ if replace && !cluster && pipeline_chunks(&writes).len() == 1 => {
                     self.import_in_transaction(record, writes, replace).await
                 }
-                _ => match self.temporary_name(&record.key).await? {
-                    Some(temp) => self.import_through(record, &temp, replace).await,
-                    None if replace => self.import_in_place(record, writes, replace).await,
-                    None => Err(anyhow!(
+                _ => match self.temporary_name(&record.key).await {
+                    Ok(Some(temp)) => self.import_through(record, &temp, replace).await,
+                    Ok(None) if replace => self.import_in_place(record, writes, replace).await,
+                    Ok(None) => Err(anyhow!(
                         "no unused temporary name was found to write it under, so nothing was written"
+                    )),
+                    Err(e) => Err(anyhow!(
+                        "{e}, while looking for a temporary name to write it under, so nothing was written"
                     )),
                 },
             };
@@ -3242,12 +3246,8 @@ return 1
     }
 
     /// A name for writing `key` out of sight: unused, and on a cluster in the
-    /// same slot, so `RENAME` can move it into place. Every such name starts
-    /// with [`IMPORT_TEMP_PREFIX`], so one left behind by a crash is easy to
-    /// find, and ends with the key itself. On a cluster a key without a hash
-    /// tag gets one right after the prefix, chosen to hash to the key's slot;
-    /// a key with a tag keeps it as the name's first. `None` when no unused
-    /// name turns up.
+    /// same slot, so `RENAME` can move it into place. See [`temporary_name`].
+    /// `None` when no unused name turns up.
     async fn temporary_name(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static TEMP: AtomicU64 = AtomicU64::new(0);
@@ -3255,25 +3255,11 @@ return 1
         let mut c = self.mgr.clone();
         for _ in 0..3 {
             let unique = format!(
-                "{}-{}:",
+                "{}-{}",
                 std::process::id(),
                 TEMP.fetch_add(1, Ordering::Relaxed)
             );
-            let tag = if cluster && topology::hash_tag(key).is_none() {
-                format!("{{{}}}", topology::slot_tags()[usize::from(key_slot(key))])
-            } else {
-                String::new()
-            };
-            let name = [
-                IMPORT_TEMP_PREFIX.as_bytes(),
-                tag.as_bytes(),
-                unique.as_bytes(),
-                key,
-            ]
-            .concat();
-            if cluster && key_slot(&name) != key_slot(key) {
-                return Ok(None);
-            }
+            let name = temporary_name(key, &unique, cluster);
             let exists: i64 = redis::cmd("EXISTS").arg(&name).query_async(&mut c).await?;
             if exists == 0 {
                 return Ok(Some(name));
@@ -4186,6 +4172,32 @@ fn nested_error(value: &redis::Value) -> Option<String> {
     }
 }
 
+/// A temporary name for importing `key`: the key itself, then
+/// [`IMPORT_TEMP_MARKER`], then `unique`. Starting with the key keeps the name
+/// inside any ACL key pattern (`~app:*`) that lets the user write the key.
+///
+/// On a cluster the name must hash to the key's slot. A key with a hash tag
+/// keeps it as the name's first, so the plain name does. A key without one
+/// gets itself as a tag after the marker, `key:rediscope-import-tmp:{key}n`,
+/// which hashes like the key when the key has no braces of its own. Failing
+/// that, a short tag for the slot goes after the marker, and as a last resort
+/// before the key, where it always decides the slot.
+fn temporary_name(key: &[u8], unique: &str, cluster: bool) -> Vec<u8> {
+    let marker = IMPORT_TEMP_MARKER.as_bytes();
+    let plain = [key, marker, unique.as_bytes()].concat();
+    if !cluster {
+        return plain;
+    }
+    let slot = key_slot(key);
+    let tag = topology::slot_tags()[usize::from(slot)].to_string();
+    let tagged = |t: &[u8]| [key, marker, b"{", t, b"}", unique.as_bytes()].concat();
+    let first = [b"{", tag.as_bytes(), b"}", key, marker, unique.as_bytes()].concat();
+    [plain, tagged(key), tagged(tag.as_bytes())]
+        .into_iter()
+        .find(|name| key_slot(name) == slot)
+        .unwrap_or(first)
+}
+
 /// Why a batch of writes did not all succeed, if it did not.
 fn batch_failure(
     result: redis::RedisResult<Vec<redis::RedisResult<redis::Value>>>,
@@ -4620,6 +4632,30 @@ mod tests {
 
     fn bulk(s: &str) -> redis::Value {
         redis::Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn a_temporary_name_starts_with_its_key_and_shares_its_slot() {
+        for key in [
+            "app:x", "{t}x", "x{t}y", "a{}", "{}", "a}b", "a{b", "}{", "", "a{b}c{d}",
+        ] {
+            let key = key.as_bytes();
+            let name = temporary_name(key, "7-1", false);
+            assert_eq!(name, [key, b":rediscope-import-tmp:7-1"].concat());
+            let name = temporary_name(key, "7-1", true);
+            assert_eq!(key_slot(&name), key_slot(key), "{:?}", encode_key(&name));
+            assert!(
+                encode_key(&name).contains("rediscope-import-tmp"),
+                "{:?}",
+                encode_key(&name)
+            );
+            // Only braces in the key itself can push the tag before it.
+            if !key.contains(&b'{') && !key.contains(&b'}') || topology::hash_tag(key).is_some() {
+                assert!(name.starts_with(key), "{:?}", encode_key(&name));
+            }
+        }
+        let name = temporary_name(b"app:x", "7-1", true);
+        assert_eq!(name, b"app:x:rediscope-import-tmp:{app:x}7-1");
     }
 
     #[test]

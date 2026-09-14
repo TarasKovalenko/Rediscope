@@ -815,19 +815,23 @@ so a file with a JSON document is refused whole on a server without RedisJSON.
 Then each key is written so that a failure leaves the existing key as it was.
 With overwrite, a key that fits one pipeline (256 commands, about 1 MB) goes out
 as one `MULTI` transaction. A bigger one is written in pipelines of that size
-under a temporary name, `rediscope:import-tmp:<pid>-<n>:key`, and renamed over
+under a temporary name, `key:rediscope-import-tmp:<pid>-<n>`, and renamed over
 the key at the end, so readers see the old value until the new one is complete.
-On a cluster, which runs no transactions, every key takes a temporary name, and
-one without a hash tag gets a tag after the prefix,
-`rediscope:import-tmp:{n}<pid>-<n>:key`, that puts it in the key's own slot. If
+The name starts with the key, so an ACL user limited to a key pattern such as
+`~app:*` may write it wherever it may write the key. On a cluster, which runs
+no transactions, every key takes a temporary name, and one without a hash tag
+gets itself as a tag after the marker, `key:rediscope-import-tmp:{key}<pid>-<n>`,
+which puts the name in the key's own slot. A key with braces of its own that
+would move that tag gets a short slot tag instead, and in the rare case that
+cannot work either, the tag goes before the key. If
 a transaction runs but one of its commands fails, which the checks above make
 unlikely, the error says so and what it left: a key partly written, or the new
 value in place without its TTL.
 
 A failed import deletes its temporary key. One that is killed before its
 rename (a crash, a lost connection) leaves it behind, and every such key
-starts with `rediscope:import-tmp:`, so `SCAN 0 MATCH rediscope:import-tmp:*`
-finds them to delete. The temporary path needs `RENAME` or `RENAMENX` on the
+has `:rediscope-import-tmp:` in its name, so
+`SCAN 0 MATCH *rediscope-import-tmp*` finds them to delete. The temporary path needs `RENAME` or `RENAMENX` on the
 target: an ACL user without them gets an error saying the key was not changed,
 and cannot import big keys, or any key other than a string without overwrite.
 An import with overwrite also needs `MULTI` and `EXEC` (`@transaction`). A

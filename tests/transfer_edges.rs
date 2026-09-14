@@ -2664,6 +2664,58 @@ async fn an_import_by_a_user_without_transactions_never_says_the_key_was_unchang
 }
 
 #[tokio::test]
+async fn an_import_by_a_user_limited_to_a_key_pattern_writes_aside_under_that_pattern() {
+    let Some(target) = Target::start().await else {
+        return;
+    };
+    let mut raw = target.raw().await;
+    let _: () = redis::cmd("ACL")
+        .arg(&["SETUSER", "apponly", "on", ">pw", "~app:*", "&*", "+@all"][..])
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let client = Client::connect(Connection {
+        username: "apponly".into(),
+        password: "pw".into(),
+        ..target.profile(&format!("edges-pattern-{}", std::process::id()))
+    })
+    .await
+    .unwrap();
+    let list = |key: &str, n: usize| Record {
+        key: key.as_bytes().to_vec(),
+        ttl_ms: Some(900_000),
+        value: Value::List((0..n).map(|i| i.to_string().into_bytes()).collect()),
+    };
+    // Big with overwrite, and small without it: both go through a temporary key.
+    let _: () = raw.set("app:big", "old").await.unwrap();
+    let report = client
+        .import_records(&[list("app:big", 100_000), list("app:small", 3)], true)
+        .await
+        .unwrap();
+    assert_eq!(report.keys, 2);
+    let report = client
+        .import_records(&[list("app:fresh", 3)], false)
+        .await
+        .unwrap();
+    assert_eq!(report.keys, 1);
+    let len: i64 = raw.llen("app:big").await.unwrap();
+    assert_eq!(len, 100_000);
+    let len: i64 = raw.llen("app:fresh").await.unwrap();
+    assert_eq!(len, 3);
+    let size: i64 = redis::cmd("DBSIZE").query_async(&mut raw).await.unwrap();
+    assert_eq!(size, 3, "nothing temporary is left");
+
+    // A key outside the pattern is refused with its name and what came before.
+    let err = client
+        .import_records(&[list("app:first", 3), list("other", 100_000)], true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with("cannot import 'other': "), "{err}");
+    assert!(err.contains("1 key(s) were written before it"), "{err}");
+}
+
+#[tokio::test]
 async fn an_export_names_what_a_format_cannot_hold_and_is_audited_once() {
     let Some(target) = Target::start().await else {
         return;

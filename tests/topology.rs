@@ -3054,7 +3054,7 @@ async fn import_without_overwrite_never_writes_over_a_key_created_after_the_chec
         .collect();
     assert_eq!(pushed.len(), 1, "{pushed:?}");
     assert!(
-        pushed[0].starts_with("rediscope:import-tmp:") && pushed[0].ends_with(":l"),
+        pushed[0].starts_with("l:rediscope-import-tmp:"),
         "{pushed:?}"
     );
     assert!(
