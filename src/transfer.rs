@@ -531,7 +531,7 @@ pub fn json_record(entry: &Json) -> Result<Record> {
         "timeseries" => {
             let samples = value
                 .get("samples")
-                .map(&array)
+                .map(array)
                 .transpose()?
                 .unwrap_or_default()
                 .iter()
