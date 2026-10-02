@@ -1462,6 +1462,15 @@ pub struct App {
 
     /// A key named by a restored session, selected once the tree is built.
     pending_selection: Option<String>,
+    /// A delete or rename changed the tree before the server answered. If
+    /// the write fails or is refused, the tree needs a rescan to match again.
+    tree_ahead: bool,
+    /// Keys taken out of the tree ahead of the server, put back if the
+    /// delete fails.
+    forgotten: Vec<KeyInfo>,
+    /// Said in place of "Keys refreshed" by the next rescan, so the reason a
+    /// write failed is still on screen once the tree has been put back.
+    status_after_rescan: Option<String>,
 
     /// When the value of the key under the cursor is due to be fetched.
     /// Moving the cursor pushes this out, so holding a key down or paging
@@ -1545,6 +1554,9 @@ impl App {
             text_cache: None,
             modal: None,
             pending_selection: None,
+            tree_ahead: false,
+            forgotten: Vec::new(),
+            status_after_rescan: None,
             value_due: None,
             pending_value: None,
             value_seq: 0,
@@ -1698,6 +1710,9 @@ impl App {
         };
         if client.read_only() {
             self.status = "This connection is read-only — production profiles can request a 5-minute unlock with Ctrl+w".into();
+            // A delete or rename confirmed just as the unlock lapsed has
+            // already changed the tree, and nothing was sent.
+            self.undo_tree_ahead();
             return;
         }
         let ok = ok_status.to_string();
@@ -1790,25 +1805,143 @@ impl App {
         self.dbsize = self.dbsize.saturating_sub(expired.len() as u64);
         self.tree = Tree::build(&self.keys, &self.separator, self.sort);
         self.rebuild_rows();
-        if self.rows.is_empty() {
-            self.tree_state.select(None);
-        } else if let Some(idx) = self.tree_state.selected() {
-            self.tree_state.select(Some(idx.min(self.rows.len() - 1)));
-        }
         // The open key going away is worth saying out loud.
         if let Some(name) = self.current.as_ref().map(|c| c.name.clone())
             && expired.contains(&name)
         {
-            self.current = None;
-            self.value = None;
+            self.close_key();
             self.focus = Focus::Tree;
+            self.resync_cursor();
             self.status = format!("'{name}' expired");
             return;
         }
+        self.resync_cursor();
         self.status = match expired.len() {
             1 => format!("'{}' expired", expired[0]),
             n => format!("{n} keys expired"),
         };
+    }
+
+    /// After the rows change, make the highlighted row and the open key agree
+    /// again. The cursor stays on the open key when it is still on screen.
+    /// Otherwise (no open key, or the open one deleted, renamed, filtered out
+    /// or folded away) the row under the cursor becomes the open key. Left
+    /// alone, the pane sits empty under a highlighted key and `D` answers
+    /// "No key selected", or `D` targets a key other than the highlighted one.
+    fn resync_cursor(&mut self) {
+        if self.screen != Screen::Browser {
+            return;
+        }
+        let open_row = self.current.as_ref().and_then(|open| {
+            self.rows
+                .iter()
+                .position(|r| r.key.as_ref().is_some_and(|k| k.name == open.name))
+        });
+        if let Some(index) = open_row {
+            self.tree_state.select(Some(index));
+            return;
+        }
+        // A capped scan says nothing about a key it did not reach, such as
+        // one opened from a value search. Keep it open and highlight no row,
+        // so the pane and `D` still agree on which key they mean.
+        if self.truncated
+            && let Some(open) = &self.current
+            && !self.keys.iter().any(|k| k.name == open.name)
+        {
+            self.tree_state.select(None);
+            return;
+        }
+        if self.rows.is_empty() {
+            self.tree_state.select(None);
+        } else {
+            let idx = self
+                .tree_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.rows.len() - 1);
+            self.tree_state.select(Some(idx));
+        }
+        if self.current.is_some() {
+            // The pane is about to show another key; keys typed next belong
+            // to the tree, not to an editor over a value that changed under it.
+            self.focus = Focus::Tree;
+        }
+        self.on_tree_move();
+    }
+
+    /// Take keys this client just deleted out of the tree without waiting for
+    /// the rescan, and put the cursor on what now sits where they were. If
+    /// the delete succeeds and the rescan fails, the tree still matches the
+    /// server; if the delete fails, `undo_tree_ahead` puts the keys back.
+    fn forget_keys(&mut self, names: &[String]) {
+        let gone: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let (removed_keys, kept): (Vec<KeyInfo>, Vec<KeyInfo>) = std::mem::take(&mut self.keys)
+            .into_iter()
+            .partition(|k| gone.contains(k.name.as_str()));
+        self.keys = kept;
+        let removed = removed_keys.len();
+        self.forgotten.extend(removed_keys);
+        // The open key may be one the scan never listed, such as a value
+        // search result; it is deleted all the same.
+        let open_gone = self
+            .current
+            .as_ref()
+            .is_some_and(|c| gone.contains(c.name.as_str()));
+        if open_gone {
+            self.close_key();
+        }
+        self.tree_ahead = true;
+        if removed == 0 {
+            if open_gone {
+                self.resync_cursor();
+            }
+            return;
+        }
+        self.key_count = self.keys.len();
+        self.dbsize = self.dbsize.saturating_sub(removed as u64);
+        self.tree = Tree::build(&self.keys, &self.separator, self.sort);
+        self.rebuild_rows();
+        self.resync_cursor();
+    }
+
+    /// A write that changed the tree ahead of the server failed or was never
+    /// sent: reopen the row under the cursor now, and rescan so the tree
+    /// shows what the server holds, keeping the reason on screen. A failed
+    /// field edit or TTL change left the tree alone and needs none of this.
+    fn undo_tree_ahead(&mut self) {
+        if !std::mem::take(&mut self.tree_ahead) {
+            return;
+        }
+        // A failed rename has no new name to find.
+        self.pending_selection = None;
+        // A failed delete may have removed nothing; show its keys again until
+        // the rescan says otherwise, so a rescan that fails too cannot hide
+        // keys the server still holds.
+        let back: Vec<KeyInfo> = std::mem::take(&mut self.forgotten)
+            .into_iter()
+            .filter(|f| !self.keys.iter().any(|k| k.name == f.name))
+            .collect();
+        if !back.is_empty() {
+            self.dbsize += back.len() as u64;
+            self.keys.extend(back);
+            self.key_count = self.keys.len();
+            self.tree = Tree::build(&self.keys, &self.separator, self.sort);
+            self.rebuild_rows();
+        }
+        self.resync_cursor();
+        if self.client.is_some() {
+            self.status_after_rescan = Some(self.status.clone());
+            self.reload_keys();
+        }
+    }
+
+    /// Close the open key and drop any read still on its way for it.
+    fn close_key(&mut self) {
+        self.current = None;
+        self.value = None;
+        self.value_due = None;
+        self.pending_value = None;
+        self.value_seq = self.value_seq.wrapping_add(1);
     }
 
     // ---- message handling -------------------------------------------------
@@ -1850,8 +1983,11 @@ impl App {
                         self.client = Some(client);
                         self.screen = Screen::Browser;
                         self.status.clear();
-                        self.current = None;
-                        self.value = None;
+                        self.close_key();
+                        self.tree_state.select(None);
+                        self.tree_ahead = false;
+                        self.forgotten.clear();
+                        self.status_after_rescan = None;
                         self.marked.clear();
                         self.restore_session(session);
                         self.reload_keys();
@@ -1883,6 +2019,9 @@ impl App {
                 } else {
                     "Keys refreshed".into()
                 };
+                if let Some(status) = self.status_after_rescan.take() {
+                    self.status = status;
+                }
                 self.coverage_warnings = warnings;
                 self.loading = false;
                 self.key_count = keys.len();
@@ -1907,16 +2046,7 @@ impl App {
                     self.tree_state.select(Some(index));
                     self.on_tree_move();
                 }
-                if self.rows.is_empty() {
-                    self.tree_state.select(None);
-                } else {
-                    let idx = self
-                        .tree_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.rows.len() - 1);
-                    self.tree_state.select(Some(idx));
-                }
+                self.resync_cursor();
             }
             Msg::Loaded {
                 seq,
@@ -2006,10 +2136,15 @@ impl App {
             }
             Msg::Mutated(Ok(status)) => {
                 self.status = status;
+                self.tree_ahead = false;
+                self.forgotten.clear();
                 self.reload_keys();
                 self.reload_value();
             }
-            Msg::Mutated(Err(e)) => self.status = format!("Error: {e}"),
+            Msg::Mutated(Err(e)) => {
+                self.status = format!("Error: {e}");
+                self.undo_tree_ahead();
+            }
             Msg::Commands(table) => self.commands = *table,
             Msg::Found {
                 keys,
@@ -2173,6 +2308,8 @@ impl App {
                 self.loading = false;
                 self.testing = None;
                 self.status = format!("Error: {e}");
+                // The rescan it was waiting for is not coming.
+                self.status_after_rescan = None;
             }
             Msg::Noop => {}
         }
@@ -2922,11 +3059,7 @@ impl App {
                 }
             }
             None => {
-                self.current = None;
-                self.value = None;
-                self.value_due = None;
-                self.pending_value = None;
-                self.value_seq = self.value_seq.wrapping_add(1);
+                self.close_key();
             }
         }
     }
@@ -3105,8 +3238,7 @@ impl App {
         self.stop_feeds();
         self.client = None;
         self.screen = Screen::Connections;
-        self.current = None;
-        self.value = None;
+        self.close_key();
         self.rows.clear();
         self.status.clear();
     }
@@ -5626,8 +5758,8 @@ impl App {
                 });
             }
             Action::DeleteKey(name) => {
-                self.current = None;
-                self.value = None;
+                self.focus = Focus::Tree;
+                self.forget_keys(std::slice::from_ref(&name));
                 self.mutate(
                     "Key deleted",
                     move |c| async move { c.delete_key(&name).await },
@@ -5635,8 +5767,11 @@ impl App {
             }
             Action::RenameKey(old) => {
                 let new = v(0).trim().to_string();
-                self.current = None;
-                self.value = None;
+                self.close_key();
+                self.focus = Focus::Tree;
+                self.tree_ahead = true;
+                // The rescan after the rename puts the cursor on the new name.
+                self.pending_selection = Some(new.clone());
                 self.mutate("Key renamed", move |c| async move {
                     c.rename_key(&old, &new).await
                 });
@@ -5775,8 +5910,14 @@ impl App {
                 }
                 let count = names.len();
                 self.marked.clear();
-                self.current = None;
-                self.value = None;
+                if self
+                    .current
+                    .as_ref()
+                    .is_some_and(|c| names.contains(&c.name))
+                {
+                    self.focus = Focus::Tree;
+                }
+                self.forget_keys(&names);
                 self.mutate(&format!("{count} key(s) deleted"), move |c| async move {
                     c.delete_keys(&names).await.map(|_| ())
                 });
@@ -6805,6 +6946,822 @@ mod tests {
     }
 
     #[test]
+    fn after_a_delete_the_key_under_the_cursor_is_the_one_d_deletes() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "a");
+
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        // The row under the cursor opens right away, before the server replies.
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(
+            app.current.as_ref().map(|k| k.name.as_str()),
+            Some("b"),
+            "the key under the cursor is the open one"
+        );
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "b"),
+            "D asks about the key under the cursor, status: {}",
+            app.status
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+
+        // The rescan the delete triggers comes back without it.
+        app.on_msg(Msg::Keys {
+            keys: vec![info("b", -1), info("c", -1)],
+            truncated: false,
+            warnings: vec![],
+            dbsize: 2,
+            pattern: "*".into(),
+        });
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(app.current.as_ref().map(|k| k.name.as_str()), Some("b"));
+
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "b"),
+            "D asks about the key under the cursor, status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_cursor_on_the_open_key_when_rows_shift() {
+        let mut app = tick_app(vec![info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        // A key appears above the open one.
+        app.on_msg(Msg::Keys {
+            keys: vec![info("a", -1), info("b", -1), info("c", -1)],
+            truncated: false,
+            warnings: vec![],
+            dbsize: 3,
+            pattern: "*".into(),
+        });
+        assert_eq!(
+            app.selected_row().unwrap().label,
+            "c",
+            "the cursor follows its key"
+        );
+        assert_eq!(app.current.as_ref().unwrap().name, "c");
+    }
+
+    /// The rescan a mutation triggers, coming back with `keys`.
+    fn rescan(app: &mut App, keys: &[&str]) {
+        app.on_msg(Msg::Keys {
+            keys: keys.iter().map(|k| info(k, -1)).collect(),
+            truncated: false,
+            warnings: vec![],
+            dbsize: keys.len() as u64,
+            pattern: "*".into(),
+        });
+    }
+
+    fn open_key(app: &App) -> Option<&str> {
+        app.current.as_ref().map(|k| k.name.as_str())
+    }
+
+    #[test]
+    fn deleting_the_last_key_in_the_list_opens_the_new_last_row() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        rescan(&mut app, &["a", "b"]);
+        assert_eq!(app.tree_state.selected(), Some(1), "the cursor clamps");
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(open_key(&app), Some("b"));
+        assert!(app.value_deadline().is_some(), "b's value is on its way");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "b"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn deleting_the_only_key_leaves_an_empty_tree_and_nothing_open() {
+        let mut app = tick_app(vec![info("a", -1)]);
+        select_label(&mut app, "a");
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        rescan(&mut app, &[]);
+        assert!(app.rows.is_empty());
+        assert_eq!(app.tree_state.selected(), None);
+        assert!(app.current.is_none());
+        assert!(app.value.is_none());
+        assert!(app.value_deadline().is_none(), "nothing to read");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.modal.is_none());
+        assert_eq!(app.status, "No key selected");
+    }
+
+    #[test]
+    fn a_rename_then_rescan_follows_the_new_name() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "b");
+        press(&mut app, KeyCode::Char('R'));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Form { action: Action::RenameKey(k), .. }) if k == "b"
+        ));
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "z");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.current.is_none(), "the old name is closed");
+
+        rescan(&mut app, &["a", "c", "z"]);
+        let row = app.selected_row().unwrap().label.clone();
+        assert_eq!(row, "z", "the cursor follows the renamed key");
+        assert_eq!(open_key(&app), Some(row.as_str()), "highlighted is open");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if *k == row),
+            "status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_delete_that_leaves_the_cursor_on_a_folder_clears_the_pane() {
+        let mut app = split_app(":", &["a:x", "a:y", "b:1"]);
+        let labels: Vec<&str> = app.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["a", "x", "y", "b", "1"]);
+        select_label(&mut app, "y");
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        rescan(&mut app, &["a:x", "b:1"]);
+        let row = app.selected_row().unwrap();
+        assert_eq!(row.label, "b");
+        assert!(row.key.is_none(), "a folder row");
+        assert!(app.current.is_none());
+        assert!(app.value.is_none());
+        assert!(app.value_deadline().is_none());
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.modal.is_none());
+        assert_eq!(app.status, "No key selected");
+    }
+
+    #[test]
+    fn an_open_key_folded_away_gives_way_to_the_row_under_the_cursor() {
+        // Past 200 keys a rescan does not expand every folder.
+        let names: Vec<String> = (0..201)
+            .map(|i| format!("bulk:{i}"))
+            .chain(["solo".to_string()])
+            .collect();
+        let keys: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut app = split_app(":", &keys);
+        app.expanded.insert("bulk".into());
+        app.rebuild_rows();
+        select_label(&mut app, "5");
+        assert_eq!(open_key(&app), Some("bulk:5"));
+        // Fold it away without moving off the key.
+        app.expanded.remove("bulk");
+        app.rebuild_rows();
+        app.tree_state.select(Some(0));
+
+        rescan(&mut app, &keys);
+        assert!(!app.expanded.contains("bulk"), "still folded");
+        assert_eq!(app.selected_row().unwrap().label, "bulk");
+        assert_eq!(
+            open_key(&app),
+            None,
+            "a folder is highlighted, so no hidden key stays open for D to delete"
+        );
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn a_value_search_keeps_the_open_key_when_it_matches() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        app.on_msg(Msg::Found {
+            keys: vec![info("b", -1), info("c", -1)],
+            truncated: false,
+            needle: "x".into(),
+        });
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+        assert!(
+            app.status.contains("2 key(s) contain 'x'"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_value_search_that_drops_the_open_key_opens_the_row_under_the_cursor() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        app.on_msg(Msg::Found {
+            keys: vec![info("a", -1), info("b", -1)],
+            truncated: false,
+            needle: "x".into(),
+        });
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(open_key(&app), Some("b"), "highlighted is open");
+
+        app.on_msg(Msg::Found {
+            keys: vec![],
+            truncated: false,
+            needle: "y".into(),
+        });
+        assert!(app.rows.is_empty());
+        assert!(app.current.is_none());
+        assert_eq!(app.status, "No values contain 'y'");
+    }
+
+    #[test]
+    fn a_restored_session_selection_wins_over_the_open_key() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "a");
+        app.pending_selection = Some("c".into());
+        rescan(&mut app, &["a", "b", "c"]);
+        assert!(app.pending_selection.is_none());
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+
+        // A remembered key that is gone leaves the open one alone.
+        app.pending_selection = Some("gone".into());
+        rescan(&mut app, &["x", "a", "b", "c"]);
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+    }
+
+    #[test]
+    fn deleting_marked_keys_opens_the_key_under_the_cursor() {
+        let mut app = tick_app(vec![
+            info("a", -1),
+            info("b", -1),
+            info("c", -1),
+            info("d", -1),
+        ]);
+        select_label(&mut app, "a");
+        press(&mut app, KeyCode::Char('m'));
+        select_label(&mut app, "b");
+        press(&mut app, KeyCode::Char('m'));
+        app.focus = Focus::Value;
+        press(&mut app, KeyCode::Char('D'));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Confirm { action: Action::DeleteMarked(n), .. }) if n == &["a", "b"]
+        ));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.marked.is_empty());
+        // The open key "b" was marked, so the row now under the cursor opens.
+        assert_eq!(leaf_labels(&app), ["c", "d"]);
+        assert_eq!(app.selected_row().unwrap().label, "d");
+        assert_eq!(open_key(&app), Some("d"));
+        assert!(
+            matches!(app.focus, Focus::Tree),
+            "the pane shows another key"
+        );
+
+        rescan(&mut app, &["c", "d"]);
+        assert_eq!(app.selected_row().unwrap().label, "d");
+        assert_eq!(open_key(&app), Some("d"));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "d"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_rescan_racing_the_delete_does_not_reopen_the_deleted_key() {
+        // The delete's own rescan can be beaten by one that still lists it.
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        select_label(&mut app, "a");
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(open_key(&app), Some("b"));
+        rescan(&mut app, &["a", "b"]);
+        assert_eq!(leaf_labels(&app), ["a", "b"], "the stale listing shows it");
+        assert_eq!(
+            app.selected_row().unwrap().label,
+            "b",
+            "the cursor stays on the open key"
+        );
+        assert_eq!(open_key(&app), Some("b"), "the deleted key is not reopened");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "b"),
+            "status: {}",
+            app.status
+        );
+        press(&mut app, KeyCode::Esc);
+        rescan(&mut app, &["b"]);
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(open_key(&app), Some("b"));
+    }
+
+    #[test]
+    fn another_key_expiring_above_the_cursor_keeps_the_open_key() {
+        let mut app = tick_app(vec![info("a", 2), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        let seq = app.value_seq;
+        app.age_ttls(2);
+        assert_eq!(leaf_labels(&app), ["b", "c"]);
+        assert_eq!(app.tree_state.selected(), Some(1), "the row moved up");
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+        assert_eq!(app.value_seq, seq, "the open key is not reloaded");
+        assert_eq!(app.status, "'a' expired");
+    }
+
+    #[test]
+    fn the_open_key_expiring_last_in_the_list_opens_the_row_above() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", 3)]);
+        select_label(&mut app, "c");
+        app.focus = Focus::Value;
+        app.age_ttls(3);
+        assert_eq!(app.tree_state.selected(), Some(1), "the cursor clamps");
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(open_key(&app), Some("b"));
+        assert!(app.value.is_none());
+        assert!(app.value_deadline().is_some(), "b's value is on its way");
+        assert!(matches!(app.focus, Focus::Tree));
+        assert_eq!(app.status, "'c' expired");
+    }
+
+    #[test]
+    fn the_open_key_expiring_mid_list_opens_the_row_below() {
+        let mut app = tick_app(vec![info("a", -1), info("b", 3), info("c", -1)]);
+        select_label(&mut app, "b");
+        app.focus = Focus::Value;
+        app.age_ttls(3);
+        assert_eq!(app.tree_state.selected(), Some(1));
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+        assert!(app.value_deadline().is_some());
+        assert!(matches!(app.focus, Focus::Tree));
+        assert_eq!(app.status, "'b' expired");
+    }
+
+    #[test]
+    fn every_key_expiring_leaves_an_empty_tree_and_nothing_open() {
+        let mut app = tick_app(vec![info("a", 1), info("b", 1)]);
+        select_label(&mut app, "b");
+        app.focus = Focus::Value;
+        app.age_ttls(1);
+        assert!(app.keys.is_empty());
+        assert!(app.rows.is_empty());
+        assert_eq!(app.tree_state.selected(), None);
+        assert!(app.current.is_none());
+        assert!(app.value.is_none());
+        assert!(app.value_deadline().is_none(), "nothing to read");
+        assert!(matches!(app.focus, Focus::Tree));
+        assert_eq!(app.status, "'b' expired");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.modal.is_none());
+        assert_eq!(app.status, "No key selected");
+    }
+
+    #[test]
+    fn every_key_expiring_with_nothing_open_leaves_an_empty_tree() {
+        let mut app = split_app(":", &["a:x"]);
+        // The folder row is highlighted, so nothing is open.
+        app.tree_state.select(Some(0));
+        app.on_tree_move();
+        assert!(app.current.is_none());
+        app.keys[0].ttl = 1;
+        app.age_ttls(1);
+        assert!(app.rows.is_empty());
+        assert_eq!(app.tree_state.selected(), None);
+        assert!(app.current.is_none());
+        assert_eq!(app.status, "'a:x' expired");
+    }
+
+    #[test]
+    fn a_failed_delete_keeps_the_cursor_key_open_until_the_rescan_restores_it() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "b");
+        app.on_value_deadline();
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(leaf_labels(&app), ["a", "c"], "the tree drops it at once");
+        assert_eq!(open_key(&app), Some("c"), "the row under the cursor opens");
+        assert!(app.value_deadline().is_some(), "c's value is on its way");
+
+        let dbsize = app.dbsize;
+        app.on_msg(Msg::Mutated(Err("NOPERM".into())));
+        assert!(app.status.starts_with("Error:"), "{}", app.status);
+        assert_eq!(
+            leaf_labels(&app),
+            ["a", "b", "c"],
+            "the key the server kept is back before any rescan"
+        );
+        assert_eq!(app.dbsize, dbsize + 1);
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"), "the open key stays put");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "c"),
+            "D asks about the highlighted key, status: {}",
+            app.status
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // The rescan the failure asks for brings "b" back; the cursor stays.
+        rescan(&mut app, &["a", "b", "c"]);
+        assert_eq!(leaf_labels(&app), ["a", "b", "c"]);
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+    }
+
+    #[test]
+    fn a_failed_rename_does_not_jump_to_the_new_name_on_a_later_rescan() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "b");
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "z");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_selection.as_deref(), Some("z"));
+
+        app.on_msg(Msg::Mutated(Err("ERR no such key".into())));
+        assert!(app.pending_selection.is_none());
+        assert!(app.status.starts_with("Error:"), "{}", app.status);
+        assert_eq!(open_key(&app), Some("b"), "the old name reopens");
+
+        // Someone else creates "z" later; the cursor stays where it was.
+        rescan(&mut app, &["a", "b", "c", "z"]);
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(open_key(&app), Some("b"));
+    }
+
+    #[test]
+    fn a_read_for_the_deleted_key_arriving_late_is_ignored() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        select_label(&mut app, "a");
+        // The read that was in flight for "a" carries this seq.
+        let seq = app.value_seq;
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_ne!(app.value_seq, seq, "closing the key moves the seq on");
+
+        let late = |seq| Msg::Loaded {
+            seq,
+            info: info("a", -1),
+            value: KeyValue::Str("old".into()),
+            notice: None,
+            coverage: Coverage::default(),
+            detail: None,
+        };
+        assert_eq!(open_key(&app), Some("b"), "the next row opens");
+        app.on_msg(late(seq));
+        assert_eq!(open_key(&app), Some("b"), "the deleted key stays closed");
+        assert!(app.value.is_none());
+
+        rescan(&mut app, &["b"]);
+        assert_eq!(open_key(&app), Some("b"));
+        app.on_msg(late(seq));
+        assert_eq!(open_key(&app), Some("b"), "b is not replaced by a");
+        assert!(app.value.is_none());
+    }
+
+    #[test]
+    fn a_rescan_without_the_open_key_moves_focus_to_the_tree() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "b");
+        app.focus = Focus::Value;
+        rescan(&mut app, &["a", "b", "c", "d"]);
+        assert!(
+            matches!(app.focus, Focus::Value),
+            "the open key is still listed, focus stays"
+        );
+        assert_eq!(open_key(&app), Some("b"));
+
+        rescan(&mut app, &["a", "c", "d"]);
+        assert!(matches!(app.focus, Focus::Tree));
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+    }
+
+    fn leaf_labels(app: &App) -> Vec<&str> {
+        app.rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
+    #[test]
+    fn a_delete_drops_the_key_from_the_tree_before_the_rescan() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        // A capped scan: the server holds more keys than the view lists.
+        app.dbsize = 10;
+        select_label(&mut app, "b");
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(leaf_labels(&app), ["a", "c"]);
+        assert!(!app.keys.iter().any(|k| k.name == "b"));
+        assert_eq!(app.key_count, 2);
+        assert_eq!(app.dbsize, 9, "one key fewer on the server");
+
+        // Marked keys go the same way.
+        select_label(&mut app, "a");
+        press(&mut app, KeyCode::Char('m'));
+        select_label(&mut app, "c");
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.rows.is_empty());
+        assert!(app.keys.is_empty());
+        assert_eq!(app.key_count, 0);
+        assert_eq!(app.dbsize, 7);
+        assert_eq!(app.tree_state.selected(), None);
+        assert!(app.current.is_none());
+    }
+
+    #[test]
+    fn a_truncated_rescan_without_the_open_key_keeps_it_open_with_no_row_highlighted() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        app.on_msg(Msg::Keys {
+            keys: vec![info("a", -1), info("b", -1)],
+            truncated: true,
+            warnings: vec![],
+            dbsize: 3,
+            pattern: "*".into(),
+        });
+        assert_eq!(open_key(&app), Some("c"), "the scan just did not reach it");
+        assert_eq!(app.tree_state.selected(), None, "no other row claims D");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "c"),
+            "D targets the open key, status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_full_rescan_without_the_open_key_opens_the_row_under_the_cursor() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        rescan(&mut app, &["a", "b"]);
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(open_key(&app), Some("b"));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "b"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn deleting_marked_keys_keeps_an_unmarked_open_key_open() {
+        let mut app = tick_app(vec![
+            info("a", -1),
+            info("b", -1),
+            info("c", -1),
+            info("d", -1),
+        ]);
+        select_label(&mut app, "a");
+        press(&mut app, KeyCode::Char('m'));
+        select_label(&mut app, "b");
+        press(&mut app, KeyCode::Char('m'));
+        select_label(&mut app, "d");
+        app.focus = Focus::Value;
+        let seq = app.value_seq;
+        press(&mut app, KeyCode::Char('D'));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Confirm { action: Action::DeleteMarked(n), .. }) if n == &["a", "b"]
+        ));
+        press(&mut app, KeyCode::Char('y'));
+        // The marked rows above it vanish; the cursor follows "d" up.
+        assert_eq!(leaf_labels(&app), ["c", "d"]);
+        assert_eq!(app.tree_state.selected(), Some(1));
+        assert_eq!(app.selected_row().unwrap().label, "d");
+        assert_eq!(open_key(&app), Some("d"));
+        assert_eq!(app.value_seq, seq, "d is not closed or reloaded");
+        assert!(
+            matches!(app.focus, Focus::Value),
+            "the open key did not change"
+        );
+
+        rescan(&mut app, &["c", "d"]);
+        assert_eq!(app.selected_row().unwrap().label, "d");
+        assert_eq!(open_key(&app), Some("d"));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "d"),
+            "status: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn deleting_the_open_key_from_the_value_pane_moves_focus_to_the_tree() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "b");
+        app.focus = Focus::Value;
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.focus, Focus::Tree));
+        assert_eq!(app.selected_row().unwrap().label, "c");
+        assert_eq!(open_key(&app), Some("c"));
+    }
+
+    #[test]
+    fn a_rescan_arriving_after_leaving_the_browser_opens_nothing() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        select_label(&mut app, "a");
+        app.back_to_connections();
+        assert!(matches!(app.screen, Screen::Connections));
+        assert!(app.current.is_none());
+
+        rescan(&mut app, &["a", "b"]);
+        assert!(app.current.is_none(), "no key opens behind the connections");
+        assert!(app.value.is_none());
+        assert!(app.value_deadline().is_none(), "nothing to read");
+    }
+
+    #[test]
+    fn a_failed_mutation_without_a_client_does_not_panic() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(crate::config::Store::default(), tx);
+        app.screen = Screen::Browser;
+        app.on_msg(Msg::Mutated(Err("boom".into())));
+        assert!(app.status.starts_with("Error:"), "{}", app.status);
+        assert!(app.current.is_none());
+
+        let mut app = tick_app(vec![info("a", -1)]);
+        select_label(&mut app, "a");
+        app.on_msg(Msg::Mutated(Err("boom".into())));
+        assert!(app.status.starts_with("Error:"), "{}", app.status);
+        assert_eq!(open_key(&app), Some("a"));
+    }
+
+    /// A browser whose capped scan left out the open key "c".
+    fn unlisted_open_key(listed: &[&str]) -> App {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "c");
+        app.on_msg(Msg::Keys {
+            keys: listed.iter().map(|k| info(k, -1)).collect(),
+            truncated: true,
+            warnings: vec![],
+            dbsize: 3,
+            pattern: "*".into(),
+        });
+        assert_eq!(open_key(&app), Some("c"));
+        assert_eq!(app.tree_state.selected(), None);
+        app
+    }
+
+    #[test]
+    fn deleting_an_unlisted_open_key_closes_it_and_opens_the_row_under_the_cursor() {
+        let mut app = unlisted_open_key(&["a", "b"]);
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_ne!(open_key(&app), Some("c"), "the deleted key is closed");
+        assert_eq!(leaf_labels(&app), ["a", "b"], "the listed keys stay");
+        assert_eq!(
+            app.selected_row().map(|r| r.label.as_str()),
+            open_key(&app),
+            "the highlighted row and the open key agree"
+        );
+        assert_eq!(open_key(&app), Some("a"));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "a"),
+            "D asks about the highlighted key, status: {}",
+            app.status
+        );
+
+        // With nothing listed, nothing opens and D has nothing to delete.
+        let mut app = unlisted_open_key(&[]);
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.current.is_none());
+        assert!(app.value.is_none());
+        assert_eq!(app.tree_state.selected(), None);
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.modal.is_none());
+        assert_eq!(app.status, "No key selected");
+    }
+
+    #[test]
+    fn deleting_marked_keys_closes_an_unlisted_open_key_among_them() {
+        let mut app = unlisted_open_key(&["a", "b"]);
+        app.marked.insert("c".into());
+        app.marked.insert("a".into());
+        press(&mut app, KeyCode::Char('D'));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Confirm { action: Action::DeleteMarked(n), .. }) if n == &["a", "c"]
+        ));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(leaf_labels(&app), ["b"]);
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(open_key(&app), Some("b"), "the row under the cursor opens");
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "b"),
+            "status: {}",
+            app.status
+        );
+
+        // Only the unlisted open key is marked: the tree is untouched.
+        let mut app = unlisted_open_key(&["a", "b"]);
+        app.marked.insert("c".into());
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(leaf_labels(&app), ["a", "b"]);
+        assert_ne!(open_key(&app), Some("c"));
+        assert_eq!(app.selected_row().map(|r| r.label.as_str()), open_key(&app));
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            !matches!(&app.modal, Some(Modal::Confirm { action: Action::DeleteKey(k), .. }) if k == "c"),
+            "D does not target the deleted key"
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_that_left_the_tree_alone_keeps_the_pending_selection() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "b");
+        let seq = app.value_seq;
+        app.pending_selection = Some("c".into());
+        assert!(!app.tree_ahead);
+
+        app.on_msg(Msg::Mutated(Err("WRONGTYPE".into())));
+        assert!(app.status.starts_with("Error:"), "{}", app.status);
+        assert_eq!(app.pending_selection.as_deref(), Some("c"));
+        assert_eq!(open_key(&app), Some("b"));
+        assert_eq!(app.selected_row().unwrap().label, "b");
+        assert_eq!(app.value_seq, seq, "b is not closed or reloaded");
+        assert!(app.status_after_rescan.is_none());
+    }
+
+    #[test]
+    fn a_rescan_shows_the_status_held_for_it_once() {
+        let mut app = tick_app(vec![info("a", -1)]);
+        app.status_after_rescan = Some("Error: NOPERM".into());
+        rescan(&mut app, &["a"]);
+        assert_eq!(app.status, "Error: NOPERM");
+        assert!(app.status_after_rescan.is_none(), "it is used up");
+        rescan(&mut app, &["a"]);
+        assert_eq!(app.status, "Keys refreshed");
+
+        // A failed scan drops it: the rescan it was waiting for is not coming.
+        app.status_after_rescan = Some("Error: NOPERM".into());
+        app.on_msg(Msg::Error("scan failed: timeout".into()));
+        assert!(app.status_after_rescan.is_none());
+        assert_eq!(app.status, "Error: scan failed: timeout");
+        rescan(&mut app, &["a"]);
+        assert_eq!(app.status, "Keys refreshed");
+    }
+
+    #[test]
+    fn a_failed_delete_without_a_client_holds_no_status_for_a_later_rescan() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1)]);
+        select_label(&mut app, "a");
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.tree_ahead);
+        app.on_msg(Msg::Mutated(Err("NOPERM".into())));
+        assert!(!app.tree_ahead);
+        assert!(
+            app.status_after_rescan.is_none(),
+            "no rescan was started to show it"
+        );
+        rescan(&mut app, &["a", "b"]);
+        assert_eq!(app.status, "Keys refreshed");
+    }
+
+    #[test]
+    fn a_successful_write_clears_tree_ahead() {
+        let mut app = tick_app(vec![info("a", -1), info("b", -1), info("c", -1)]);
+        select_label(&mut app, "a");
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.tree_ahead);
+        app.on_msg(Msg::Mutated(Ok("Key deleted".into())));
+        assert!(!app.tree_ahead);
+        assert_eq!(app.status, "Key deleted");
+
+        // A later failure of an unrelated edit does not undo anything.
+        app.pending_selection = Some("c".into());
+        app.on_msg(Msg::Mutated(Err("WRONGTYPE".into())));
+        assert_eq!(app.pending_selection.as_deref(), Some("c"));
+        assert_eq!(open_key(&app), Some("b"));
+
+        // A rename sets it too, and its success clears it.
+        app.pending_selection = None;
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "z");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.tree_ahead);
+        app.on_msg(Msg::Mutated(Ok("Key renamed".into())));
+        assert!(!app.tree_ahead);
+    }
+
+    #[test]
     fn o_cycles_the_sort_and_keeps_the_cursor_on_its_key() {
         let mut app = tick_app(vec![
             info("job:10", -1),
@@ -7354,8 +8311,12 @@ mod tests {
         );
 
         app.age_ttls(3);
-        assert!(app.current.is_none());
         assert!(app.value.is_none());
+        assert_eq!(
+            app.current.as_ref().map(|k| k.name.as_str()),
+            Some("other"),
+            "the key under the cursor opens in its place"
+        );
         assert!(matches!(app.focus, Focus::Tree));
         assert_eq!(app.status, "'session:1' expired");
     }
