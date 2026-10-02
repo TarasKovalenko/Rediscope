@@ -30,7 +30,7 @@ body:
     attributes:
       label: rediscope version
       description: Output of `rediscope --version`.
-      placeholder: rediscope 0.13.0
+      placeholder: rediscope 0.14.0
     validations:
       required: true
   - type: input
