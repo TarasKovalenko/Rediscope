@@ -203,7 +203,8 @@ async fn seed_every_type(p: &mut Pair, prefix: &str) -> usize {
         let _: () = r.pfadd(key("hll"), &["a", "b", "c"]).await.unwrap();
         count += 1;
     }
-    if supports(r, "VADD").await {
+    // Exporting a whole vector set needs VRANGE; 8.0 has VADD without it.
+    if supports(r, "VRANGE").await {
         for (el, v, attr) in [
             ("e1", [1.0, 2.0], Some(r#"{"year":1950}"#)),
             ("e2", [0.5, -0.25], None),
@@ -222,7 +223,7 @@ async fn seed_every_type(p: &mut Pair, prefix: &str) -> usize {
         }
         count += 1;
     } else {
-        eprintln!("skipped vector sets: the server has no VADD");
+        eprintln!("skipped vector sets: the server has no VRANGE");
     }
     if supports(r, "JSON.SET").await {
         let _: () = redis::cmd("JSON.SET")
